@@ -2,7 +2,7 @@
 pdf_generator.py — Salary Slip matching the Kerala / Nirbhik format
 =====================================================================
 • Two-column table: Salary & Allowances | Deductions
-• Zero-value rows are NEVER printed
+• ALL rows are printed (including 0.00) to match official format
 • Gross Monthly Emoluments + Total Deductions share the bottom row
 • Net Salary Paid spans full width
 • Bank details, Prepared by / Received by, legal footer
@@ -70,7 +70,7 @@ S_LEGAL   = _s("legal",fontSize=7, textColor=colors.HexColor("#555555"),
 
 
 def _fmt(amount: float) -> str:
-    """Rs.17,688.00 style — Indian comma grouping."""
+    """Rs.17,688.00 style — Indian comma grouping for totals."""
     s  = f"{abs(amount):,.2f}"
     # convert Western commas → Indian grouping
     p  = s.split(".")
@@ -87,6 +87,11 @@ def _fmt(amount: float) -> str:
         fmt = ",".join(grps) + "," + last3
     result = f"Rs.{fmt}.{p[1]}"
     return ("-" + result) if amount < 0 else result
+
+
+def _plain_amt(amount: float) -> str:
+    """Plain decimal format for individual line items: 12844.00"""
+    return f"{amount:,.2f}"
 
 
 # ── Main slip builder ────────────────────────────────────────────────────────
@@ -150,8 +155,9 @@ def _build_flowables(r: PayrollResult, cfg: CompanyConfig) -> list:
     story.append(Spacer(1, 4 * mm))
 
     # ── 3. Salary & Deductions table ─────────────────────────────────────
-    earn_items = r.earnings_items()   # non-zero only
-    ded_items  = r.deduction_items()  # non-zero only
+    #    Show ALL rows including 0.00 — matching the official slip format
+    earn_items = r.all_earnings_items()    # all 12 rows
+    ded_items  = r.all_deduction_items()   # all 9 rows
 
     # Pad to same length so the two columns align
     max_rows = max(len(earn_items), len(ded_items))
@@ -170,18 +176,18 @@ def _build_flowables(r: PayrollResult, cfg: CompanyConfig) -> list:
         Paragraph("",                    S_TH),
     ]]
 
-    # Data rows
+    # Data rows — use plain number format for individual items
     for i in range(max_rows):
         el, ev = earn_items[i]
         dl, dv = ded_items[i]
         table_rows.append([
             Paragraph(el, S_CELL),
-            Paragraph(_fmt(ev) if ev else "", S_CELL),
+            Paragraph(_plain_amt(ev) if ev != "" else "", S_CELL),
             Paragraph(dl, S_CELL),
-            Paragraph(_fmt(dv) if dv else "", S_CELL),
+            Paragraph(_plain_amt(dv) if dv != "" else "", S_CELL),
         ])
 
-    # Gross / Total Deductions footer row
+    # Gross / Total Deductions footer row (use Rs. format for totals)
     table_rows.append([
         Paragraph("Gross Monthly Emoluments", S_BOLD),
         Paragraph("",                          S_BOLD),
@@ -279,6 +285,17 @@ def _build_flowables(r: PayrollResult, cfg: CompanyConfig) -> list:
         colWidths=[CONTENT_W / 2, CONTENT_W / 2],
     )
     story.append(bank_row)
+
+    # UAN / ESIC row
+    if r.uan_number or r.esic_number:
+        story.append(Spacer(1, 1 * mm))
+        ids_row = Table(
+            [[Paragraph(f"UAN (PF) &nbsp;: <b>{r.uan_number or '—'}</b>", S_CELL),
+              Paragraph(f"ESIC IP No &nbsp;: <b>{r.esic_number or '—'}</b>", S_CELL)]],
+            colWidths=[CONTENT_W / 2, CONTENT_W / 2],
+        )
+        story.append(ids_row)
+
     story.append(Spacer(1, 5 * mm))
 
     # ── 6. Prepared / Received ───────────────────────────────────────────

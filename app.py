@@ -11,20 +11,27 @@ import sys
 import csv
 import tempfile
 import datetime
-import subprocess
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import customtkinter as ctk
 
-from schema import Worker, MasterProfile, AttendanceRecord, CompanyConfig
+from schema import (
+    Worker, MasterProfile, AttendanceRecord, CompanyConfig,
+    SKILL_CATEGORIES,
+)
 from database import (
     init_db, get_all_workers, get_all_profiles, get_profiles_dict,
     get_attendance, upsert_attendance, bulk_upsert_attendance,
-    upsert_worker, deactivate_worker, upsert_profile, delete_profile,
+    upsert_worker, deactivate_worker, reactivate_worker,
+    delete_worker, get_worker_by_id,
+    upsert_profile, delete_profile,
     get_config, save_config, get_months_with_data,
-    import_attendance_from_csv, DB_PATH,
+    get_workers_by_branch, import_attendance_from_csv,
+    get_all_branches, add_branch, rename_branch, delete_branch,
+    branch_worker_count,
+    DB_PATH,
 )
 from payroll_engine import calculate_payroll, payroll_summary
 from pdf_generator import generate_bulk_pdfs, generate_slip_pdf
@@ -47,7 +54,6 @@ TEXT_PRIMARY     = "#E8E8F0"
 TEXT_SECONDARY   = "#9090A8"
 TEXT_MUTED       = "#606078"
 SIDEBAR_BG      = "#14141F"
-SIDEBAR_ACTIVE   = "#1E88E5"
 SIDEBAR_HOVER    = "#1A1A2A"
 
 FONT_FAMILY      = "Segoe UI"
@@ -61,26 +67,20 @@ FONT_TINY        = (FONT_FAMILY, 9)
 FONT_METRIC_VAL  = (FONT_FAMILY, 20, "bold")
 FONT_METRIC_LBL  = (FONT_FAMILY, 9)
 
-APP_WIDTH  = 1280
-APP_HEIGHT = 780
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def month_options():
-    """Generate last 12 months as 'YYYY-MM' strings."""
     today = datetime.date.today()
     months = []
     for i in range(11, -1, -1):
         y, m = today.year, today.month - i
         while m <= 0:
-            m += 12
-            y -= 1
+            m += 12; y -= 1
         months.append(f"{y}-{m:02d}")
     return months
 
 
 def fmt_inr(amount):
-    """Format amount in Indian currency style."""
     s = f"{abs(amount):,.2f}"
     p = s.split(".")
     n = p[0].replace(",", "")
@@ -91,74 +91,54 @@ def fmt_inr(amount):
         rest = n[:-3]
         grps = []
         while len(rest) > 2:
-            grps.insert(0, rest[-2:])
-            rest = rest[:-2]
-        if rest:
-            grps.insert(0, rest)
+            grps.insert(0, rest[-2:]); rest = rest[:-2]
+        if rest: grps.insert(0, rest)
         fmt = ",".join(grps) + "," + last3
     result = f"₹{fmt}.{p[1]}"
     return ("-" + result) if amount < 0 else result
 
 
+def _branch_list():
+    """Get branches from DB; returns ["(No branches)"] if empty."""
+    b = get_all_branches()
+    return b if b else ["(No branches)"]
+
+
+def _branch_filter_list():
+    """For filter dropdowns: ["All"] + branches."""
+    b = get_all_branches()
+    return ["All"] + b if b else ["All"]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-#   METRIC CARD WIDGET
+#   REUSABLE WIDGETS
 # ══════════════════════════════════════════════════════════════════════════════
 class MetricCard(ctk.CTkFrame):
-    """A styled metric card showing a value and label."""
-
     def __init__(self, master, label, value, color=ACCENT, **kw):
         super().__init__(master, corner_radius=12, fg_color=CARD_BG, **kw)
-
-        # Top accent line
         accent = ctk.CTkFrame(self, height=3, corner_radius=0, fg_color=color)
-        accent.pack(fill="x", padx=0, pady=0)
-
+        accent.pack(fill="x")
         inner = ctk.CTkFrame(self, fg_color="transparent")
         inner.pack(fill="both", expand=True, padx=16, pady=(10, 14))
-
-        self._val_label = ctk.CTkLabel(
-            inner, text=str(value), font=FONT_METRIC_VAL,
-            text_color=TEXT_PRIMARY, anchor="w"
-        )
-        self._val_label.pack(anchor="w")
-
-        self._name_label = ctk.CTkLabel(
-            inner, text=label, font=FONT_METRIC_LBL,
-            text_color=TEXT_SECONDARY, anchor="w"
-        )
-        self._name_label.pack(anchor="w", pady=(2, 0))
-
-    def update_value(self, value, label=None):
-        self._val_label.configure(text=str(value))
-        if label:
-            self._name_label.configure(text=label)
+        self._val = ctk.CTkLabel(inner, text=str(value), font=FONT_METRIC_VAL,
+                                  text_color=TEXT_PRIMARY, anchor="w")
+        self._val.pack(anchor="w")
+        self._lbl = ctk.CTkLabel(inner, text=label, font=FONT_METRIC_LBL,
+                                  text_color=TEXT_SECONDARY, anchor="w")
+        self._lbl.pack(anchor="w", pady=(2, 0))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#   STYLED TREEVIEW TABLE
-# ══════════════════════════════════════════════════════════════════════════════
 class StyledTreeview(ctk.CTkFrame):
-    """A dark-themed treeview table inside a CTk frame."""
-
     def __init__(self, master, columns, column_widths=None, height=14, **kw):
         super().__init__(master, fg_color=CARD_BG, corner_radius=10, **kw)
-
         style = ttk.Style()
         style.theme_use("clam")
-
-        style.configure("Dark.Treeview",
-                         background=SURFACE_3,
-                         foreground=TEXT_PRIMARY,
-                         fieldbackground=SURFACE_3,
-                         borderwidth=0,
-                         font=(FONT_FAMILY, 10),
-                         rowheight=30)
-        style.configure("Dark.Treeview.Heading",
-                         background=ACCENT_DARK,
-                         foreground="white",
-                         font=(FONT_FAMILY, 10, "bold"),
-                         borderwidth=0,
-                         relief="flat")
+        style.configure("Dark.Treeview", background=SURFACE_3,
+                         foreground=TEXT_PRIMARY, fieldbackground=SURFACE_3,
+                         borderwidth=0, font=(FONT_FAMILY, 10), rowheight=28)
+        style.configure("Dark.Treeview.Heading", background=ACCENT_DARK,
+                         foreground="white", font=(FONT_FAMILY, 10, "bold"),
+                         borderwidth=0, relief="flat")
         style.map("Dark.Treeview",
                    background=[("selected", ACCENT)],
                    foreground=[("selected", "white")])
@@ -168,26 +148,20 @@ class StyledTreeview(ctk.CTkFrame):
         container = ctk.CTkFrame(self, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=6, pady=6)
 
-        self.tree = ttk.Treeview(
-            container, columns=columns, show="headings",
-            style="Dark.Treeview", height=height,
-            selectmode="browse"
-        )
-
+        self.tree = ttk.Treeview(container, columns=columns, show="headings",
+                                  style="Dark.Treeview", height=height,
+                                  selectmode="browse")
         scrollbar = ctk.CTkScrollbar(container, command=self.tree.yview,
                                       fg_color=SURFACE_3, button_color=TEXT_MUTED)
         self.tree.configure(yscrollcommand=scrollbar.set)
-
         self.tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
         for i, col in enumerate(columns):
-            w = (column_widths[i] if column_widths and i < len(column_widths)
-                 else 120)
+            w = column_widths[i] if column_widths and i < len(column_widths) else 120
             self.tree.heading(col, text=col, anchor="w")
-            self.tree.column(col, width=w, minwidth=60, anchor="w")
+            self.tree.column(col, width=w, minwidth=50, anchor="w")
 
-        # Alternate row striping via tags
         self.tree.tag_configure("even", background=SURFACE_2)
         self.tree.tag_configure("odd", background=SURFACE_3)
 
@@ -196,37 +170,20 @@ class StyledTreeview(ctk.CTkFrame):
             self.tree.delete(item)
 
     def insert_rows(self, rows):
-        """rows: list of tuples matching column order"""
         self.clear()
         for i, row in enumerate(rows):
             tag = "even" if i % 2 == 0 else "odd"
             self.tree.insert("", "end", values=row, tags=(tag,))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#   SIDEBAR BUTTON
-# ══════════════════════════════════════════════════════════════════════════════
 class SidebarButton(ctk.CTkButton):
-    """A sidebar navigation button with icon + label."""
-
     def __init__(self, master, text, icon, command=None, **kw):
-        super().__init__(
-            master,
-            text=f"  {icon}   {text}",
-            font=(FONT_FAMILY, 12),
-            anchor="w",
-            height=42,
-            corner_radius=8,
-            fg_color="transparent",
-            hover_color=SIDEBAR_HOVER,
-            text_color=TEXT_SECONDARY,
-            command=command,
-            **kw,
-        )
-        self._is_active = False
+        super().__init__(master, text=f"  {icon}   {text}", font=(FONT_FAMILY, 12),
+                         anchor="w", height=42, corner_radius=8,
+                         fg_color="transparent", hover_color=SIDEBAR_HOVER,
+                         text_color=TEXT_SECONDARY, command=command, **kw)
 
     def set_active(self, active):
-        self._is_active = active
         if active:
             self.configure(fg_color=ACCENT, text_color="white",
                            hover_color=ACCENT_HOVER)
@@ -235,27 +192,16 @@ class SidebarButton(ctk.CTkButton):
                            hover_color=SIDEBAR_HOVER)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#   STATUS BAR
-# ══════════════════════════════════════════════════════════════════════════════
 class StatusBar(ctk.CTkFrame):
-    """Bottom status bar with message display."""
-
     def __init__(self, master, **kw):
-        super().__init__(master, height=28, corner_radius=0,
-                         fg_color=SIDEBAR_BG, **kw)
+        super().__init__(master, height=28, corner_radius=0, fg_color=SIDEBAR_BG, **kw)
         self.pack_propagate(False)
-
-        self._label = ctk.CTkLabel(
-            self, text="  Ready", font=FONT_TINY,
-            text_color=TEXT_MUTED, anchor="w"
-        )
+        self._label = ctk.CTkLabel(self, text="  Ready", font=FONT_TINY,
+                                    text_color=TEXT_MUTED, anchor="w")
         self._label.pack(side="left", padx=10, fill="y")
-
         self._right = ctk.CTkLabel(
             self, text=f"PayrollPro v2.0  •  DB: {os.path.abspath(DB_PATH)}  ",
-            font=FONT_TINY, text_color=TEXT_MUTED, anchor="e"
-        )
+            font=FONT_TINY, text_color=TEXT_MUTED, anchor="e")
         self._right.pack(side="right", padx=10, fill="y")
 
     def set_message(self, msg, color=TEXT_MUTED):
@@ -268,28 +214,18 @@ class StatusBar(ctk.CTkFrame):
 class PayrollApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-
         self.title("PayrollPro — Professional Payroll Management")
-        self.geometry(f"{APP_WIDTH}x{APP_HEIGHT}")
-        self.minsize(1000, 600)
-
-        # Try to set window icon (optional)
-        try:
-            self.iconbitmap(default="")
-        except Exception:
-            pass
+        self.geometry("1300x800")
+        self.minsize(1050, 650)
 
         init_db(DB_PATH, seed=True)
 
-        # ── Main layout -------------------------------------------------
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
         self._build_sidebar()
         self._build_main_area()
         self._build_status_bar()
-
-        # Show dashboard by default
         self._navigate("dashboard")
 
     # ─── Sidebar ─────────────────────────────────────────────────────────
@@ -299,67 +235,45 @@ class PayrollApp(ctk.CTk):
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         self.sidebar.grid_propagate(False)
 
-        # Logo area
-        logo_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        logo_frame.pack(fill="x", padx=16, pady=(20, 6))
+        logo = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        logo.pack(fill="x", padx=16, pady=(20, 6))
+        ctk.CTkLabel(logo, text="💼", font=(FONT_FAMILY, 28)).pack(side="left")
+        ctk.CTkLabel(logo, text=" PayrollPro", font=(FONT_FAMILY, 18, "bold"),
+                      text_color=TEXT_PRIMARY).pack(side="left", padx=(6, 0))
+        ctk.CTkLabel(self.sidebar, text="Professional Payroll System",
+                      font=FONT_TINY, text_color=TEXT_MUTED).pack(padx=20, anchor="w")
 
-        ctk.CTkLabel(
-            logo_frame, text="💼", font=(FONT_FAMILY, 28)
-        ).pack(side="left")
-        ctk.CTkLabel(
-            logo_frame, text=" PayrollPro",
-            font=(FONT_FAMILY, 18, "bold"), text_color=TEXT_PRIMARY
-        ).pack(side="left", padx=(6, 0))
-
-        ctk.CTkLabel(
-            self.sidebar, text="Professional Payroll System",
-            font=FONT_TINY, text_color=TEXT_MUTED
-        ).pack(padx=20, anchor="w")
-
-        # Divider
         ctk.CTkFrame(self.sidebar, height=1, fg_color=TEXT_MUTED).pack(
-            fill="x", padx=16, pady=(16, 12)
-        )
+            fill="x", padx=16, pady=(16, 12))
 
-        # Navigation buttons
-        nav_items = [
+        nav = [
             ("Dashboard",      "📊", "dashboard"),
             ("Attendance",     "📋", "attendance"),
             ("Workers",        "👷", "workers"),
             ("Job Profiles",   "🏷️", "profiles"),
+            ("Branches",       "🏢", "branches"),
             ("Generate Slips", "📄", "slips"),
             ("Settings",       "⚙️",  "settings"),
         ]
-
         self._nav_buttons = {}
-        for text, icon, key in nav_items:
-            btn = SidebarButton(
-                self.sidebar, text=text, icon=icon,
-                command=lambda k=key: self._navigate(k)
-            )
+        for text, icon, key in nav:
+            btn = SidebarButton(self.sidebar, text=text, icon=icon,
+                                command=lambda k=key: self._navigate(k))
             btn.pack(fill="x", padx=12, pady=2)
             self._nav_buttons[key] = btn
 
-        # Bottom info
-        spacer = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        spacer.pack(fill="both", expand=True)
-
+        ctk.CTkFrame(self.sidebar, fg_color="transparent").pack(fill="both", expand=True)
         ctk.CTkFrame(self.sidebar, height=1, fg_color=TEXT_MUTED).pack(
-            fill="x", padx=16, pady=(0, 8)
-        )
-        ctk.CTkLabel(
-            self.sidebar, text="Zero-Cost Payroll System\nPython + SQLite",
-            font=FONT_TINY, text_color=TEXT_MUTED, justify="left"
-        ).pack(padx=20, pady=(0, 16), anchor="w")
+            fill="x", padx=16, pady=(0, 8))
+        ctk.CTkLabel(self.sidebar, text="Zero-Cost Payroll System\nPython + SQLite",
+                      font=FONT_TINY, text_color=TEXT_MUTED, justify="left"
+                      ).pack(padx=20, pady=(0, 16), anchor="w")
 
-    # ─── Main content area ───────────────────────────────────────────────
     def _build_main_area(self):
         self.main_area = ctk.CTkFrame(self, corner_radius=0, fg_color=SURFACE)
         self.main_area.grid(row=0, column=1, sticky="nsew")
         self.main_area.grid_columnconfigure(0, weight=1)
         self.main_area.grid_rowconfigure(0, weight=1)
-
-        self._pages = {}
         self._current_page = None
 
     def _build_status_bar(self):
@@ -368,138 +282,101 @@ class PayrollApp(ctk.CTk):
 
     # ─── Navigation ──────────────────────────────────────────────────────
     def _navigate(self, page_key):
-        # Update sidebar highlights
         for k, btn in self._nav_buttons.items():
             btn.set_active(k == page_key)
-
-        # Destroy current page
         if self._current_page:
             self._current_page.destroy()
 
-        # Build new page
-        builders = {
-            "dashboard":  self._build_dashboard,
-            "attendance": self._build_attendance,
-            "workers":    self._build_workers,
-            "profiles":   self._build_profiles,
-            "slips":      self._build_slips,
-            "settings":   self._build_settings,
-        }
-
-        page = ctk.CTkScrollableFrame(
-            self.main_area, fg_color=SURFACE,
-            scrollbar_button_color=TEXT_MUTED,
-            scrollbar_fg_color=SURFACE
-        )
-        page.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+        page = ctk.CTkScrollableFrame(self.main_area, fg_color=SURFACE,
+                                       scrollbar_button_color=TEXT_MUTED,
+                                       scrollbar_fg_color=SURFACE)
+        page.grid(row=0, column=0, sticky="nsew")
         self._current_page = page
 
+        builders = {
+            "dashboard": self._page_dashboard,
+            "attendance": self._page_attendance,
+            "workers": self._page_workers,
+            "profiles": self._page_profiles,
+            "branches": self._page_branches,
+            "slips": self._page_slips,
+            "settings": self._page_settings,
+        }
         builder = builders.get(page_key)
         if builder:
             builder(page)
-
-        self.status_bar.set_message(f"Viewing: {page_key.title()}")
+        self.status_bar.set_message(f"Viewing: {page_key.replace('_',' ').title()}")
 
     # ══════════════════════════════════════════════════════════════════════
-    #   PAGE: DASHBOARD
+    #   DASHBOARD
     # ══════════════════════════════════════════════════════════════════════
-    def _build_dashboard(self, parent):
-        # Title
-        ctk.CTkLabel(
-            parent, text="📊  Payroll Dashboard",
-            font=FONT_TITLE, text_color=TEXT_PRIMARY, anchor="w"
-        ).pack(fill="x", padx=28, pady=(20, 4))
+    def _page_dashboard(self, parent):
+        ctk.CTkLabel(parent, text="📊  Payroll Dashboard", font=FONT_TITLE,
+                      text_color=TEXT_PRIMARY, anchor="w").pack(
+            fill="x", padx=28, pady=(20, 2))
+        ctk.CTkLabel(parent, text="Overview of payroll calculations for the selected period",
+                      font=FONT_SMALL, text_color=TEXT_SECONDARY, anchor="w"
+                      ).pack(fill="x", padx=28, pady=(0, 14))
 
-        ctk.CTkLabel(
-            parent, text="Overview of payroll calculations for the selected period",
-            font=FONT_SMALL, text_color=TEXT_SECONDARY, anchor="w"
-        ).pack(fill="x", padx=28, pady=(0, 16))
-
-        # Controls row
         ctrl = ctk.CTkFrame(parent, fg_color="transparent")
-        ctrl.pack(fill="x", padx=28, pady=(0, 12))
+        ctrl.pack(fill="x", padx=28, pady=(0, 10))
 
         opts = month_options()
         ctk.CTkLabel(ctrl, text="Month:", font=FONT_BODY_BOLD,
                       text_color=TEXT_PRIMARY).pack(side="left")
         month_var = ctk.StringVar(value=opts[-1])
-        month_menu = ctk.CTkOptionMenu(
-            ctrl, values=opts, variable=month_var,
-            width=140, font=FONT_BODY,
-            fg_color=SURFACE_3, button_color=ACCENT,
-            button_hover_color=ACCENT_HOVER
-        )
-        month_menu.pack(side="left", padx=(8, 20))
+        ctk.CTkOptionMenu(ctrl, values=opts, variable=month_var, width=140,
+                           font=FONT_BODY, fg_color=SURFACE_3, button_color=ACCENT,
+                           button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 20))
 
-        locs = sorted({p.location for p in get_all_profiles()})
-        ctk.CTkLabel(ctrl, text="Location:", font=FONT_BODY_BOLD,
+        ctk.CTkLabel(ctrl, text="Branch:", font=FONT_BODY_BOLD,
                       text_color=TEXT_PRIMARY).pack(side="left")
-        loc_var = ctk.StringVar(value="All")
-        loc_menu = ctk.CTkOptionMenu(
-            ctrl, values=["All"] + locs, variable=loc_var,
-            width=160, font=FONT_BODY,
-            fg_color=SURFACE_3, button_color=ACCENT,
-            button_hover_color=ACCENT_HOVER
-        )
-        loc_menu.pack(side="left", padx=(8, 20))
+        branch_var = ctk.StringVar(value="All")
+        ctk.CTkOptionMenu(ctrl, values=_branch_filter_list(), variable=branch_var,
+                           width=150, font=FONT_BODY, fg_color=SURFACE_3,
+                           button_color=ACCENT, button_hover_color=ACCENT_HOVER
+                           ).pack(side="left", padx=(8, 20))
 
-        # Container for dynamic content
-        content_frame = ctk.CTkFrame(parent, fg_color="transparent")
-        content_frame.pack(fill="both", expand=True, padx=28, pady=(0, 20))
+        content = ctk.CTkFrame(parent, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=28, pady=(0, 20))
 
-        def refresh_dashboard():
-            # Clear content
-            for w in content_frame.winfo_children():
+        def refresh():
+            for w in content.winfo_children():
                 w.destroy()
-
-            sel_month = month_var.get()
-            sel_loc = loc_var.get()
+            sel_m = month_var.get()
+            sel_b = branch_var.get()
 
             workers = get_all_workers()
             profiles = get_profiles_dict()
-            attendance = get_attendance(sel_month)
+            attendance = get_attendance(sel_m)
 
-            if sel_loc != "All":
-                rel = {pid for pid, p in profiles.items() if p.location == sel_loc}
-                workers = [w for w in workers if w.profile_id in rel]
+            if sel_b != "All":
+                workers = [w for w in workers if w.branch == sel_b]
 
-            results, warnings = calculate_payroll(workers, profiles, attendance,
-                                                   sel_month)
+            results, warnings = calculate_payroll(workers, profiles, attendance, sel_m)
 
             if warnings:
-                warn_frame = ctk.CTkFrame(content_frame, fg_color="#3D2F00",
-                                           corner_radius=8)
-                warn_frame.pack(fill="x", pady=(0, 12))
-                ctk.CTkLabel(
-                    warn_frame,
-                    text=f"  ⚠️  {len(warnings)} warning(s): {warnings[0]}"
-                         + (" ..." if len(warnings) > 1 else ""),
-                    font=FONT_SMALL, text_color=WARNING_CLR, anchor="w"
-                ).pack(padx=12, pady=8)
+                wf = ctk.CTkFrame(content, fg_color="#3D2F00", corner_radius=8)
+                wf.pack(fill="x", pady=(0, 10))
+                ctk.CTkLabel(wf, text=f"  ⚠️  {len(warnings)} warning(s): {warnings[0]}"
+                             + (" ..." if len(warnings) > 1 else ""),
+                             font=FONT_SMALL, text_color=WARNING_CLR, anchor="w"
+                             ).pack(padx=12, pady=8)
 
             if not results:
-                empty = ctk.CTkFrame(content_frame, fg_color=CARD_BG,
-                                      corner_radius=12)
-                empty.pack(fill="x", pady=40, padx=60)
-                ctk.CTkLabel(
-                    empty, text="📭", font=(FONT_FAMILY, 40)
-                ).pack(pady=(30, 8))
-                ctk.CTkLabel(
-                    empty, text="No payroll data for this period",
-                    font=FONT_HEADING, text_color=TEXT_SECONDARY
-                ).pack()
-                ctk.CTkLabel(
-                    empty, text="Enter attendance data first to see results here.",
-                    font=FONT_SMALL, text_color=TEXT_MUTED
-                ).pack(pady=(4, 30))
+                ef = ctk.CTkFrame(content, fg_color=CARD_BG, corner_radius=12)
+                ef.pack(fill="x", pady=30, padx=40)
+                ctk.CTkLabel(ef, text="📭", font=(FONT_FAMILY, 40)).pack(pady=(30, 6))
+                ctk.CTkLabel(ef, text="No payroll data for this period",
+                             font=FONT_HEADING, text_color=TEXT_SECONDARY).pack()
+                ctk.CTkLabel(ef, text="Enter attendance data first to see results.",
+                             font=FONT_SMALL, text_color=TEXT_MUTED).pack(pady=(4, 30))
                 return
 
-            # Metrics
             s = payroll_summary(results)
-            metrics_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
-            metrics_frame.pack(fill="x", pady=(0, 16))
-            metrics_frame.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
-
+            mf = ctk.CTkFrame(content, fg_color="transparent")
+            mf.pack(fill="x", pady=(0, 14))
+            mf.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
             cards = [
                 ("Workers", str(s["total_workers"]), ACCENT),
                 ("Total Gross", fmt_inr(s["total_gross"]), "#26A69A"),
@@ -507,363 +384,253 @@ class PayrollApp(ctk.CTk):
                 ("Total ESI", fmt_inr(s["total_esi"]), "#AB47BC"),
                 ("Total Net Pay", fmt_inr(s["total_net"]), SUCCESS),
             ]
-            for i, (lbl, val, clr) in enumerate(cards):
-                mc = MetricCard(metrics_frame, lbl, val, color=clr)
-                mc.grid(row=0, column=i, padx=4, pady=4, sticky="nsew")
+            for i, (l, v, c) in enumerate(cards):
+                MetricCard(mf, l, v, color=c).grid(row=0, column=i, padx=4, pady=4, sticky="nsew")
 
-            # Payroll table
-            ctk.CTkLabel(
-                content_frame, text="Payroll Breakdown",
-                font=FONT_HEADING, text_color=TEXT_PRIMARY, anchor="w"
-            ).pack(fill="x", pady=(8, 8))
+            ctk.CTkLabel(content, text="Payroll Breakdown", font=FONT_HEADING,
+                          text_color=TEXT_PRIMARY, anchor="w").pack(fill="x", pady=(6, 6))
 
-            cols = ("Worker ID", "Name", "Profile", "Days",
-                    "Gross (₹)", "EPF (₹)", "ESI (₹)",
-                    "Total Ded.", "Net Pay (₹)")
-            widths = [80, 140, 130, 50, 110, 90, 90, 100, 120]
-
-            table = StyledTreeview(content_frame, columns=cols,
-                                    column_widths=widths, height=min(len(results), 15))
-            table.pack(fill="both", expand=True, pady=(0, 12))
-
-            rows = []
-            for r in results:
-                rows.append((
-                    r.worker_id, r.worker_name, r.profile_title,
-                    r.days_present,
-                    fmt_inr(r.gross), fmt_inr(r.epf_deduction),
-                    fmt_inr(r.esi_deduction), fmt_inr(r.total_deductions),
-                    fmt_inr(r.net_pay),
-                ))
+            cols = ("ID", "Name", "Branch", "Skill", "Designation", "Days",
+                    "Gross (₹)", "EPF (₹)", "ESI (₹)", "Net Pay (₹)")
+            widths = [60, 130, 90, 80, 120, 45, 100, 80, 75, 110]
+            table = StyledTreeview(content, columns=cols, column_widths=widths,
+                                    height=min(len(results), 14))
+            table.pack(fill="both", expand=True, pady=(0, 10))
+            rows = [(r.worker_id, r.worker_name, r.branch, r.skill_category,
+                     r.profile_title, r.days_present, fmt_inr(r.gross),
+                     fmt_inr(r.epf_deduction), fmt_inr(r.esi_deduction),
+                     fmt_inr(r.net_pay)) for r in results]
             table.insert_rows(rows)
 
-            # Export CSV button
             def export_csv():
                 import pandas as pd
                 path = filedialog.asksaveasfilename(
-                    defaultextension=".csv",
-                    filetypes=[("CSV files", "*.csv")],
-                    initialfile=f"Payroll_{sel_month}.csv"
-                )
+                    defaultextension=".csv", filetypes=[("CSV", "*.csv")],
+                    initialfile=f"Payroll_{sel_m}.csv")
                 if path:
-                    df = pd.DataFrame([r.summary_row() for r in results])
-                    df.to_csv(path, index=False)
-                    self.status_bar.set_message(
-                        f"✅ Exported CSV → {path}", SUCCESS)
-                    messagebox.showinfo("Export Complete",
-                                         f"CSV saved to:\n{path}")
+                    pd.DataFrame([r.summary_row() for r in results]).to_csv(path, index=False)
+                    self.status_bar.set_message(f"✅ CSV exported → {path}", SUCCESS)
+                    messagebox.showinfo("Export", f"CSV saved:\n{path}")
 
-            ctk.CTkButton(
-                content_frame, text="⬇️  Export CSV", font=FONT_BODY_BOLD,
-                fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                height=36, corner_radius=8, command=export_csv
-            ).pack(anchor="w", pady=(0, 20))
+            ctk.CTkButton(content, text="⬇️  Export CSV", font=FONT_BODY_BOLD,
+                           fg_color=ACCENT, hover_color=ACCENT_HOVER, height=36,
+                           corner_radius=8, command=export_csv).pack(anchor="w", pady=(0, 16))
 
-        # Bind refresh on control change
-        month_var.trace_add("write", lambda *_: refresh_dashboard())
-        loc_var.trace_add("write", lambda *_: refresh_dashboard())
-
-        # Refresh button
-        ctk.CTkButton(
-            ctrl, text="🔄 Refresh", font=FONT_BODY, width=100,
-            fg_color=SURFACE_3, hover_color=SURFACE_2,
-            text_color=TEXT_PRIMARY, height=32, corner_radius=8,
-            command=refresh_dashboard
-        ).pack(side="right")
-
-        refresh_dashboard()
+        month_var.trace_add("write", lambda *_: refresh())
+        branch_var.trace_add("write", lambda *_: refresh())
+        ctk.CTkButton(ctrl, text="🔄 Refresh", font=FONT_BODY, width=100,
+                       fg_color=SURFACE_3, hover_color=SURFACE_2,
+                       text_color=TEXT_PRIMARY, height=32, corner_radius=8,
+                       command=refresh).pack(side="right")
+        refresh()
 
     # ══════════════════════════════════════════════════════════════════════
-    #   PAGE: ATTENDANCE
+    #   ATTENDANCE
     # ══════════════════════════════════════════════════════════════════════
-    def _build_attendance(self, parent):
-        ctk.CTkLabel(
-            parent, text="📋  Attendance & Earnings Entry",
-            font=FONT_TITLE, text_color=TEXT_PRIMARY, anchor="w"
-        ).pack(fill="x", padx=28, pady=(20, 4))
-        ctk.CTkLabel(
-            parent, text="Enter daily attendance and manage per-worker allowances and deductions",
-            font=FONT_SMALL, text_color=TEXT_SECONDARY, anchor="w"
-        ).pack(fill="x", padx=28, pady=(0, 16))
+    def _page_attendance(self, parent):
+        ctk.CTkLabel(parent, text="📋  Attendance & Earnings Entry", font=FONT_TITLE,
+                      text_color=TEXT_PRIMARY, anchor="w").pack(fill="x", padx=28, pady=(20, 2))
+        ctk.CTkLabel(parent, text="Enter daily attendance and manage per-worker allowances / deductions",
+                      font=FONT_SMALL, text_color=TEXT_SECONDARY, anchor="w"
+                      ).pack(fill="x", padx=28, pady=(0, 14))
 
-        # Tabs
-        tabview = ctk.CTkTabview(
-            parent, fg_color=SURFACE_2, segmented_button_fg_color=SURFACE_3,
-            segmented_button_selected_color=ACCENT,
-            segmented_button_selected_hover_color=ACCENT_HOVER,
-            segmented_button_unselected_color=SURFACE_3,
-            segmented_button_unselected_hover_color=SIDEBAR_HOVER,
-            corner_radius=10
-        )
+        tabview = ctk.CTkTabview(parent, fg_color=SURFACE_2,
+                                  segmented_button_fg_color=SURFACE_3,
+                                  segmented_button_selected_color=ACCENT,
+                                  segmented_button_selected_hover_color=ACCENT_HOVER,
+                                  segmented_button_unselected_color=SURFACE_3,
+                                  segmented_button_unselected_hover_color=SIDEBAR_HOVER,
+                                  corner_radius=10)
         tabview.pack(fill="both", expand=True, padx=28, pady=(0, 20))
 
-        tab_manual = tabview.add("✏️ Manual Entry")
-        tab_csv = tabview.add("📥 CSV Import")
+        tab_manual = tabview.add("✏️  Manual Entry")
+        tab_csv = tabview.add("📥  CSV Import")
 
-        self._build_attendance_manual(tab_manual)
-        self._build_attendance_csv(tab_csv)
+        self._build_att_manual(tab_manual)
+        self._build_att_csv(tab_csv)
 
-    def _build_attendance_manual(self, parent):
+    def _build_att_manual(self, parent):
         opts = month_options()
         config = get_config()
 
-        # Controls
         ctrl = ctk.CTkFrame(parent, fg_color="transparent")
         ctrl.pack(fill="x", padx=12, pady=(12, 8))
 
         ctk.CTkLabel(ctrl, text="Month:", font=FONT_BODY_BOLD,
                       text_color=TEXT_PRIMARY).pack(side="left")
         month_var = ctk.StringVar(value=opts[-1])
-        ctk.CTkOptionMenu(
-            ctrl, values=opts, variable=month_var, width=140,
-            font=FONT_BODY, fg_color=SURFACE_3, button_color=ACCENT,
-            button_hover_color=ACCENT_HOVER
-        ).pack(side="left", padx=(8, 20))
+        ctk.CTkOptionMenu(ctrl, values=opts, variable=month_var, width=140,
+                           font=FONT_BODY, fg_color=SURFACE_3, button_color=ACCENT,
+                           button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 20))
 
-        ctk.CTkLabel(
-            ctrl, text=f"(Max working days: {config.working_days})",
-            font=FONT_SMALL, text_color=TEXT_MUTED
-        ).pack(side="left")
+        ctk.CTkLabel(ctrl, text="Branch:", font=FONT_BODY_BOLD,
+                      text_color=TEXT_PRIMARY).pack(side="left")
+        branch_var = ctk.StringVar(value="All")
+        ctk.CTkOptionMenu(ctrl, values=_branch_filter_list(), variable=branch_var,
+                           width=140, font=FONT_BODY, fg_color=SURFACE_3,
+                           button_color=ACCENT, button_hover_color=ACCENT_HOVER
+                           ).pack(side="left", padx=(8, 20))
 
-        # Container for the table
+        ctk.CTkLabel(ctrl, text=f"(Max working days: {config.working_days})",
+                      font=FONT_SMALL, text_color=TEXT_MUTED).pack(side="left")
+
         table_frame = ctk.CTkFrame(parent, fg_color="transparent")
         table_frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
 
-        # Store entry widgets keyed by worker_id
         self._att_entries = {}
 
-        def refresh_att_table():
+        def refresh():
             for w in table_frame.winfo_children():
                 w.destroy()
             self._att_entries.clear()
 
-            sel_month = month_var.get()
+            sel_m = month_var.get()
+            sel_b = branch_var.get()
             workers = get_all_workers()
+            if sel_b != "All":
+                workers = [w for w in workers if w.branch == sel_b]
             profiles = get_profiles_dict()
-            existing = {a.worker_id: a for a in get_attendance(sel_month)}
-
-            ctk.CTkLabel(
-                table_frame, text="Step 1 — Days Present & OT Wages",
-                font=FONT_SUBHEADING, text_color=TEXT_PRIMARY, anchor="w"
-            ).pack(fill="x", pady=(4, 8))
-
-            # Header
-            hdr = ctk.CTkFrame(table_frame, fg_color=ACCENT_DARK,
-                                corner_radius=6)
-            hdr.pack(fill="x", pady=(0, 2))
-            headers = ["Worker ID", "Name", "Profile", "Days Present", "OT Wages (₹)"]
-            hdr_widths = [0.12, 0.25, 0.23, 0.20, 0.20]
-            for txt, w in zip(headers, hdr_widths):
-                ctk.CTkLabel(
-                    hdr, text=txt, font=FONT_BODY_BOLD,
-                    text_color="white", anchor="w"
-                ).pack(side="left", padx=8, pady=6, expand=True, fill="x")
+            existing = {a.worker_id: a for a in get_attendance(sel_m)}
 
             if not workers:
-                ctk.CTkLabel(
-                    table_frame, text="No workers found. Add workers first.",
-                    font=FONT_BODY, text_color=TEXT_MUTED
-                ).pack(pady=20)
+                ctk.CTkLabel(table_frame, text="No workers found. Add workers first.",
+                              font=FONT_BODY, text_color=TEXT_MUTED).pack(pady=30)
                 return
 
-            # Rows
-            for i, w in enumerate(workers):
-                att = existing.get(w.worker_id,
-                                   AttendanceRecord(w.worker_id, sel_month))
-                p = profiles.get(w.profile_id)
+            ctk.CTkLabel(table_frame, text="Days Present & Overtime",
+                          font=FONT_SUBHEADING, text_color=TEXT_PRIMARY, anchor="w"
+                          ).pack(fill="x", pady=(4, 6))
 
+            hdr = ctk.CTkFrame(table_frame, fg_color=ACCENT_DARK, corner_radius=6)
+            hdr.pack(fill="x", pady=(0, 2))
+            for txt in ["ID", "Name", "Branch", "Skill", "Designation", "Days Present", "OT Wages (₹)"]:
+                ctk.CTkLabel(hdr, text=txt, font=(FONT_FAMILY, 10, "bold"),
+                              text_color="white", anchor="w").pack(
+                    side="left", padx=6, pady=5, expand=True, fill="x")
+
+            for i, w in enumerate(workers):
+                att = existing.get(w.worker_id, AttendanceRecord(w.worker_id, sel_m))
+                p = profiles.get(w.profile_id)
                 bg = SURFACE_2 if i % 2 == 0 else SURFACE_3
                 row = ctk.CTkFrame(table_frame, fg_color=bg, corner_radius=4)
                 row.pack(fill="x", pady=1)
 
-                ctk.CTkLabel(
-                    row, text=w.worker_id, font=FONT_SMALL,
-                    text_color=TEXT_PRIMARY, anchor="w", width=90
-                ).pack(side="left", padx=8, pady=5)
-
-                ctk.CTkLabel(
-                    row, text=w.name, font=FONT_SMALL,
-                    text_color=TEXT_PRIMARY, anchor="w", width=160
-                ).pack(side="left", padx=8, pady=5)
-
-                ctk.CTkLabel(
-                    row, text=(p.title if p else w.profile_id),
-                    font=FONT_SMALL, text_color=TEXT_SECONDARY,
-                    anchor="w", width=150
-                ).pack(side="left", padx=8, pady=5)
+                ctk.CTkLabel(row, text=w.worker_id, font=FONT_SMALL,
+                              text_color=TEXT_PRIMARY, width=60).pack(side="left", padx=6, pady=4)
+                ctk.CTkLabel(row, text=w.name, font=FONT_SMALL,
+                              text_color=TEXT_PRIMARY, width=120, anchor="w").pack(side="left", padx=6)
+                ctk.CTkLabel(row, text=w.branch, font=FONT_TINY,
+                              text_color=TEXT_SECONDARY, width=80, anchor="w").pack(side="left", padx=6)
+                ctk.CTkLabel(row, text=w.skill_category, font=FONT_TINY,
+                              text_color=TEXT_SECONDARY, width=75, anchor="w").pack(side="left", padx=6)
+                ctk.CTkLabel(row, text=(p.title if p else "—"), font=FONT_TINY,
+                              text_color=TEXT_SECONDARY, width=110, anchor="w").pack(side="left", padx=6)
 
                 days_var = ctk.StringVar(value=str(att.days_present))
-                days_entry = ctk.CTkEntry(
-                    row, textvariable=days_var, width=80, height=26,
-                    font=FONT_SMALL, fg_color=SURFACE,
-                    border_color=TEXT_MUTED, corner_radius=4
-                )
-                days_entry.pack(side="left", padx=8, pady=5)
-
+                ctk.CTkEntry(row, textvariable=days_var, width=70, height=24,
+                              font=FONT_SMALL, fg_color=SURFACE, border_color=TEXT_MUTED,
+                              corner_radius=4).pack(side="left", padx=6)
                 ot_var = ctk.StringVar(value=str(att.overtime_wages))
-                ot_entry = ctk.CTkEntry(
-                    row, textvariable=ot_var, width=100, height=26,
-                    font=FONT_SMALL, fg_color=SURFACE,
-                    border_color=TEXT_MUTED, corner_radius=4
-                )
-                ot_entry.pack(side="left", padx=8, pady=5)
+                ctk.CTkEntry(row, textvariable=ot_var, width=90, height=24,
+                              font=FONT_SMALL, fg_color=SURFACE, border_color=TEXT_MUTED,
+                              corner_radius=4).pack(side="left", padx=6)
 
                 self._att_entries[w.worker_id] = {
-                    "days": days_var,
-                    "ot": ot_var,
-                    "existing": att,
+                    "days": days_var, "ot": ot_var, "existing": att,
                 }
 
-            # Detailed allowances/deductions section
-            ctk.CTkLabel(
-                table_frame,
-                text="\nStep 2 — Detailed Allowances & Deductions (expand per worker)",
-                font=FONT_SUBHEADING, text_color=TEXT_PRIMARY, anchor="w"
-            ).pack(fill="x", pady=(12, 8))
-
-            ctk.CTkLabel(
-                table_frame,
-                text="Click 'Edit Details' next to a worker to set DA, HRA, Bonus, etc.",
-                font=FONT_SMALL, text_color=TEXT_MUTED, anchor="w"
-            ).pack(fill="x", pady=(0, 8))
+            # Detailed allowances per worker
+            ctk.CTkLabel(table_frame,
+                          text="\nDetailed Allowances & Deductions (expand per worker)",
+                          font=FONT_SUBHEADING, text_color=TEXT_PRIMARY, anchor="w"
+                          ).pack(fill="x", pady=(10, 6))
 
             for w in workers:
-                att = existing.get(w.worker_id,
-                                   AttendanceRecord(w.worker_id, sel_month))
-                detail_frame = ctk.CTkFrame(table_frame, fg_color=CARD_BG,
-                                             corner_radius=8)
-                detail_frame.pack(fill="x", pady=3)
+                att = existing.get(w.worker_id, AttendanceRecord(w.worker_id, sel_m))
+                df = ctk.CTkFrame(table_frame, fg_color=CARD_BG, corner_radius=8)
+                df.pack(fill="x", pady=2)
 
-                header_row = ctk.CTkFrame(detail_frame, fg_color="transparent")
-                header_row.pack(fill="x", padx=10, pady=(6, 0))
+                hr = ctk.CTkFrame(df, fg_color="transparent")
+                hr.pack(fill="x", padx=10, pady=(6, 0))
+                ctk.CTkLabel(hr, text=f"{w.worker_id} — {w.name}  [{w.branch}]",
+                              font=FONT_BODY_BOLD, text_color=TEXT_PRIMARY).pack(side="left")
 
-                ctk.CTkLabel(
-                    header_row,
-                    text=f"{w.worker_id} — {w.name}",
-                    font=FONT_BODY_BOLD, text_color=TEXT_PRIMARY
-                ).pack(side="left")
+                details = ctk.CTkFrame(df, fg_color="transparent")
 
-                # Collapsible details
-                details = ctk.CTkFrame(detail_frame, fg_color="transparent")
-                details.pack_forget()
+                shown = [False]
+                toggle_btn = ctk.CTkButton(
+                    hr, text="▶ Details", font=FONT_SMALL, width=90, height=24,
+                    corner_radius=6, fg_color=SURFACE_3, hover_color=SURFACE_2,
+                    text_color=TEXT_SECONDARY)
+                toggle_btn.pack(side="right")
 
-                def make_toggle(d=details, h=header_row):
-                    toggle_btn = ctk.CTkButton(
-                        h, text="▶ Edit Details", font=FONT_SMALL,
-                        width=100, height=26, corner_radius=6,
-                        fg_color=SURFACE_3, hover_color=SURFACE_2,
-                        text_color=TEXT_SECONDARY
-                    )
-                    toggle_btn.pack(side="right")
-                    shown = [False]
-
+                def make_toggle(d=details, tb=toggle_btn, sh=shown):
                     def toggle():
-                        if shown[0]:
-                            d.pack_forget()
-                            toggle_btn.configure(text="▶ Edit Details")
-                            shown[0] = False
+                        if sh[0]:
+                            d.pack_forget(); tb.configure(text="▶ Details"); sh[0] = False
                         else:
-                            d.pack(fill="x", padx=10, pady=(6, 10))
-                            toggle_btn.configure(text="▼ Hide Details")
-                            shown[0] = True
-                    toggle_btn.configure(command=toggle)
-
+                            d.pack(fill="x", padx=10, pady=(6, 10)); tb.configure(text="▼ Hide"); sh[0] = True
+                    tb.configure(command=toggle)
                 make_toggle()
-
-                # Build the detail fields
                 self._build_detail_fields(details, w.worker_id, att)
 
-            # Save All button
-            def save_all_attendance():
-                sel_month = month_var.get()
+            # Save button
+            def save_all():
+                sel_m = month_var.get()
                 records = []
-                workers = get_all_workers()
-                existing = {a.worker_id: a for a in get_attendance(sel_month)}
-
-                for w in workers:
-                    if w.worker_id not in self._att_entries:
-                        continue
-                    entry = self._att_entries[w.worker_id]
+                existing_db = {a.worker_id: a for a in get_attendance(sel_m)}
+                for wid, entry in self._att_entries.items():
                     att = entry.get("detail_att",
-                                    existing.get(w.worker_id,
-                                    AttendanceRecord(w.worker_id, sel_month)))
-
+                                    existing_db.get(wid, AttendanceRecord(wid, sel_m)))
                     try:
-                        days = float(entry["days"].get() or 0)
-                        ot = float(entry["ot"].get() or 0)
+                        att.days_present = float(entry["days"].get() or 0)
+                        att.overtime_wages = float(entry["ot"].get() or 0)
                     except ValueError:
-                        days, ot = 0.0, 0.0
-
-                    att.month = sel_month
-                    att.days_present = days
-                    att.overtime_wages = ot
+                        pass
+                    att.month = sel_m
                     records.append(att)
-
                 bulk_upsert_attendance(records)
                 self.status_bar.set_message(
-                    f"✅ Saved {len(records)} attendance records for {sel_month}",
-                    SUCCESS
-                )
-                messagebox.showinfo("Success",
-                    f"Saved {len(records)} records for {sel_month}.")
+                    f"✅ Saved {len(records)} records for {sel_m}", SUCCESS)
+                messagebox.showinfo("Saved", f"{len(records)} records saved for {sel_m}.")
 
-            ctk.CTkButton(
-                table_frame, text="💾  Save All Attendance",
-                font=FONT_BODY_BOLD, fg_color=SUCCESS,
-                hover_color="#2E7D32", height=40, corner_radius=8,
-                command=save_all_attendance
-            ).pack(fill="x", pady=(16, 20))
+            ctk.CTkButton(table_frame, text="💾  Save All Attendance",
+                           font=FONT_BODY_BOLD, fg_color=SUCCESS, hover_color="#2E7D32",
+                           height=40, corner_radius=8, command=save_all
+                           ).pack(fill="x", pady=(14, 16))
 
-        month_var.trace_add("write", lambda *_: refresh_att_table())
-        refresh_att_table()
+        month_var.trace_add("write", lambda *_: refresh())
+        branch_var.trace_add("write", lambda *_: refresh())
+        refresh()
 
     def _build_detail_fields(self, parent, worker_id, att):
-        """Build the allowances/deductions input fields for one worker."""
         fields = [
             ("DA (₹)", "da"), ("HRA (₹)", "hra"), ("CCA (₹)", "cca"),
             ("Arrears (₹)", "arrears"), ("N&FH Wages (₹)", "nfh_wages"),
-            ("Leave Wages (₹)", "leave_wages"),
-            ("Bonus (₹)", "bonus"),
-            ("Maternity Benefit (₹)", "maternity_benefit"),
-            ("Advance Pay (₹)", "advances_pay"),
-            ("Other Allowances (₹)", "other_allowances"),
-            ("EPF Override (0=auto)", "epf_override"),
-            ("ESI Override (0=auto)", "esi_override"),
-            ("Welfare Fund (₹)", "welfare_fund"),
-            ("TDS (₹)", "tds"),
-            ("Profession Tax (₹)", "profession_tax"),
-            ("Advance Repayment (₹)", "advance_repayment"),
-            ("Fine (₹)", "fine"),
-            ("Loss & Damages (₹)", "loss_damages"),
-            ("Other Deductions (₹)", "other_deductions"),
+            ("Leave Wages (₹)", "leave_wages"), ("Bonus (₹)", "bonus"),
+            ("Maternity (₹)", "maternity_benefit"), ("Advance Pay (₹)", "advances_pay"),
+            ("Other Allow. (₹)", "other_allowances"),
+            ("EPF Override (0=auto)", "epf_override"), ("ESI Override (0=auto)", "esi_override"),
+            ("Welfare Fund (₹)", "welfare_fund"), ("TDS (₹)", "tds"),
+            ("Prof. Tax (₹)", "profession_tax"), ("Adv. Repayment (₹)", "advance_repayment"),
+            ("Fine (₹)", "fine"), ("Loss/Damages (₹)", "loss_damages"),
+            ("Other Ded. (₹)", "other_deductions"),
         ]
-
         vars_dict = {}
-        cols_per_row = 3
         for i, (label, attr) in enumerate(fields):
-            row_idx, col_idx = divmod(i, cols_per_row)
-
-            if col_idx == 0:
+            if i % 3 == 0:
                 row_frame = ctk.CTkFrame(parent, fg_color="transparent")
                 row_frame.pack(fill="x", pady=2)
-
-            field = ctk.CTkFrame(row_frame, fg_color="transparent")
-            field.pack(side="left", expand=True, fill="x", padx=4)
-
-            ctk.CTkLabel(
-                field, text=label, font=FONT_TINY,
-                text_color=TEXT_SECONDARY, anchor="w"
-            ).pack(anchor="w")
-
+            f = ctk.CTkFrame(row_frame, fg_color="transparent")
+            f.pack(side="left", expand=True, fill="x", padx=4)
+            ctk.CTkLabel(f, text=label, font=FONT_TINY,
+                          text_color=TEXT_SECONDARY, anchor="w").pack(anchor="w")
             var = ctk.StringVar(value=str(getattr(att, attr, 0.0)))
-            ctk.CTkEntry(
-                field, textvariable=var, width=120, height=26,
-                font=FONT_SMALL, fg_color=SURFACE,
-                border_color=TEXT_MUTED, corner_radius=4
-            ).pack(anchor="w")
+            ctk.CTkEntry(f, textvariable=var, width=110, height=24,
+                          font=FONT_SMALL, fg_color=SURFACE, border_color=TEXT_MUTED,
+                          corner_radius=4).pack(anchor="w")
             vars_dict[attr] = var
 
-        # Store a way to build the AttendanceRecord from these vars
         def build_record():
             kwargs = {"worker_id": worker_id, "month": att.month}
             for _, attr in fields:
@@ -873,731 +640,830 @@ class PayrollApp(ctk.CTk):
                     kwargs[attr] = 0.0
             return AttendanceRecord(**kwargs)
 
-        # Save reference for the save function
-        if worker_id in self._att_entries:
-            self._att_entries[worker_id]["detail_att_builder"] = build_record
-
-        # Override the att in entries so save picks up detail fields
-        def update_detail_att(*_):
+        def update(*_):
             if worker_id in self._att_entries:
                 self._att_entries[worker_id]["detail_att"] = build_record()
-
         for _, attr in fields:
-            vars_dict[attr].trace_add("write", update_detail_att)
+            vars_dict[attr].trace_add("write", update)
+        update()
 
-        update_detail_att()
-
-    def _build_attendance_csv(self, parent):
-        ctk.CTkLabel(
-            parent,
-            text="Upload a CSV file to import attendance data in bulk.",
-            font=FONT_BODY, text_color=TEXT_SECONDARY, anchor="w"
-        ).pack(padx=16, pady=(16, 8))
+    def _build_att_csv(self, parent):
+        ctk.CTkLabel(parent, text="Upload a CSV to import attendance data in bulk.",
+                      font=FONT_BODY, text_color=TEXT_SECONDARY, anchor="w"
+                      ).pack(padx=16, pady=(16, 8))
 
         info = ctk.CTkFrame(parent, fg_color=CARD_BG, corner_radius=8)
-        info.pack(fill="x", padx=16, pady=(0, 12))
-        ctk.CTkLabel(
-            info, text="Supported columns:", font=FONT_BODY_BOLD,
-            text_color=TEXT_PRIMARY, anchor="w"
-        ).pack(padx=12, pady=(10, 4), anchor="w")
-        ctk.CTkLabel(
-            info,
-            text="worker_id, days_present, basic_wages, da, hra, cca,\n"
-                 "overtime_wages, arrears, advances_pay, nfh_wages,\n"
-                 "maternity_benefit, leave_wages, bonus, other_allowances,\n"
-                 "epf_override, esi_override, welfare_fund, tds,\n"
-                 "profession_tax, advance_repayment, fine, loss_damages,\n"
-                 "other_deductions",
-            font=FONT_TINY, text_color=TEXT_MUTED, anchor="w", justify="left"
-        ).pack(padx=12, pady=(0, 10), anchor="w")
+        info.pack(fill="x", padx=16, pady=(0, 10))
+        ctk.CTkLabel(info, text="Supported columns:", font=FONT_BODY_BOLD,
+                      text_color=TEXT_PRIMARY).pack(padx=12, pady=(10, 2), anchor="w")
+        ctk.CTkLabel(info,
+                      text="worker_id, days_present, basic_wages, da, hra, cca,\n"
+                           "overtime_wages, arrears, advances_pay, nfh_wages,\n"
+                           "bonus, other_allowances, epf_override, esi_override, …",
+                      font=FONT_TINY, text_color=TEXT_MUTED, justify="left"
+                      ).pack(padx=12, pady=(0, 10), anchor="w")
 
-        # Download template
-        def download_template():
+        def download_tpl():
             workers = get_all_workers()
-            tpl_cols = ["worker_id", "days_present", "basic_wages", "da",
-                        "hra", "cca", "overtime_wages", "bonus",
-                        "advance_repayment"]
+            tpl_cols = ["worker_id", "days_present", "basic_wages", "da", "hra",
+                        "cca", "overtime_wages", "bonus", "advance_repayment"]
             path = filedialog.asksaveasfilename(
-                defaultextension=".csv",
-                filetypes=[("CSV files", "*.csv")],
-                initialfile="attendance_template.csv"
-            )
+                defaultextension=".csv", filetypes=[("CSV", "*.csv")],
+                initialfile="attendance_template.csv")
             if path:
                 with open(path, "w", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(tpl_cols)
+                    wr = csv.writer(f); wr.writerow(tpl_cols)
                     for w in workers:
-                        writer.writerow(
-                            [w.worker_id] + [0] * (len(tpl_cols) - 1))
-                self.status_bar.set_message(f"✅ Template saved → {path}",
-                                             SUCCESS)
+                        wr.writerow([w.worker_id] + [0] * (len(tpl_cols) - 1))
+                self.status_bar.set_message(f"✅ Template → {path}", SUCCESS)
 
-        ctk.CTkButton(
-            parent, text="⬇️  Download Template CSV", font=FONT_BODY,
-            fg_color=SURFACE_3, hover_color=SURFACE_2,
-            text_color=TEXT_PRIMARY, height=34, corner_radius=8,
-            command=download_template
-        ).pack(padx=16, anchor="w", pady=(0, 16))
+        ctk.CTkButton(parent, text="⬇️  Download Template", font=FONT_BODY,
+                       fg_color=SURFACE_3, hover_color=SURFACE_2,
+                       text_color=TEXT_PRIMARY, height=32, corner_radius=8,
+                       command=download_tpl).pack(padx=16, anchor="w", pady=(0, 12))
 
-        ctk.CTkFrame(parent, height=1, fg_color=TEXT_MUTED).pack(
-            fill="x", padx=16, pady=(0, 12))
+        ctk.CTkFrame(parent, height=1, fg_color=TEXT_MUTED).pack(fill="x", padx=16, pady=(0, 10))
 
-        # Import controls
-        opts = month_options()
         ctrl = ctk.CTkFrame(parent, fg_color="transparent")
-        ctrl.pack(fill="x", padx=16, pady=(0, 8))
-
-        ctk.CTkLabel(ctrl, text="Import for Month:",
-                      font=FONT_BODY_BOLD,
+        ctrl.pack(fill="x", padx=16)
+        ctk.CTkLabel(ctrl, text="Import for Month:", font=FONT_BODY_BOLD,
                       text_color=TEXT_PRIMARY).pack(side="left")
+        opts = month_options()
         imp_month_var = ctk.StringVar(value=opts[-1])
-        ctk.CTkOptionMenu(
-            ctrl, values=opts, variable=imp_month_var, width=140,
-            font=FONT_BODY, fg_color=SURFACE_3, button_color=ACCENT,
-            button_hover_color=ACCENT_HOVER
-        ).pack(side="left", padx=(8, 0))
+        ctk.CTkOptionMenu(ctrl, values=opts, variable=imp_month_var, width=140,
+                           font=FONT_BODY, fg_color=SURFACE_3, button_color=ACCENT,
+                           button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 0))
 
         def import_csv():
-            filepath = filedialog.askopenfilename(
-                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
-            )
-            if not filepath:
-                return
-            month = imp_month_var.get()
-            res = import_attendance_from_csv(filepath, month)
-            msg = f"✅ Imported {res['imported']} records for {month}."
-            self.status_bar.set_message(msg, SUCCESS)
+            fp = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All", "*.*")])
+            if not fp: return
+            res = import_attendance_from_csv(fp, imp_month_var.get())
+            msg = f"Imported {res['imported']} records."
+            self.status_bar.set_message(f"✅ {msg}", SUCCESS)
             if res["errors"]:
-                messagebox.showwarning(
-                    "Import Warnings",
-                    f"Imported {res['imported']} records.\n\nErrors:\n"
-                    + "\n".join(res["errors"][:10])
-                )
+                messagebox.showwarning("Import", msg + "\n\nErrors:\n" + "\n".join(res["errors"][:10]))
             else:
-                messagebox.showinfo("Import Complete", msg)
+                messagebox.showinfo("Import", f"✅ {msg}")
 
-        ctk.CTkButton(
-            parent, text="📥  Import CSV", font=FONT_BODY_BOLD,
-            fg_color=ACCENT, hover_color=ACCENT_HOVER,
-            height=38, corner_radius=8, command=import_csv
-        ).pack(padx=16, anchor="w", pady=(12, 20))
+        ctk.CTkButton(parent, text="📥  Import CSV", font=FONT_BODY_BOLD,
+                       fg_color=ACCENT, hover_color=ACCENT_HOVER, height=38,
+                       corner_radius=8, command=import_csv).pack(padx=16, anchor="w", pady=(12, 20))
 
     # ══════════════════════════════════════════════════════════════════════
-    #   PAGE: WORKERS
+    #   WORKERS  (full Add / Edit / Delete)
     # ══════════════════════════════════════════════════════════════════════
-    def _build_workers(self, parent):
-        ctk.CTkLabel(
-            parent, text="👷  Worker Master Data",
-            font=FONT_TITLE, text_color=TEXT_PRIMARY, anchor="w"
-        ).pack(fill="x", padx=28, pady=(20, 4))
-        ctk.CTkLabel(
-            parent, text="Manage all worker registrations, bank details, and status",
-            font=FONT_SMALL, text_color=TEXT_SECONDARY, anchor="w"
-        ).pack(fill="x", padx=28, pady=(0, 16))
+    def _page_workers(self, parent):
+        ctk.CTkLabel(parent, text="👷  Worker Master Data", font=FONT_TITLE,
+                      text_color=TEXT_PRIMARY, anchor="w").pack(fill="x", padx=28, pady=(20, 2))
+        ctk.CTkLabel(parent, text="Add, edit, or delete workers — manage bank details, PF/ESIC, branch and skill",
+                      font=FONT_SMALL, text_color=TEXT_SECONDARY, anchor="w"
+                      ).pack(fill="x", padx=28, pady=(0, 14))
 
-        tabview = ctk.CTkTabview(
-            parent, fg_color=SURFACE_2,
-            segmented_button_fg_color=SURFACE_3,
-            segmented_button_selected_color=ACCENT,
-            segmented_button_selected_hover_color=ACCENT_HOVER,
-            segmented_button_unselected_color=SURFACE_3,
-            segmented_button_unselected_hover_color=SIDEBAR_HOVER,
-            corner_radius=10
-        )
+        tabview = ctk.CTkTabview(parent, fg_color=SURFACE_2,
+                                  segmented_button_fg_color=SURFACE_3,
+                                  segmented_button_selected_color=ACCENT,
+                                  segmented_button_selected_hover_color=ACCENT_HOVER,
+                                  segmented_button_unselected_color=SURFACE_3,
+                                  segmented_button_unselected_hover_color=SIDEBAR_HOVER,
+                                  corner_radius=10)
         tabview.pack(fill="both", expand=True, padx=28, pady=(0, 20))
 
         tab_all = tabview.add("👥 All Workers")
         tab_add = tabview.add("➕ Add / Edit")
 
-        # ─ All Workers tab ─
+        # ── Form variables (created early so table buttons can populate them) ─
+        form_vars = {}
+
+        def _populate_form(worker_id):
+            w = get_worker_by_id(worker_id)
+            if not w:
+                messagebox.showerror("Error", f"Worker '{worker_id}' not found.")
+                return
+            form_vars["wid"].set(w.worker_id)
+            form_vars["name"].set(w.name)
+            form_vars["profile"].set(w.profile_id)
+            form_vars["branch"].set(w.branch)
+            form_vars["skill"].set(w.skill_category)
+            form_vars["join"].set(w.joining_date)
+            form_vars["bank_acc"].set(w.bank_account)
+            form_vars["bank_name"].set(w.bank_name)
+            form_vars["ifsc"].set(w.ifsc_code)
+            form_vars["uan"].set(w.uan_number)
+            form_vars["esic"].set(w.esic_number)
+            tabview.set("➕ Add / Edit")
+            self.status_bar.set_message(f"Editing worker {w.worker_id} — {w.name}", ACCENT)
+
+        def _clear_form():
+            for key in ["wid", "name", "bank_acc", "bank_name", "ifsc", "uan", "esic"]:
+                form_vars[key].set("")
+            form_vars["join"].set(str(datetime.date.today()))
+            branches = get_all_branches()
+            if branches:
+                form_vars["branch"].set(branches[0])
+            else:
+                form_vars["branch"].set("")
+            form_vars["skill"].set(SKILL_CATEGORIES[-1])
+            profiles = get_all_profiles()
+            if profiles:
+                form_vars["profile"].set(profiles[0].profile_id)
+            self.status_bar.set_message("Form cleared — ready to add a new worker.")
+
+        # ── All Workers tab ──────────────────────────────────────────────
         def refresh_workers():
             for w in tab_all.winfo_children():
                 w.destroy()
 
-            workers = get_all_workers(active_only=False)
-            profiles = get_profiles_dict()
+            fc = ctk.CTkFrame(tab_all, fg_color="transparent")
+            fc.pack(fill="x", padx=8, pady=(8, 6))
+            ctk.CTkLabel(fc, text="Filter Branch:", font=FONT_BODY_BOLD,
+                          text_color=TEXT_PRIMARY).pack(side="left")
+            filt_var = ctk.StringVar(value="All")
+            ctk.CTkOptionMenu(fc, values=_branch_filter_list(), variable=filt_var,
+                               width=140, font=FONT_BODY, fg_color=SURFACE_3,
+                               button_color=ACCENT, button_hover_color=ACCENT_HOVER
+                               ).pack(side="left", padx=(8, 0))
 
-            cols = ("ID", "Name", "Profile", "Bank", "A/C",
-                    "IFSC", "UAN", "ESIC", "Status")
-            widths = [60, 140, 130, 100, 120, 100, 110, 90, 60]
+            table_container = ctk.CTkFrame(tab_all, fg_color="transparent")
+            table_container.pack(fill="both", expand=True, padx=8)
 
-            table = StyledTreeview(tab_all, columns=cols,
-                                    column_widths=widths, height=12)
-            table.pack(fill="both", expand=True, padx=8, pady=(8, 8))
+            def update_table(*_):
+                for w in table_container.winfo_children():
+                    w.destroy()
+                workers = get_all_workers(active_only=False)
+                if filt_var.get() != "All":
+                    workers = [w for w in workers if w.branch == filt_var.get()]
+                profiles = get_profiles_dict()
 
-            rows = []
-            for w in workers:
-                pname = (profiles[w.profile_id].title
-                         if w.profile_id in profiles else w.profile_id)
-                rows.append((
-                    w.worker_id, w.name, pname,
-                    w.bank_name, w.bank_account, w.ifsc_code,
-                    w.uan_number, w.esic_number,
-                    "✅ Active" if w.active else "❌ Inactive"
-                ))
-            table.insert_rows(rows)
+                if not workers:
+                    ef = ctk.CTkFrame(table_container, fg_color=CARD_BG, corner_radius=12)
+                    ef.pack(fill="x", pady=30, padx=30)
+                    ctk.CTkLabel(ef, text="👤", font=(FONT_FAMILY, 36)).pack(pady=(20, 4))
+                    ctk.CTkLabel(ef, text="No workers yet",
+                                 font=FONT_HEADING, text_color=TEXT_SECONDARY).pack()
+                    ctk.CTkLabel(ef, text='Go to the "➕ Add / Edit" tab to add your first worker.',
+                                 font=FONT_SMALL, text_color=TEXT_MUTED).pack(pady=(4, 20))
+                    return
 
-            # Deactivate control
-            ctrl = ctk.CTkFrame(tab_all, fg_color="transparent")
-            ctrl.pack(fill="x", padx=8, pady=(4, 12))
+                cols = ("ID", "Name", "Branch", "Skill", "Designation", "Bank", "A/C",
+                        "IFSC", "UAN (PF)", "ESIC IP", "Status")
+                widths = [55, 120, 80, 70, 100, 90, 100, 90, 90, 70, 55]
+                table = StyledTreeview(table_container, columns=cols,
+                                        column_widths=widths, height=min(len(workers), 12))
+                table.pack(fill="both", expand=True, pady=(4, 4))
 
-            active_ids = [w.worker_id for w in workers if w.active]
-            if active_ids:
-                ctk.CTkLabel(ctrl, text="Deactivate Worker:",
-                              font=FONT_BODY_BOLD,
+                rows = []
+                for w in workers:
+                    pn = profiles[w.profile_id].title if w.profile_id in profiles else w.profile_id
+                    rows.append((w.worker_id, w.name, w.branch, w.skill_category, pn,
+                                 w.bank_name, w.bank_account, w.ifsc_code,
+                                 w.uan_number, w.esic_number,
+                                 "✅" if w.active else "❌"))
+                table.insert_rows(rows)
+
+                # ── Action buttons
+                ctrl = ctk.CTkFrame(table_container, fg_color="transparent")
+                ctrl.pack(fill="x", pady=(6, 8))
+
+                all_ids = [w.worker_id for w in workers]
+                sel_var = ctk.StringVar(value=all_ids[0] if all_ids else "")
+
+                ctk.CTkLabel(ctrl, text="Select Worker:", font=FONT_BODY_BOLD,
                               text_color=TEXT_PRIMARY).pack(side="left")
-                deact_var = ctk.StringVar(value=active_ids[0])
-                ctk.CTkOptionMenu(
-                    ctrl, values=active_ids, variable=deact_var,
-                    width=120, font=FONT_BODY, fg_color=SURFACE_3,
-                    button_color=DANGER, button_hover_color="#C62828"
-                ).pack(side="left", padx=8)
+                ctk.CTkOptionMenu(ctrl, values=all_ids, variable=sel_var, width=100,
+                                   font=FONT_BODY, fg_color=SURFACE_3,
+                                   button_color=ACCENT, button_hover_color=ACCENT_HOVER
+                                   ).pack(side="left", padx=(8, 12))
 
-                def do_deactivate():
-                    wid = deact_var.get()
+                def do_edit():
+                    _populate_form(sel_var.get())
+
+                ctk.CTkButton(ctrl, text="✏️ Edit", font=FONT_BODY,
+                               fg_color=ACCENT, hover_color=ACCENT_HOVER, height=30,
+                               corner_radius=6, width=80, command=do_edit
+                               ).pack(side="left", padx=(0, 6))
+
+                def do_toggle_active():
+                    wid = sel_var.get()
+                    w = get_worker_by_id(wid)
+                    if not w: return
+                    if w.active:
+                        if messagebox.askyesno("Confirm", f"Deactivate '{wid}'?"):
+                            deactivate_worker(wid)
+                            self.status_bar.set_message(f"Worker {wid} deactivated.", WARNING_CLR)
+                            update_table()
+                    else:
+                        reactivate_worker(wid)
+                        self.status_bar.set_message(f"Worker {wid} re-activated.", SUCCESS)
+                        update_table()
+
+                ctk.CTkButton(ctrl, text="🔄 Toggle Active", font=FONT_BODY,
+                               fg_color=WARNING_CLR, hover_color="#E65100", height=30,
+                               corner_radius=6, width=120, command=do_toggle_active
+                               ).pack(side="left", padx=(0, 6))
+
+                def do_delete():
+                    wid = sel_var.get()
                     if messagebox.askyesno(
-                        "Confirm",
-                        f"Deactivate worker '{wid}'?"
+                        "⚠️ Permanently Delete",
+                        f"This will permanently delete worker '{wid}' "
+                        f"and ALL their attendance records.\n\n"
+                        f"This action cannot be undone. Continue?",
+                        icon="warning"
                     ):
-                        deactivate_worker(wid)
-                        self.status_bar.set_message(
-                            f"Worker {wid} deactivated.", WARNING_CLR)
-                        refresh_workers()
+                        delete_worker(wid)
+                        self.status_bar.set_message(f"🗑️ Worker {wid} permanently deleted.", DANGER)
+                        update_table()
 
-                ctk.CTkButton(
-                    ctrl, text="❌ Deactivate", font=FONT_BODY,
-                    fg_color=DANGER, hover_color="#C62828",
-                    height=32, corner_radius=6, command=do_deactivate
-                ).pack(side="left", padx=4)
+                ctk.CTkButton(ctrl, text="🗑️ Delete", font=FONT_BODY,
+                               fg_color=DANGER, hover_color="#C62828", height=30,
+                               corner_radius=6, width=80, command=do_delete
+                               ).pack(side="left")
 
-        refresh_workers()
+                def on_double_click(event):
+                    sel = table.tree.selection()
+                    if sel:
+                        item = table.tree.item(sel[0])
+                        wid = item["values"][0] if item["values"] else None
+                        if wid:
+                            _populate_form(str(wid))
 
-        # ─ Add / Edit tab ─
-        profiles = get_all_profiles()
-        pmap = {p.profile_id: f"{p.title} ({p.location})" for p in profiles}
+                table.tree.bind("<Double-1>", on_double_click)
 
+            filt_var.trace_add("write", update_table)
+            update_table()
+
+        # ── Add / Edit form ──────────────────────────────────────────────
         form = ctk.CTkFrame(tab_add, fg_color=CARD_BG, corner_radius=10)
         form.pack(fill="x", padx=16, pady=16)
 
-        ctk.CTkLabel(
-            form, text="Worker Registration Form",
-            font=FONT_HEADING, text_color=TEXT_PRIMARY
-        ).pack(padx=16, pady=(16, 12))
+        form_header = ctk.CTkFrame(form, fg_color="transparent")
+        form_header.pack(fill="x", padx=16, pady=(16, 10))
+        ctk.CTkLabel(form_header, text="Worker Registration Form", font=FONT_HEADING,
+                      text_color=TEXT_PRIMARY).pack(side="left")
+        ctk.CTkButton(form_header, text="🧹 Clear Form", font=FONT_SMALL,
+                       fg_color=SURFACE_3, hover_color=SURFACE_2,
+                       text_color=TEXT_SECONDARY, height=28, width=100,
+                       corner_radius=6, command=lambda: _clear_form()
+                       ).pack(side="right")
 
-        # Fields
-        fields_frame = ctk.CTkFrame(form, fg_color="transparent")
-        fields_frame.pack(fill="x", padx=16, pady=(0, 12))
+        ff = ctk.CTkFrame(form, fg_color="transparent")
+        ff.pack(fill="x", padx=16, pady=(0, 10))
+        ff.grid_columnconfigure((0, 1, 2), weight=1)
 
-        def make_field(parent, label, row, col, default="", width=200):
-            f = ctk.CTkFrame(parent, fg_color="transparent")
-            f.grid(row=row, column=col, padx=8, pady=4, sticky="ew")
-            ctk.CTkLabel(f, text=label, font=FONT_SMALL,
-                          text_color=TEXT_SECONDARY).pack(anchor="w")
-            var = ctk.StringVar(value=default)
-            ctk.CTkEntry(
-                f, textvariable=var, height=30, font=FONT_BODY,
-                fg_color=SURFACE, border_color=TEXT_MUTED, corner_radius=6,
-                width=width
-            ).pack(fill="x")
-            return var
+        def mkf(p, lbl, r, c, default=""):
+            f = ctk.CTkFrame(p, fg_color="transparent")
+            f.grid(row=r, column=c, padx=8, pady=4, sticky="ew")
+            ctk.CTkLabel(f, text=lbl, font=FONT_SMALL, text_color=TEXT_SECONDARY).pack(anchor="w")
+            v = ctk.StringVar(value=default)
+            ctk.CTkEntry(f, textvariable=v, height=30, font=FONT_BODY,
+                          fg_color=SURFACE, border_color=TEXT_MUTED, corner_radius=6).pack(fill="x")
+            return v
 
-        fields_frame.grid_columnconfigure((0, 1, 2), weight=1)
-
-        wid_var = make_field(fields_frame, "Worker ID *", 0, 0,
-                              placeholder := "")
-        wname_var = make_field(fields_frame, "Full Name *", 0, 1)
+        wid_var = mkf(ff, "Worker ID *", 0, 0)
+        wname_var = mkf(ff, "Full Name *", 0, 1)
 
         # Profile dropdown
-        pf = ctk.CTkFrame(fields_frame, fg_color="transparent")
+        profiles = get_all_profiles()
+        pf = ctk.CTkFrame(ff, fg_color="transparent")
         pf.grid(row=0, column=2, padx=8, pady=4, sticky="ew")
-        ctk.CTkLabel(pf, text="Job Profile *", font=FONT_SMALL,
+        ctk.CTkLabel(pf, text="Designation (Job Profile) *", font=FONT_SMALL,
                       text_color=TEXT_SECONDARY).pack(anchor="w")
-        prof_ids = list(pmap.keys()) if pmap else ["(none)"]
+        prof_ids = [p.profile_id for p in profiles] if profiles else ["—"]
         prof_var = ctk.StringVar(value=prof_ids[0] if prof_ids else "")
-        ctk.CTkOptionMenu(
-            pf, values=prof_ids, variable=prof_var,
-            font=FONT_BODY, fg_color=SURFACE, button_color=ACCENT,
-            button_hover_color=ACCENT_HOVER, height=30
-        ).pack(fill="x")
+        ctk.CTkOptionMenu(pf, values=prof_ids, variable=prof_var, font=FONT_BODY,
+                           fg_color=SURFACE, button_color=ACCENT,
+                           button_hover_color=ACCENT_HOVER, height=30).pack(fill="x")
 
-        wbank_var = make_field(fields_frame, "Bank Account No.", 1, 0)
-        wbname_var = make_field(fields_frame, "Bank Name", 1, 1)
-        wifsc_var = make_field(fields_frame, "IFSC Code", 1, 2)
-        wuan_var = make_field(fields_frame, "UAN Number (PF)", 2, 0)
-        wesic_var = make_field(fields_frame, "ESIC IP Number", 2, 1)
-        wjoin_var = make_field(fields_frame, "Joining Date (YYYY-MM-DD)",
-                                2, 2,
-                                default=str(datetime.date.today()))
+        # Branch dropdown (dynamic from DB)
+        bf = ctk.CTkFrame(ff, fg_color="transparent")
+        bf.grid(row=1, column=0, padx=8, pady=4, sticky="ew")
+        ctk.CTkLabel(bf, text="Branch *", font=FONT_SMALL, text_color=TEXT_SECONDARY).pack(anchor="w")
+        branches = _branch_list()
+        branch_var = ctk.StringVar(value=branches[0] if branches else "")
+        ctk.CTkOptionMenu(bf, values=branches, variable=branch_var,
+                           font=FONT_BODY, fg_color=SURFACE, button_color=ACCENT,
+                           button_hover_color=ACCENT_HOVER, height=30).pack(fill="x")
+
+        # Skill dropdown
+        sf = ctk.CTkFrame(ff, fg_color="transparent")
+        sf.grid(row=1, column=1, padx=8, pady=4, sticky="ew")
+        ctk.CTkLabel(sf, text="Skill Category *", font=FONT_SMALL, text_color=TEXT_SECONDARY).pack(anchor="w")
+        skill_var = ctk.StringVar(value=SKILL_CATEGORIES[-1])
+        ctk.CTkOptionMenu(sf, values=SKILL_CATEGORIES, variable=skill_var,
+                           font=FONT_BODY, fg_color=SURFACE, button_color=ACCENT,
+                           button_hover_color=ACCENT_HOVER, height=30).pack(fill="x")
+
+        wjoin_var = mkf(ff, "Joining Date (YYYY-MM-DD)", 1, 2, str(datetime.date.today()))
+
+        # Bank + statutory IDs
+        wbank_var = mkf(ff, "Bank Account Number", 2, 0)
+        wbname_var = mkf(ff, "Bank Name", 2, 1)
+        wifsc_var = mkf(ff, "IFSC Code", 2, 2)
+        wuan_var = mkf(ff, "UAN / PF ID Number", 3, 0)
+        wesic_var = mkf(ff, "ESIC IP Number", 3, 1)
+
+        # Store references
+        form_vars["wid"] = wid_var
+        form_vars["name"] = wname_var
+        form_vars["profile"] = prof_var
+        form_vars["branch"] = branch_var
+        form_vars["skill"] = skill_var
+        form_vars["join"] = wjoin_var
+        form_vars["bank_acc"] = wbank_var
+        form_vars["bank_name"] = wbname_var
+        form_vars["ifsc"] = wifsc_var
+        form_vars["uan"] = wuan_var
+        form_vars["esic"] = wesic_var
 
         def save_worker():
             wid = wid_var.get().strip().upper()
             wname = wname_var.get().strip()
             if not wid or not wname:
-                messagebox.showerror("Validation Error",
-                                      "Worker ID and Name are required.")
+                messagebox.showerror("Required", "Worker ID and Name are required.")
                 return
-
+            p = prof_var.get()
+            if not p or p == "(none)" or p == "—":
+                messagebox.showerror("Required",
+                    "Please create a Job Profile first (under 🏷️ Job Profiles).")
+                return
+            b = branch_var.get()
+            if not b or b == "(No branches)":
+                messagebox.showerror("Required",
+                    "Please create a Branch first (under 🏢 Branches).")
+                return
             upsert_worker(Worker(
-                wid, wname, prof_var.get(),
-                wbank_var.get().strip(), wbname_var.get().strip(),
-                wifsc_var.get().strip(), wuan_var.get().strip(),
-                wesic_var.get().strip(), wjoin_var.get().strip(), True
+                worker_id=wid, name=wname, profile_id=p,
+                bank_account=wbank_var.get().strip(),
+                bank_name=wbname_var.get().strip(),
+                ifsc_code=wifsc_var.get().strip(),
+                uan_number=wuan_var.get().strip(),
+                esic_number=wesic_var.get().strip(),
+                joining_date=wjoin_var.get().strip(),
+                active=True,
+                branch=b,
+                skill_category=skill_var.get(),
             ))
             self.status_bar.set_message(f"✅ Worker {wid} saved!", SUCCESS)
-            messagebox.showinfo("Success", f"Worker {wid} saved!")
+            messagebox.showinfo("Saved", f"Worker {wid} saved!")
+            _clear_form()
             refresh_workers()
 
-        ctk.CTkButton(
-            form, text="💾  Save Worker", font=FONT_BODY_BOLD,
-            fg_color=SUCCESS, hover_color="#2E7D32",
-            height=40, corner_radius=8, command=save_worker
-        ).pack(pady=(4, 16))
+        ctk.CTkButton(form, text="💾  Save Worker", font=FONT_BODY_BOLD,
+                       fg_color=SUCCESS, hover_color="#2E7D32", height=40,
+                       corner_radius=8, command=save_worker).pack(pady=(4, 16))
+
+        # Initialize table
+        refresh_workers()
 
     # ══════════════════════════════════════════════════════════════════════
-    #   PAGE: JOB PROFILES
+    #   JOB PROFILES  (simple: designation + daily wage + OT rate)
     # ══════════════════════════════════════════════════════════════════════
-    def _build_profiles(self, parent):
-        ctk.CTkLabel(
-            parent, text="🏷️  Job Profile Master",
-            font=FONT_TITLE, text_color=TEXT_PRIMARY, anchor="w"
-        ).pack(fill="x", padx=28, pady=(20, 4))
-        ctk.CTkLabel(
-            parent, text="Define job roles, daily wages, and overtime rates",
-            font=FONT_SMALL, text_color=TEXT_SECONDARY, anchor="w"
-        ).pack(fill="x", padx=28, pady=(0, 16))
+    def _page_profiles(self, parent):
+        ctk.CTkLabel(parent, text="🏷️  Job Profiles / Designations", font=FONT_TITLE,
+                      text_color=TEXT_PRIMARY, anchor="w").pack(fill="x", padx=28, pady=(20, 2))
+        ctk.CTkLabel(parent, text="Define job designations like Sweeper, Janitor, Supervisor with daily wage and OT rate",
+                      font=FONT_SMALL, text_color=TEXT_SECONDARY, anchor="w"
+                      ).pack(fill="x", padx=28, pady=(0, 14))
 
-        tabview = ctk.CTkTabview(
-            parent, fg_color=SURFACE_2,
-            segmented_button_fg_color=SURFACE_3,
-            segmented_button_selected_color=ACCENT,
-            segmented_button_selected_hover_color=ACCENT_HOVER,
-            segmented_button_unselected_color=SURFACE_3,
-            segmented_button_unselected_hover_color=SIDEBAR_HOVER,
-            corner_radius=10
-        )
+        tabview = ctk.CTkTabview(parent, fg_color=SURFACE_2,
+                                  segmented_button_fg_color=SURFACE_3,
+                                  segmented_button_selected_color=ACCENT,
+                                  segmented_button_selected_hover_color=ACCENT_HOVER,
+                                  segmented_button_unselected_color=SURFACE_3,
+                                  segmented_button_unselected_hover_color=SIDEBAR_HOVER,
+                                  corner_radius=10)
         tabview.pack(fill="both", expand=True, padx=28, pady=(0, 20))
-
         tab_all = tabview.add("📋 All Profiles")
         tab_add = tabview.add("➕ Add / Edit")
 
-        # ─ All profiles ─
         def refresh_profiles():
             for w in tab_all.winfo_children():
                 w.destroy()
-
             profiles = get_all_profiles()
-            cols = ("Profile ID", "Title", "Daily Wage (₹)",
-                    "OT Rate (₹/hr)", "Location")
-            widths = [120, 180, 120, 120, 160]
-            table = StyledTreeview(tab_all, columns=cols,
-                                    column_widths=widths, height=8)
+
+            if not profiles:
+                ef = ctk.CTkFrame(tab_all, fg_color=CARD_BG, corner_radius=12)
+                ef.pack(fill="x", pady=30, padx=30)
+                ctk.CTkLabel(ef, text="🏷️", font=(FONT_FAMILY, 36)).pack(pady=(20, 4))
+                ctk.CTkLabel(ef, text="No job profiles yet",
+                             font=FONT_HEADING, text_color=TEXT_SECONDARY).pack()
+                ctk.CTkLabel(ef, text='Add designations like Sweeper, Janitor, etc. in the "➕ Add / Edit" tab.',
+                             font=FONT_SMALL, text_color=TEXT_MUTED).pack(pady=(4, 20))
+                return
+
+            cols = ("Profile ID", "Designation", "Daily Wage (₹)", "OT Rate (₹/hr)")
+            widths = [150, 220, 150, 150]
+            table = StyledTreeview(tab_all, columns=cols, column_widths=widths, height=8)
             table.pack(fill="both", expand=True, padx=8, pady=(8, 8))
+            table.insert_rows([(p.profile_id, p.title, fmt_inr(p.daily_wage),
+                                fmt_inr(p.ot_rate)) for p in profiles])
 
-            rows = [(p.profile_id, p.title, fmt_inr(p.daily_wage),
-                     fmt_inr(p.ot_rate), p.location)
-                    for p in profiles]
-            table.insert_rows(rows)
-
-            # Delete control
             ctrl = ctk.CTkFrame(tab_all, fg_color="transparent")
-            ctrl.pack(fill="x", padx=8, pady=(4, 12))
-
+            ctrl.pack(fill="x", padx=8, pady=(4, 10))
             pids = [p.profile_id for p in profiles]
-            if pids:
-                ctk.CTkLabel(ctrl, text="Delete Profile:",
-                              font=FONT_BODY_BOLD,
-                              text_color=TEXT_PRIMARY).pack(side="left")
-                del_var = ctk.StringVar(value=pids[0])
-                ctk.CTkOptionMenu(
-                    ctrl, values=pids, variable=del_var, width=140,
-                    font=FONT_BODY, fg_color=SURFACE_3,
-                    button_color=DANGER, button_hover_color="#C62828"
-                ).pack(side="left", padx=8)
+            ctk.CTkLabel(ctrl, text="Delete:", font=FONT_BODY_BOLD,
+                          text_color=TEXT_PRIMARY).pack(side="left")
+            dv = ctk.StringVar(value=pids[0])
+            ctk.CTkOptionMenu(ctrl, values=pids, variable=dv, width=140,
+                               font=FONT_BODY, fg_color=SURFACE_3,
+                               button_color=DANGER, button_hover_color="#C62828"
+                               ).pack(side="left", padx=8)
 
-                def do_delete():
-                    pid = del_var.get()
-                    if messagebox.askyesno("Confirm",
-                                            f"Delete profile '{pid}'?"):
-                        delete_profile(pid)
-                        self.status_bar.set_message(
-                            f"Profile '{pid}' deleted.", WARNING_CLR)
+            def do_del():
+                if messagebox.askyesno("Confirm", f"Delete profile '{dv.get()}'?"):
+                    try:
+                        delete_profile(dv.get())
+                        self.status_bar.set_message(f"Profile deleted.", WARNING_CLR)
                         refresh_profiles()
+                    except Exception as e:
+                        messagebox.showerror("Error",
+                            f"Cannot delete: workers are using this profile.\n\n{e}")
 
-                ctk.CTkButton(
-                    ctrl, text="🗑️ Delete", font=FONT_BODY,
-                    fg_color=DANGER, hover_color="#C62828",
-                    height=32, corner_radius=6, command=do_delete
-                ).pack(side="left", padx=4)
+            ctk.CTkButton(ctrl, text="🗑️ Delete", font=FONT_BODY,
+                           fg_color=DANGER, hover_color="#C62828", height=30,
+                           corner_radius=6, command=do_del).pack(side="left")
 
         refresh_profiles()
 
-        # ─ Add / Edit ─
+        # Add / Edit form — simplified (just designation + wage + OT)
         form = ctk.CTkFrame(tab_add, fg_color=CARD_BG, corner_radius=10)
         form.pack(fill="x", padx=16, pady=16)
-
-        ctk.CTkLabel(
-            form, text="Profile Registration Form",
-            font=FONT_HEADING, text_color=TEXT_PRIMARY
-        ).pack(padx=16, pady=(16, 12))
-
+        ctk.CTkLabel(form, text="Job Profile / Designation Form", font=FONT_HEADING,
+                      text_color=TEXT_PRIMARY).pack(padx=16, pady=(16, 10))
         ff = ctk.CTkFrame(form, fg_color="transparent")
-        ff.pack(fill="x", padx=16, pady=(0, 12))
+        ff.pack(fill="x", padx=16, pady=(0, 10))
         ff.grid_columnconfigure((0, 1), weight=1)
 
-        def pfield(parent, label, row, col, default=""):
-            f = ctk.CTkFrame(parent, fg_color="transparent")
-            f.grid(row=row, column=col, padx=8, pady=4, sticky="ew")
-            ctk.CTkLabel(f, text=label, font=FONT_SMALL,
-                          text_color=TEXT_SECONDARY).pack(anchor="w")
-            var = ctk.StringVar(value=default)
-            ctk.CTkEntry(
-                f, textvariable=var, height=30, font=FONT_BODY,
-                fg_color=SURFACE, border_color=TEXT_MUTED, corner_radius=6
-            ).pack(fill="x")
-            return var
+        def pf(p, lbl, r, c, default=""):
+            f = ctk.CTkFrame(p, fg_color="transparent")
+            f.grid(row=r, column=c, padx=8, pady=4, sticky="ew")
+            ctk.CTkLabel(f, text=lbl, font=FONT_SMALL, text_color=TEXT_SECONDARY).pack(anchor="w")
+            v = ctk.StringVar(value=default)
+            ctk.CTkEntry(f, textvariable=v, height=30, font=FONT_BODY,
+                          fg_color=SURFACE, border_color=TEXT_MUTED, corner_radius=6).pack(fill="x")
+            return v
 
-        pid_var = pfield(ff, "Profile ID *", 0, 0)
-        ptit_var = pfield(ff, "Title *", 0, 1)
-        pdw_var = pfield(ff, "Daily Wage (₹) *", 1, 0, "494.0")
-        pot_var = pfield(ff, "OT Rate (₹/hr) *", 1, 1, "65.0")
-        ploc_var = pfield(ff, "Location / Site *", 2, 0, "Head Office")
+        pid_var = pf(ff, "Profile ID * (no spaces, e.g. sweeper)", 0, 0)
+        ptit_var = pf(ff, "Designation Title * (e.g. Sweeper)", 0, 1)
+        pdw_var = pf(ff, "Daily Wage (₹) *", 1, 0, "494.0")
+        pot_var = pf(ff, "OT Rate (₹/hr) *", 1, 1, "65.0")
 
-        def save_profile():
-            pid = pid_var.get().strip().lower()
+        def save_prof():
+            pid = pid_var.get().strip().lower().replace(" ", "_")
             ptit = ptit_var.get().strip()
             if not pid or not ptit:
-                messagebox.showerror("Validation",
-                                      "Profile ID and Title are required.")
-                return
-            if " " in pid:
-                messagebox.showerror("Validation",
-                                      "No spaces in Profile ID.")
+                messagebox.showerror("Required", "Profile ID and Designation are required.")
                 return
             try:
-                dw = float(pdw_var.get())
-                ot = float(pot_var.get())
+                dw = float(pdw_var.get()); ot = float(pot_var.get())
             except ValueError:
-                messagebox.showerror("Validation",
-                                      "Wage/Rate must be numbers.")
+                messagebox.showerror("Validation", "Wage/Rate must be numbers.")
                 return
-
-            upsert_profile(MasterProfile(pid, ptit, dw, ot,
-                                          ploc_var.get().strip()))
-            self.status_bar.set_message(f"✅ Profile '{pid}' saved!", SUCCESS)
-            messagebox.showinfo("Success", f"Profile '{pid}' saved!")
+            upsert_profile(MasterProfile(pid, ptit, dw, ot, ""))
+            self.status_bar.set_message(f"✅ Profile '{ptit}' saved!", SUCCESS)
+            messagebox.showinfo("Saved", f"Designation '{ptit}' (ID: {pid}) saved!")
             refresh_profiles()
 
-        ctk.CTkButton(
-            form, text="💾  Save Profile", font=FONT_BODY_BOLD,
-            fg_color=SUCCESS, hover_color="#2E7D32",
-            height=40, corner_radius=8, command=save_profile
-        ).pack(pady=(4, 16))
+        ctk.CTkButton(form, text="💾  Save Profile", font=FONT_BODY_BOLD,
+                       fg_color=SUCCESS, hover_color="#2E7D32", height=40,
+                       corner_radius=8, command=save_prof).pack(pady=(4, 16))
 
     # ══════════════════════════════════════════════════════════════════════
-    #   PAGE: GENERATE SLIPS
+    #   BRANCHES  (Add / Rename / Delete)
     # ══════════════════════════════════════════════════════════════════════
-    def _build_slips(self, parent):
-        ctk.CTkLabel(
-            parent, text="📄  Generate Salary Slips",
-            font=FONT_TITLE, text_color=TEXT_PRIMARY, anchor="w"
-        ).pack(fill="x", padx=28, pady=(20, 4))
-        ctk.CTkLabel(
-            parent, text="Generate PDF salary slips for all or individual workers",
-            font=FONT_SMALL, text_color=TEXT_SECONDARY, anchor="w"
-        ).pack(fill="x", padx=28, pady=(0, 16))
-
-        config = get_config()
-        opts = month_options()
-
-        # Controls
-        ctrl = ctk.CTkFrame(parent, fg_color="transparent")
-        ctrl.pack(fill="x", padx=28, pady=(0, 12))
-
-        ctk.CTkLabel(ctrl, text="Month:", font=FONT_BODY_BOLD,
-                      text_color=TEXT_PRIMARY).pack(side="left")
-        month_var = ctk.StringVar(value=opts[-1])
-        ctk.CTkOptionMenu(
-            ctrl, values=opts, variable=month_var, width=140,
-            font=FONT_BODY, fg_color=SURFACE_3, button_color=ACCENT,
-            button_hover_color=ACCENT_HOVER
-        ).pack(side="left", padx=(8, 20))
-
-        profiles = get_profiles_dict()
-        locs = sorted({p.location for p in profiles.values()})
-        ctk.CTkLabel(ctrl, text="Location:", font=FONT_BODY_BOLD,
-                      text_color=TEXT_PRIMARY).pack(side="left")
-        loc_var = ctk.StringVar(value="All")
-        ctk.CTkOptionMenu(
-            ctrl, values=["All"] + locs, variable=loc_var, width=160,
-            font=FONT_BODY, fg_color=SURFACE_3, button_color=ACCENT,
-            button_hover_color=ACCENT_HOVER
-        ).pack(side="left", padx=(8, 0))
+    def _page_branches(self, parent):
+        ctk.CTkLabel(parent, text="🏢  Branch Management", font=FONT_TITLE,
+                      text_color=TEXT_PRIMARY, anchor="w").pack(fill="x", padx=28, pady=(20, 2))
+        ctk.CTkLabel(parent, text="Add, rename, or remove company branches",
+                      font=FONT_SMALL, text_color=TEXT_SECONDARY, anchor="w"
+                      ).pack(fill="x", padx=28, pady=(0, 14))
 
         content = ctk.CTkFrame(parent, fg_color="transparent")
         content.pack(fill="both", expand=True, padx=28, pady=(0, 20))
 
-        def refresh_slips():
+        def refresh():
             for w in content.winfo_children():
                 w.destroy()
 
-            sel_month = month_var.get()
-            sel_loc = loc_var.get()
+            branches = get_all_branches()
+            counts = branch_worker_count()
+
+            # ── Add new branch ─────────────────────────────────────────
+            add_card = ctk.CTkFrame(content, fg_color=CARD_BG, corner_radius=12)
+            add_card.pack(fill="x", pady=(0, 16))
+            ctk.CTkLabel(add_card, text="➕  Add New Branch", font=FONT_HEADING,
+                          text_color=TEXT_PRIMARY).pack(padx=20, pady=(16, 8), anchor="w")
+
+            add_row = ctk.CTkFrame(add_card, fg_color="transparent")
+            add_row.pack(fill="x", padx=20, pady=(0, 16))
+
+            new_var = ctk.StringVar()
+            ctk.CTkEntry(add_row, textvariable=new_var, height=36, width=300,
+                          font=FONT_BODY, fg_color=SURFACE, border_color=TEXT_MUTED,
+                          corner_radius=6, placeholder_text="Enter branch name..."
+                          ).pack(side="left", padx=(0, 12))
+
+            def do_add():
+                name = new_var.get().strip()
+                if not name:
+                    messagebox.showerror("Required", "Branch name cannot be empty.")
+                    return
+                try:
+                    add_branch(name)
+                    self.status_bar.set_message(f"✅ Branch '{name}' added!", SUCCESS)
+                    new_var.set("")
+                    refresh()
+                except Exception as e:
+                    messagebox.showerror("Error", f"Branch already exists or error:\n{e}")
+
+            ctk.CTkButton(add_row, text="➕ Add Branch", font=FONT_BODY_BOLD,
+                           fg_color=SUCCESS, hover_color="#2E7D32", height=36,
+                           corner_radius=8, command=do_add).pack(side="left")
+
+            # ── Existing branches ──────────────────────────────────────
+            if not branches:
+                ef = ctk.CTkFrame(content, fg_color=CARD_BG, corner_radius=12)
+                ef.pack(fill="x", pady=10)
+                ctk.CTkLabel(ef, text="🏢", font=(FONT_FAMILY, 36)).pack(pady=(20, 4))
+                ctk.CTkLabel(ef, text="No branches yet",
+                             font=FONT_HEADING, text_color=TEXT_SECONDARY).pack()
+                ctk.CTkLabel(ef, text="Add your first branch above.",
+                             font=FONT_SMALL, text_color=TEXT_MUTED).pack(pady=(4, 20))
+                return
+
+            ctk.CTkLabel(content, text="Existing Branches", font=FONT_HEADING,
+                          text_color=TEXT_PRIMARY, anchor="w").pack(fill="x", pady=(0, 8))
+
+            for b in branches:
+                count = counts.get(b, 0)
+                card = ctk.CTkFrame(content, fg_color=CARD_BG, corner_radius=10)
+                card.pack(fill="x", pady=3)
+
+                info_row = ctk.CTkFrame(card, fg_color="transparent")
+                info_row.pack(fill="x", padx=16, pady=10)
+
+                ctk.CTkLabel(info_row, text=f"📍  {b}", font=FONT_BODY_BOLD,
+                              text_color=TEXT_PRIMARY).pack(side="left")
+                ctk.CTkLabel(info_row, text=f"  ({count} active worker{'s' if count != 1 else ''})",
+                              font=FONT_SMALL, text_color=TEXT_MUTED).pack(side="left", padx=(4, 0))
+
+                # Rename button
+                def make_rename(branch_name=b):
+                    def do_rename():
+                        dialog = ctk.CTkInputDialog(
+                            text=f"Rename '{branch_name}' to:",
+                            title="Rename Branch")
+                        new_name = dialog.get_input()
+                        if new_name and new_name.strip():
+                            try:
+                                rename_branch(branch_name, new_name.strip())
+                                self.status_bar.set_message(
+                                    f"✅ Branch renamed: {branch_name} → {new_name.strip()}", SUCCESS)
+                                refresh()
+                            except Exception as e:
+                                messagebox.showerror("Error", f"Rename failed:\n{e}")
+                    return do_rename
+
+                ctk.CTkButton(info_row, text="✏️ Rename", font=FONT_SMALL,
+                               fg_color=ACCENT, hover_color=ACCENT_HOVER, height=28,
+                               corner_radius=6, width=80, command=make_rename()
+                               ).pack(side="right", padx=(6, 0))
+
+                # Delete button
+                def make_delete(branch_name=b, wcount=count):
+                    def do_del():
+                        extra = ""
+                        if wcount > 0:
+                            extra = (f"\n\n⚠️ {wcount} worker(s) are assigned to this branch. "
+                                     f"They will become unassigned.")
+                        if messagebox.askyesno(
+                            "Delete Branch",
+                            f"Delete branch '{branch_name}'?{extra}",
+                            icon="warning" if wcount > 0 else "question"
+                        ):
+                            delete_branch(branch_name)
+                            self.status_bar.set_message(
+                                f"🗑️ Branch '{branch_name}' deleted.", DANGER)
+                            refresh()
+                    return do_del
+
+                ctk.CTkButton(info_row, text="🗑️", font=FONT_SMALL,
+                               fg_color=DANGER, hover_color="#C62828", height=28,
+                               corner_radius=6, width=40, command=make_delete()
+                               ).pack(side="right")
+
+        refresh()
+
+    # ══════════════════════════════════════════════════════════════════════
+    #   GENERATE SLIPS
+    # ══════════════════════════════════════════════════════════════════════
+    def _page_slips(self, parent):
+        ctk.CTkLabel(parent, text="📄  Generate Salary Slips", font=FONT_TITLE,
+                      text_color=TEXT_PRIMARY, anchor="w").pack(fill="x", padx=28, pady=(20, 2))
+        ctk.CTkLabel(parent, text="Generate PDF salary slips — per branch or for all workers",
+                      font=FONT_SMALL, text_color=TEXT_SECONDARY, anchor="w"
+                      ).pack(fill="x", padx=28, pady=(0, 14))
+
+        ctrl = ctk.CTkFrame(parent, fg_color="transparent")
+        ctrl.pack(fill="x", padx=28, pady=(0, 10))
+
+        opts = month_options()
+        ctk.CTkLabel(ctrl, text="Month:", font=FONT_BODY_BOLD,
+                      text_color=TEXT_PRIMARY).pack(side="left")
+        month_var = ctk.StringVar(value=opts[-1])
+        ctk.CTkOptionMenu(ctrl, values=opts, variable=month_var, width=140,
+                           font=FONT_BODY, fg_color=SURFACE_3, button_color=ACCENT,
+                           button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 20))
+
+        ctk.CTkLabel(ctrl, text="Branch:", font=FONT_BODY_BOLD,
+                      text_color=TEXT_PRIMARY).pack(side="left")
+        branch_var = ctk.StringVar(value="All")
+        ctk.CTkOptionMenu(ctrl, values=_branch_filter_list(), variable=branch_var,
+                           width=150, font=FONT_BODY, fg_color=SURFACE_3,
+                           button_color=ACCENT, button_hover_color=ACCENT_HOVER
+                           ).pack(side="left", padx=(8, 0))
+
+        content = ctk.CTkFrame(parent, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=28, pady=(0, 20))
+
+        def refresh():
+            for w in content.winfo_children():
+                w.destroy()
+            sel_m = month_var.get()
+            sel_b = branch_var.get()
 
             workers = get_all_workers()
-            profs = get_profiles_dict()
-            attendance = get_attendance(sel_month)
+            if sel_b != "All":
+                workers = [w for w in workers if w.branch == sel_b]
+            profiles = get_profiles_dict()
+            attendance = get_attendance(sel_m)
 
-            if sel_loc != "All":
-                rel = {pid for pid, p in profs.items()
-                       if p.location == sel_loc}
-                workers = [w for w in workers if w.profile_id in rel]
-
-            results, warnings = calculate_payroll(
-                workers, profs, attendance, sel_month)
+            results, warnings = calculate_payroll(workers, profiles, attendance, sel_m)
 
             if warnings:
-                wf = ctk.CTkFrame(content, fg_color="#3D2F00",
-                                   corner_radius=8)
+                wf = ctk.CTkFrame(content, fg_color="#3D2F00", corner_radius=8)
                 wf.pack(fill="x", pady=(0, 8))
-                ctk.CTkLabel(
-                    wf,
-                    text=f"  ⚠️  {len(warnings)} warning(s)",
-                    font=FONT_SMALL, text_color=WARNING_CLR
-                ).pack(padx=12, pady=6)
+                ctk.CTkLabel(wf, text=f"  ⚠️  {len(warnings)} warning(s)",
+                             font=FONT_SMALL, text_color=WARNING_CLR).pack(padx=12, pady=6)
 
             if not results:
-                ef = ctk.CTkFrame(content, fg_color=CARD_BG,
-                                   corner_radius=12)
+                ef = ctk.CTkFrame(content, fg_color=CARD_BG, corner_radius=12)
                 ef.pack(fill="x", pady=30, padx=40)
-                ctk.CTkLabel(ef, text="📭", font=(FONT_FAMILY, 36)).pack(
-                    pady=(20, 6))
-                ctk.CTkLabel(
-                    ef, text="No payroll data available.",
-                    font=FONT_HEADING, text_color=TEXT_SECONDARY
-                ).pack(pady=(0, 20))
+                ctk.CTkLabel(ef, text="📭", font=(FONT_FAMILY, 36)).pack(pady=(20, 4))
+                ctk.CTkLabel(ef, text="No payroll data. Add attendance first.",
+                             font=FONT_HEADING, text_color=TEXT_SECONDARY).pack(pady=(0, 20))
                 return
 
-            ctk.CTkLabel(
-                content, text=f"Ready: {len(results)} slip(s)",
-                font=FONT_HEADING, text_color=TEXT_PRIMARY, anchor="w"
-            ).pack(fill="x", pady=(0, 8))
+            ctk.CTkLabel(content, text=f"Ready: {len(results)} slip(s)",
+                          font=FONT_HEADING, text_color=TEXT_PRIMARY, anchor="w"
+                          ).pack(fill="x", pady=(0, 6))
 
-            # Summary table
-            cols = ("Worker ID", "Name", "Profile", "Net Pay (₹)")
-            widths = [100, 180, 160, 140]
-            table = StyledTreeview(content, columns=cols,
-                                    column_widths=widths,
+            cols = ("ID", "Name", "Branch", "Skill", "Designation", "Net Pay (₹)")
+            widths = [70, 150, 100, 80, 130, 120]
+            table = StyledTreeview(content, columns=cols, column_widths=widths,
                                     height=min(len(results), 10))
-            table.pack(fill="both", expand=True, pady=(0, 12))
+            table.pack(fill="both", expand=True, pady=(0, 10))
+            table.insert_rows([(r.worker_id, r.worker_name, r.branch,
+                                r.skill_category, r.profile_title,
+                                fmt_inr(r.net_pay)) for r in results])
 
-            rows = [(r.worker_id, r.worker_name, r.profile_title,
-                     fmt_inr(r.net_pay)) for r in results]
-            table.insert_rows(rows)
-
-            # Action buttons
-            btn_frame = ctk.CTkFrame(content, fg_color="transparent")
-            btn_frame.pack(fill="x", pady=(8, 4))
-
-            def gen_all_zip():
-                out_dir = filedialog.askdirectory(
-                    title="Select output folder")
-                if not out_dir:
-                    return
-                self.status_bar.set_message("⏳ Generating PDFs...",
-                                             ACCENT)
+            def gen_all():
+                out_dir = filedialog.askdirectory(title="Select output folder for salary slips")
+                if not out_dir: return
+                self.status_bar.set_message("⏳ Generating PDFs...", ACCENT)
                 self.update()
 
-                # Run in thread to keep UI responsive
-                def do_gen():
+                def do():
                     cfg = get_config()
-                    gen = generate_bulk_pdfs(results, cfg, out_dir,
-                                             zip_output=True)
-                    self.after(0, lambda: _on_gen_done(gen, out_dir))
+                    gen = generate_bulk_pdfs(results, cfg, out_dir, zip_output=True)
+                    self.after(0, lambda: done(gen, out_dir))
 
-                def _on_gen_done(gen, out_dir):
+                def done(gen, od):
                     for e in gen["errors"]:
                         messagebox.showerror("Error", e)
-                    msg = (f"✅ {gen['success_count']} slips generated "
-                           f"→ {out_dir}")
+                    msg = f"✅ {gen['success_count']} slips → {od}"
                     self.status_bar.set_message(msg, SUCCESS)
-                    messagebox.showinfo("Generation Complete",
+                    messagebox.showinfo("Done",
                         f"{gen['success_count']} salary slips generated.\n\n"
-                        f"Output: {out_dir}\n"
-                        + (f"ZIP: {gen['zip_path']}" if gen['zip_path']
-                           else ""))
-                    # Open folder
-                    try:
-                        os.startfile(out_dir)
-                    except Exception:
-                        pass
+                        f"Folder: {od}\n" +
+                        (f"ZIP: {gen['zip_path']}" if gen['zip_path'] else ""))
+                    try: os.startfile(od)
+                    except Exception: pass
 
-                threading.Thread(target=do_gen, daemon=True).start()
+                threading.Thread(target=do, daemon=True).start()
 
-            ctk.CTkButton(
-                btn_frame, text="📦  Generate ALL as ZIP",
-                font=FONT_BODY_BOLD, fg_color=ACCENT,
-                hover_color=ACCENT_HOVER,
-                height=42, corner_radius=8, command=gen_all_zip
-            ).pack(side="left", padx=(0, 12))
+            ctk.CTkButton(content, text="📦  Generate ALL Slips (PDF + ZIP)",
+                           font=FONT_BODY_BOLD, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                           height=42, corner_radius=8, command=gen_all
+                           ).pack(fill="x", pady=(8, 8))
 
-            # Single slip
-            single_frame = ctk.CTkFrame(content, fg_color=CARD_BG,
-                                          corner_radius=10)
-            single_frame.pack(fill="x", pady=(12, 4))
+            # ── Single slip ──
+            single = ctk.CTkFrame(content, fg_color=CARD_BG, corner_radius=10)
+            single.pack(fill="x", pady=(4, 4))
+            ctk.CTkLabel(single, text="Generate Single Slip", font=FONT_SUBHEADING,
+                          text_color=TEXT_PRIMARY).pack(padx=12, pady=(10, 4), anchor="w")
+            sc = ctk.CTkFrame(single, fg_color="transparent")
+            sc.pack(fill="x", padx=12, pady=(0, 12))
 
-            ctk.CTkLabel(
-                single_frame, text="Generate Single Slip",
-                font=FONT_SUBHEADING, text_color=TEXT_PRIMARY
-            ).pack(padx=12, pady=(12, 4), anchor="w")
-
-            sf_ctrl = ctk.CTkFrame(single_frame, fg_color="transparent")
-            sf_ctrl.pack(fill="x", padx=12, pady=(0, 12))
-
-            names = {r.worker_id: r.worker_name for r in results}
-            name_list = [f"{k} — {v}" for k, v in names.items()]
-            sel_worker_var = ctk.StringVar(
-                value=name_list[0] if name_list else "")
-            ctk.CTkOptionMenu(
-                sf_ctrl, values=name_list, variable=sel_worker_var,
-                width=260, font=FONT_BODY, fg_color=SURFACE,
-                button_color=ACCENT, button_hover_color=ACCENT_HOVER
-            ).pack(side="left", padx=(0, 12))
+            names = {r.worker_id: f"{r.worker_id} — {r.worker_name} [{r.branch}]" for r in results}
+            nl = list(names.values())
+            sel_w = ctk.StringVar(value=nl[0] if nl else "")
+            ctk.CTkOptionMenu(sc, values=nl, variable=sel_w, width=280,
+                               font=FONT_BODY, fg_color=SURFACE, button_color=ACCENT,
+                               button_hover_color=ACCENT_HOVER).pack(side="left", padx=(0, 12))
 
             def gen_single():
-                sel = sel_worker_var.get()
-                wid = sel.split(" — ")[0] if " — " in sel else sel
-                target = next(
-                    (r for r in results if r.worker_id == wid), None)
-                if not target:
-                    return
-                out_dir = filedialog.askdirectory(
-                    title="Select output folder")
-                if not out_dir:
-                    return
+                sel = sel_w.get()
+                wid = sel.split(" — ")[0].strip() if " — " in sel else sel
+                target = next((r for r in results if r.worker_id == wid), None)
+                if not target: return
+                out_dir = filedialog.askdirectory(title="Output folder")
+                if not out_dir: return
                 cfg = get_config()
                 path = generate_slip_pdf(target, cfg, out_dir)
-                self.status_bar.set_message(
-                    f"✅ Slip generated → {path}", SUCCESS)
+                self.status_bar.set_message(f"✅ Slip → {path}", SUCCESS)
                 messagebox.showinfo("Done", f"Slip saved:\n{path}")
-                try:
-                    os.startfile(path)
-                except Exception:
-                    pass
+                try: os.startfile(path)
+                except Exception: pass
 
-            ctk.CTkButton(
-                sf_ctrl, text="👁️  Generate & Open",
-                font=FONT_BODY_BOLD, fg_color=SUCCESS,
-                hover_color="#2E7D32",
-                height=36, corner_radius=8, command=gen_single
-            ).pack(side="left")
+            ctk.CTkButton(sc, text="👁️  Generate & Open", font=FONT_BODY_BOLD,
+                           fg_color=SUCCESS, hover_color="#2E7D32", height=36,
+                           corner_radius=8, command=gen_single).pack(side="left")
 
-        month_var.trace_add("write", lambda *_: refresh_slips())
-        loc_var.trace_add("write", lambda *_: refresh_slips())
-        refresh_slips()
+        month_var.trace_add("write", lambda *_: refresh())
+        branch_var.trace_add("write", lambda *_: refresh())
+        refresh()
 
     # ══════════════════════════════════════════════════════════════════════
-    #   PAGE: SETTINGS
+    #   SETTINGS
     # ══════════════════════════════════════════════════════════════════════
-    def _build_settings(self, parent):
-        ctk.CTkLabel(
-            parent, text="⚙️  Company Settings",
-            font=FONT_TITLE, text_color=TEXT_PRIMARY, anchor="w"
-        ).pack(fill="x", padx=28, pady=(20, 4))
-        ctk.CTkLabel(
-            parent, text="Configure company information displayed on salary slips",
-            font=FONT_SMALL, text_color=TEXT_SECONDARY, anchor="w"
-        ).pack(fill="x", padx=28, pady=(0, 16))
+    def _page_settings(self, parent):
+        ctk.CTkLabel(parent, text="⚙️  Company Settings", font=FONT_TITLE,
+                      text_color=TEXT_PRIMARY, anchor="w").pack(fill="x", padx=28, pady=(20, 2))
+        ctk.CTkLabel(parent, text="Company information and configuration",
+                      font=FONT_SMALL, text_color=TEXT_SECONDARY, anchor="w"
+                      ).pack(fill="x", padx=28, pady=(0, 14))
 
         cfg = get_config()
-
         form = ctk.CTkFrame(parent, fg_color=CARD_BG, corner_radius=12)
-        form.pack(fill="x", padx=28, pady=(0, 20))
-
-        ctk.CTkLabel(
-            form, text="Company Information",
-            font=FONT_HEADING, text_color=TEXT_PRIMARY
-        ).pack(padx=20, pady=(20, 16), anchor="w")
+        form.pack(fill="x", padx=28, pady=(0, 16))
+        ctk.CTkLabel(form, text="Company Information", font=FONT_HEADING,
+                      text_color=TEXT_PRIMARY).pack(padx=20, pady=(16, 12), anchor="w")
 
         ff = ctk.CTkFrame(form, fg_color="transparent")
-        ff.pack(fill="x", padx=20, pady=(0, 16))
+        ff.pack(fill="x", padx=20, pady=(0, 12))
 
-        def sfield(parent, label, default="", row=0):
-            f = ctk.CTkFrame(parent, fg_color="transparent")
-            f.pack(fill="x", pady=4)
-            ctk.CTkLabel(f, text=label, font=FONT_SMALL,
-                          text_color=TEXT_SECONDARY, width=180,
-                          anchor="w").pack(side="left")
-            var = ctk.StringVar(value=default)
-            ctk.CTkEntry(
-                f, textvariable=var, height=32, font=FONT_BODY,
-                fg_color=SURFACE, border_color=TEXT_MUTED, corner_radius=6
-            ).pack(side="left", fill="x", expand=True, padx=(8, 0))
-            return var
+        def sf(p, lbl, default=""):
+            f = ctk.CTkFrame(p, fg_color="transparent")
+            f.pack(fill="x", pady=3)
+            ctk.CTkLabel(f, text=lbl, font=FONT_SMALL, text_color=TEXT_SECONDARY,
+                          width=180, anchor="w").pack(side="left")
+            v = ctk.StringVar(value=default)
+            ctk.CTkEntry(f, textvariable=v, height=30, font=FONT_BODY,
+                          fg_color=SURFACE, border_color=TEXT_MUTED, corner_radius=6
+                          ).pack(side="left", fill="x", expand=True, padx=(8, 0))
+            return v
 
-        cname_var = sfield(ff, "Company Name", cfg.company_name)
-        caddr1_var = sfield(ff, "Address Line 1", cfg.address_line1)
-        caddr2_var = sfield(ff, "Address Line 2", cfg.address_line2)
-        cphone_var = sfield(ff, "Phone", cfg.phone)
-        cemail_var = sfield(ff, "Email", cfg.email)
+        cn = sf(ff, "Company Name", cfg.company_name)
+        a1 = sf(ff, "Address Line 1", cfg.address_line1)
+        a2 = sf(ff, "Address Line 2", cfg.address_line2)
+        ph = sf(ff, "Phone", cfg.phone)
+        em = sf(ff, "Email", cfg.email)
 
-        # Working days with spinner
         wdf = ctk.CTkFrame(ff, fg_color="transparent")
-        wdf.pack(fill="x", pady=4)
-        ctk.CTkLabel(wdf, text="Standard Working Days", font=FONT_SMALL,
-                      text_color=TEXT_SECONDARY, width=180,
-                      anchor="w").pack(side="left")
-        wdays_var = ctk.StringVar(value=str(cfg.working_days))
-        ctk.CTkEntry(
-            wdf, textvariable=wdays_var, height=32, width=80,
-            font=FONT_BODY, fg_color=SURFACE, border_color=TEXT_MUTED,
-            corner_radius=6
-        ).pack(side="left", padx=(8, 0))
+        wdf.pack(fill="x", pady=3)
+        ctk.CTkLabel(wdf, text="Working Days / Month", font=FONT_SMALL,
+                      text_color=TEXT_SECONDARY, width=180, anchor="w").pack(side="left")
+        wd = ctk.StringVar(value=str(cfg.working_days))
+        ctk.CTkEntry(wdf, textvariable=wd, height=30, width=80, font=FONT_BODY,
+                      fg_color=SURFACE, border_color=TEXT_MUTED, corner_radius=6
+                      ).pack(side="left", padx=(8, 0))
 
-        def save_settings():
+        def save_cfg():
             try:
-                wd = int(wdays_var.get())
+                w = int(wd.get())
             except ValueError:
-                messagebox.showerror("Validation",
-                                      "Working days must be a number.")
-                return
-
-            save_config(CompanyConfig(
-                cname_var.get(), caddr1_var.get(), caddr2_var.get(),
-                cphone_var.get(), cemail_var.get(), wd
-            ))
+                messagebox.showerror("Error", "Working days must be a number."); return
+            save_config(CompanyConfig(cn.get(), a1.get(), a2.get(), ph.get(), em.get(), w))
             self.status_bar.set_message("✅ Settings saved!", SUCCESS)
-            messagebox.showinfo("Success", "Company settings saved!")
+            messagebox.showinfo("Saved", "Company settings saved!")
 
-        ctk.CTkButton(
-            form, text="💾  Save Settings", font=FONT_BODY_BOLD,
-            fg_color=SUCCESS, hover_color="#2E7D32",
-            height=42, corner_radius=8, command=save_settings
-        ).pack(pady=(0, 20))
+        ctk.CTkButton(form, text="💾  Save Settings", font=FONT_BODY_BOLD,
+                       fg_color=SUCCESS, hover_color="#2E7D32", height=42,
+                       corner_radius=8, command=save_cfg).pack(pady=(0, 16))
 
-        # Database info
-        db_info = ctk.CTkFrame(parent, fg_color=CARD_BG, corner_radius=12)
-        db_info.pack(fill="x", padx=28, pady=(0, 20))
-
-        ctk.CTkLabel(
-            db_info, text="System Information",
-            font=FONT_HEADING, text_color=TEXT_PRIMARY
-        ).pack(padx=20, pady=(16, 8), anchor="w")
-
-        ctk.CTkLabel(
-            db_info,
-            text=f"Database Path:  {os.path.abspath(DB_PATH)}",
-            font=FONT_SMALL, text_color=TEXT_MUTED
-        ).pack(padx=20, pady=(0, 4), anchor="w")
-        ctk.CTkLabel(
-            db_info,
-            text="Share payroll.db via Google Drive for multi-site access "
-                 "(one writer at a time).",
-            font=FONT_SMALL, text_color=TEXT_MUTED
-        ).pack(padx=20, pady=(0, 16), anchor="w")
+        # System info
+        db = ctk.CTkFrame(parent, fg_color=CARD_BG, corner_radius=12)
+        db.pack(fill="x", padx=28, pady=(0, 16))
+        ctk.CTkLabel(db, text="System Information", font=FONT_HEADING,
+                      text_color=TEXT_PRIMARY).pack(padx=20, pady=(16, 6), anchor="w")
+        ctk.CTkLabel(db, text=f"Database: {os.path.abspath(DB_PATH)}",
+                      font=FONT_SMALL, text_color=TEXT_MUTED).pack(padx=20, anchor="w")
+        branches = get_all_branches()
+        ctk.CTkLabel(db, text=f"Branches: {len(branches)}  |  Workers: {len(get_all_workers(active_only=False))}  |  Profiles: {len(get_all_profiles())}",
+                      font=FONT_SMALL, text_color=TEXT_MUTED).pack(padx=20, anchor="w", pady=(2, 12))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#   ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     app = PayrollApp()
