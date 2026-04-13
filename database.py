@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS attendance (
     days_present      REAL DEFAULT 0,
     basic_wages       REAL DEFAULT 0, da REAL DEFAULT 0,
     hra               REAL DEFAULT 0, cca REAL DEFAULT 0,
-    overtime_wages    REAL DEFAULT 0, arrears REAL DEFAULT 0,
+    overtime_hours    REAL DEFAULT 0, arrears REAL DEFAULT 0,
     advances_pay      REAL DEFAULT 0, nfh_wages REAL DEFAULT 0,
     maternity_benefit REAL DEFAULT 0, leave_wages REAL DEFAULT 0,
     bonus             REAL DEFAULT 0, other_allowances REAL DEFAULT 0,
@@ -198,7 +198,7 @@ def get_worker_by_id(worker_id, db_path=DB_PATH):
 #   ATTENDANCE
 # ══════════════════════════════════════════════════════════════════════════════
 _ATT_COLS = ("worker_id","month","days_present",
-             "basic_wages","da","hra","cca","overtime_wages","arrears",
+             "basic_wages","da","hra","cca","overtime_hours","arrears",
              "advances_pay","nfh_wages","maternity_benefit","leave_wages",
              "bonus","other_allowances",
              "epf_override","esi_override","welfare_fund","tds",

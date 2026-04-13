@@ -88,7 +88,7 @@ class AttendanceRecord:
     da                : float = 0.0
     hra               : float = 0.0
     cca               : float = 0.0
-    overtime_wages    : float = 0.0
+    overtime_hours    : float = 0.0   # user enters hours; engine × ot_rate = wages
     arrears           : float = 0.0
     advances_pay      : float = 0.0
     nfh_wages         : float = 0.0

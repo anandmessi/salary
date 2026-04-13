@@ -127,7 +127,7 @@ def _build_flowables(r: PayrollResult, cfg: CompanyConfig) -> list:
 
     # ── 2. Employee info block ───────────────────────────────────────────
     def lv(lbl, val):
-        return [Paragraph(lbl, S_LBL), Paragraph(": " + (str(val) if val else "—"), S_VAL)]
+        return [Paragraph(lbl, S_LBL), Paragraph(str(val) if val else "—", S_VAL)]
 
     col_a = CONTENT_W * 0.38
     col_b = CONTENT_W * 0.62
@@ -135,11 +135,14 @@ def _build_flowables(r: PayrollResult, cfg: CompanyConfig) -> list:
     info_rows = [
         lv("Establishment Name",      cfg.company_name),
         lv("Address of Establishment",f"{cfg.address_line1}, {cfg.address_line2}"),
-        lv("Name of the Employee",    f"{r.worker_name} , {r.worker_id}"),
+        lv("Name of the Employee",    f"{r.worker_name}"),
         lv("Period of Payment",       r.period_label),
         lv("Designation",             r.profile_title),
         lv("Date of Joining",         r.joining_date or "—"),
         lv("Total No. of Days Worked",f"{r.days_present} days"),
+        lv("PF / UAN Number",         r.uan_number or "—"),
+        lv("ESIC IP Number",          r.esic_number or "—"),
+        lv("Bank A/c & IFSC",         f"{r.bank_account}  (IFSC: {r.ifsc_code})" if r.bank_account else "—"),
     ]
 
     info_t = Table(info_rows, colWidths=[col_a, col_b])
@@ -155,9 +158,9 @@ def _build_flowables(r: PayrollResult, cfg: CompanyConfig) -> list:
     story.append(Spacer(1, 4 * mm))
 
     # ── 3. Salary & Deductions table ─────────────────────────────────────
-    #    Show ALL rows including 0.00 — matching the official slip format
-    earn_items = r.all_earnings_items()    # all 12 rows
-    ded_items  = r.all_deduction_items()   # all 9 rows
+    #    Show only > 0 values as requested
+    earn_items = r.earnings_items()
+    ded_items  = r.deduction_items()
 
     # Pad to same length so the two columns align
     max_rows = max(len(earn_items), len(ded_items))
@@ -270,32 +273,8 @@ def _build_flowables(r: PayrollResult, cfg: CompanyConfig) -> list:
     story.append(remarks_t)
     story.append(Spacer(1, 4 * mm))
 
-    # ── 5. Bank details ──────────────────────────────────────────────────
-    bank_text = (
-        f"Wages and Other Allowances are Credited to your Account No"
-        f" &nbsp; : &nbsp; <b>{r.bank_account or '—'}</b>"
-    )
-    story.append(Paragraph(bank_text,
-                            _s("bt", fontSize=8.5, leading=14)))
-    story.append(Spacer(1, 2 * mm))
-
-    bank_row = Table(
-        [[Paragraph(f"Bank Name &nbsp;: <b>{r.bank_name or '—'}</b>", S_CELL),
-          Paragraph(f"IFSC Code &nbsp;: <b>{r.ifsc_code or '—'}</b>", S_CELL)]],
-        colWidths=[CONTENT_W / 2, CONTENT_W / 2],
-    )
-    story.append(bank_row)
-
-    # UAN / ESIC row
-    if r.uan_number or r.esic_number:
-        story.append(Spacer(1, 1 * mm))
-        ids_row = Table(
-            [[Paragraph(f"UAN (PF) &nbsp;: <b>{r.uan_number or '—'}</b>", S_CELL),
-              Paragraph(f"ESIC IP No &nbsp;: <b>{r.esic_number or '—'}</b>", S_CELL)]],
-            colWidths=[CONTENT_W / 2, CONTENT_W / 2],
-        )
-        story.append(ids_row)
-
+    # Bank details are now included in the Employee Info block (Section 2)
+    
     story.append(Spacer(1, 5 * mm))
 
     # ── 6. Prepared / Received ───────────────────────────────────────────

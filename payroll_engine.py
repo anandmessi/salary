@@ -45,9 +45,11 @@ def calculate_single(
     basic = att.basic_wages if att.basic_wages > 0 \
             else round(att.days_present * skill_wage.daily_wage, 2)
 
+    overtime_wages = round(att.overtime_hours * skill_wage.ot_rate, 2)
+
     gross = round(
         basic + att.da + att.hra + att.cca
-        + att.overtime_wages + att.arrears + att.advances_pay
+        + overtime_wages + att.arrears + att.advances_pay
         + att.nfh_wages + att.maternity_benefit + att.leave_wages
         + att.bonus + att.other_allowances,
         2,
@@ -95,7 +97,7 @@ def calculate_single(
         da                = att.da,
         hra               = att.hra,
         cca               = att.cca,
-        overtime_wages    = att.overtime_wages,
+        overtime_wages    = overtime_wages,
         arrears           = att.arrears,
         advances_pay      = att.advances_pay,
         nfh_wages         = att.nfh_wages,
