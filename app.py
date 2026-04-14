@@ -580,36 +580,61 @@ class PayrollApp(ctk.CTk):
                                     "✅" if w.active else "❌") for w in workers])
 
                 ctrl = ctk.CTkFrame(table_container, fg_color="transparent"); ctrl.pack(fill="x", pady=(6, 8))
-                all_ids = [w.worker_id for w in workers]
-                sel_var = ctk.StringVar(value=all_ids[0])
+                # Show "ID — Name" in dropdown for easy identification
+                all_labels = [f"{w.worker_id} — {w.name}" for w in workers]
+                sel_var = ctk.StringVar(value=all_labels[0] if all_labels else "")
+
+                def _get_selected_id():
+                    """Extract worker_id from the 'ID — Name' dropdown value."""
+                    val = sel_var.get()
+                    return val.split(" — ")[0].strip() if " — " in val else val.strip()
+
                 ctk.CTkLabel(ctrl, text="Select:", font=FONT_BODY_BOLD, text_color=TEXT_PRIMARY).pack(side="left")
-                ctk.CTkOptionMenu(ctrl, values=all_ids, variable=sel_var, width=100, font=FONT_BODY,
+                ctk.CTkOptionMenu(ctrl, values=all_labels, variable=sel_var, width=220, font=FONT_BODY,
                                    fg_color=SURFACE_3, button_color=ACCENT,
                                    button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 12))
                 ctk.CTkButton(ctrl, text="✏️ Edit", font=FONT_BODY, fg_color=ACCENT,
                                hover_color=ACCENT_HOVER, height=30, corner_radius=6, width=80,
-                               command=lambda: _populate_form(sel_var.get())).pack(side="left", padx=(0, 6))
+                               command=lambda: _populate_form(_get_selected_id())).pack(side="left", padx=(0, 6))
                 def do_toggle():
-                    w = get_worker_by_id(sel_var.get())
+                    wid = _get_selected_id()
+                    w = get_worker_by_id(wid)
                     if not w: return
                     if w.active:
-                        if messagebox.askyesno("Confirm", f"Deactivate '{sel_var.get()}'?"):
-                            deactivate_worker(sel_var.get())
-                            self.status_bar.set_message(f"Worker deactivated.", WARNING_CLR); update_table()
+                        if messagebox.askyesno("Confirm", f"Deactivate '{w.name}' ({wid})?"):
+                            deactivate_worker(wid)
+                            self.status_bar.set_message(f"Worker {wid} deactivated.", WARNING_CLR); update_table()
                     else:
-                        reactivate_worker(sel_var.get())
-                        self.status_bar.set_message(f"Worker re-activated.", SUCCESS); update_table()
+                        reactivate_worker(wid)
+                        self.status_bar.set_message(f"Worker {wid} re-activated.", SUCCESS); update_table()
                 ctk.CTkButton(ctrl, text="🔄 Toggle", font=FONT_BODY, fg_color=WARNING_CLR,
                                hover_color="#E65100", height=30, corner_radius=6, width=90,
                                command=do_toggle).pack(side="left", padx=(0, 6))
                 def do_delete():
+                    wid = _get_selected_id()
+                    w = get_worker_by_id(wid)
+                    wname = w.name if w else wid
                     if messagebox.askyesno("⚠️ Delete",
-                        f"Permanently delete '{sel_var.get()}' and ALL attendance?\nCannot undo.", icon="warning"):
-                        delete_worker(sel_var.get())
-                        self.status_bar.set_message(f"Worker deleted.", DANGER); update_table()
+                        f"Permanently delete '{wname}' ({wid}) and ALL their attendance?\nCannot undo.", icon="warning"):
+                        delete_worker(wid)
+                        self.status_bar.set_message(f"Worker {wid} deleted.", DANGER); update_table()
                 ctk.CTkButton(ctrl, text="🗑️ Delete", font=FONT_BODY, fg_color=DANGER,
                                hover_color="#C62828", height=30, corner_radius=6, width=80,
                                command=do_delete).pack(side="left")
+
+                # Clicking a row in the table updates the dropdown
+                def on_select(event):
+                    sel = table.tree.selection()
+                    if sel:
+                        vals = table.tree.item(sel[0])["values"]
+                        if vals:
+                            wid = str(vals[0])
+                            # Find matching label in dropdown
+                            for lbl in all_labels:
+                                if lbl.startswith(wid + " — "):
+                                    sel_var.set(lbl); break
+                table.tree.bind("<<TreeviewSelect>>", on_select)
+
                 def on_dbl(event):
                     sel = table.tree.selection()
                     if sel:
