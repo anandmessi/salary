@@ -5,7 +5,7 @@ Professional native desktop payroll software.
 Run with:  python app.py
 """
 
-import os, sys, csv, datetime, threading
+import os, sys, csv, datetime, threading, tempfile
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -16,6 +16,7 @@ from database import (
     init_db, get_all_workers, get_all_skill_wages, get_skill_wages_dict,
     upsert_skill_wage,
     get_attendance, upsert_attendance, bulk_upsert_attendance,
+    delete_attendance_for_worker,
     upsert_worker, deactivate_worker, reactivate_worker,
     delete_worker, get_worker_by_id,
     get_config, save_config, get_months_with_data,
@@ -888,21 +889,39 @@ class PayrollApp(ctk.CTk):
                                 r.profile_title, fmt_inr(r.net_pay)) for r in results])
 
             def gen_all():
-                od = filedialog.askdirectory(title="Select output folder")
-                if not od: return
-                self.status_bar.set_message("⏳ Generating PDFs...", ACCENT); self.update()
+                zip_path = filedialog.asksaveasfilename(
+                    title="Save Salary Slips ZIP",
+                    defaultextension=".zip",
+                    filetypes=[("ZIP Archive", "*.zip")],
+                    initialfile=f"SalarySlips_{month_var.get()}.zip"
+                )
+                if not zip_path: return
+                self.status_bar.set_message("⏳ Generating ZIP...", ACCENT); self.update()
                 def do():
                     cfg = get_config()
-                    gen = generate_bulk_pdfs(results, cfg, od, zip_output=True)
-                    self.after(0, lambda: done(gen, od))
-                def done(gen, od):
-                    self.status_bar.set_message(f"✅ {gen['success_count']} slips → {od}", SUCCESS)
-                    messagebox.showinfo("Done", f"{gen['success_count']} slips generated.\nFolder: {od}")
-                    try: os.startfile(od)
+                    # Generate into a temp dir, zip_only keeps output clean
+                    temp_dir = tempfile.mkdtemp(prefix="payroll_slips_")
+                    try:
+                        gen = generate_bulk_pdfs(results, cfg, temp_dir, zip_output=True, zip_only=True)
+                        # Move the generated zip to the user-chosen path
+                        if gen.get("zip_path") and os.path.exists(gen["zip_path"]):
+                            import shutil
+                            shutil.move(gen["zip_path"], zip_path)
+                    finally:
+                        # Clean up temp dir
+                        try:
+                            import shutil
+                            shutil.rmtree(temp_dir, ignore_errors=True)
+                        except: pass
+                    self.after(0, lambda: done(gen, zip_path))
+                def done(gen, zp):
+                    self.status_bar.set_message(f"✅ {gen['success_count']} slips → {zp}", SUCCESS)
+                    messagebox.showinfo("Done", f"{gen['success_count']} salary slips saved as ZIP.\n\n{zp}")
+                    try: os.startfile(os.path.dirname(zp))
                     except: pass
                 threading.Thread(target=do, daemon=True).start()
 
-            ctk.CTkButton(content, text="📦  Generate ALL Slips (PDF + ZIP)", font=FONT_BODY_BOLD,
+            ctk.CTkButton(content, text="📦  Download All Slips as ZIP", font=FONT_BODY_BOLD,
                            fg_color=ACCENT, hover_color=ACCENT_HOVER, height=42,
                            corner_radius=8, command=gen_all).pack(fill="x", pady=(8, 8))
 

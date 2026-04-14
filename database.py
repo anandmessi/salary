@@ -220,6 +220,14 @@ def upsert_attendance(a: AttendanceRecord, db_path=DB_PATH):
 def bulk_upsert_attendance(records: List[AttendanceRecord], db_path=DB_PATH):
     for a in records: upsert_attendance(a, db_path)
 
+def delete_attendance_for_worker(worker_id: str, month: str = None, db_path=DB_PATH):
+    """Delete attendance records for a worker. If month given, only that month; else all months."""
+    with get_conn(db_path) as conn:
+        if month:
+            conn.execute("DELETE FROM attendance WHERE worker_id=? AND month=?", (worker_id, month))
+        else:
+            conn.execute("DELETE FROM attendance WHERE worker_id=?", (worker_id,))
+
 def import_attendance_from_csv(filepath, month, db_path=DB_PATH):
     import csv
     records, errors = [], []

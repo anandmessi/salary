@@ -9,6 +9,8 @@ pdf_generator.py — Salary Slip matching the Kerala / Nirbhik format
 """
 
 import os
+import shutil
+import tempfile
 import zipfile
 from typing import List
 
@@ -329,23 +331,44 @@ def generate_bulk_pdfs(
     config    : CompanyConfig,
     output_dir: str = "salary_slips",
     zip_output: bool = True,
+    zip_only  : bool = False,
 ) -> dict:
+    """
+    Generate salary slip PDFs for all results.
+    If zip_only=True, only a .zip file is saved to output_dir (no loose PDFs).
+    If zip_output=True (and zip_only=False), both PDFs and a .zip are saved.
+    """
     os.makedirs(output_dir, exist_ok=True)
     pdf_paths, errors = [], []
 
+    # When zip_only, generate PDFs into a temporary directory
+    pdf_dir = None
+    if zip_only:
+        pdf_dir = os.path.join(output_dir, "_temp_slips")
+        os.makedirs(pdf_dir, exist_ok=True)
+    else:
+        pdf_dir = output_dir
+
     for r in results:
         try:
-            pdf_paths.append(generate_slip_pdf(r, config, output_dir))
+            pdf_paths.append(generate_slip_pdf(r, config, pdf_dir))
         except Exception as e:
             errors.append(f"{r.worker_name}: {e}")
 
     zip_path = None
-    if zip_output and pdf_paths:
+    if (zip_output or zip_only) and pdf_paths:
         month    = results[0].month if results else "unknown"
         zip_path = os.path.join(output_dir, f"SalarySlips_{month}.zip")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for p in pdf_paths:
                 zf.write(p, arcname=os.path.basename(p))
+
+    # Clean up loose PDFs when zip_only
+    if zip_only and pdf_dir != output_dir:
+        try:
+            shutil.rmtree(pdf_dir)
+        except Exception:
+            pass
 
     return {
         "pdf_paths"    : pdf_paths,
