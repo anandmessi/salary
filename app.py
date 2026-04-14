@@ -6,6 +6,7 @@ Run with:  python app.py
 """
 
 import os, sys, csv, datetime, threading, tempfile
+from backup_manager import BackupManager
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -155,8 +156,14 @@ class StatusBar(ctk.CTkFrame):
         self._label.pack(side="left", padx=10, fill="y")
         ctk.CTkLabel(self, text=f"PayrollPro v2.1  •  DB: {os.path.abspath(DB_PATH)}  ",
                       font=FONT_TINY, text_color=TEXT_MUTED, anchor="e").pack(side="right", padx=10, fill="y")
+        self._backup_label = ctk.CTkLabel(
+            self, text="  🔄 Backup: Starting…  ",
+            font=FONT_TINY, text_color=TEXT_MUTED, anchor="e")
+        self._backup_label.pack(side="right", padx=4, fill="y")
     def set_message(self, msg, color=TEXT_MUTED):
         self._label.configure(text=f"  {msg}", text_color=color)
+    def set_backup_status(self, status: str, color=TEXT_MUTED):
+        self._backup_label.configure(text=f"  {status}  ", text_color=color)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -168,7 +175,26 @@ class PayrollApp(ctk.CTk):
         init_db(DB_PATH, seed=True)
         self.grid_columnconfigure(1, weight=1); self.grid_rowconfigure(0, weight=1)
         self._build_sidebar(); self._build_main_area(); self._build_status_bar()
+        # ── Start real-time backup manager ─────────────────────────────────
+        self._backup_mgr = BackupManager(
+            db_path=DB_PATH,
+            on_sync=self._on_backup_sync,
+        )
+        self._backup_mgr.start()
         self._navigate("dashboard")
+
+    def _on_backup_sync(self, status: str, timestamp: str):
+        """Called by BackupManager (background thread) after each sync."""
+        def _update():
+            if "Error" in status or "⚠" in status:
+                color = DANGER
+                label = f"🔴 Backup: {timestamp}"
+            else:
+                color = SUCCESS
+                label = f"🟢 Backup: {timestamp}"
+            self.status_bar.set_backup_status(label, color)
+        # Schedule UI update on the main thread
+        self.after(0, _update)
 
     def _build_sidebar(self):
         self.sidebar = ctk.CTkFrame(self, width=220, corner_radius=0, fg_color=SIDEBAR_BG)
@@ -1022,6 +1048,60 @@ class PayrollApp(ctk.CTk):
                       font=FONT_SMALL, text_color=TEXT_MUTED).pack(padx=20, anchor="w")
         ctk.CTkLabel(db, text=f"Branches: {len(get_all_branches())}  |  Workers: {len(get_all_workers(active_only=False))}",
                       font=FONT_SMALL, text_color=TEXT_MUTED).pack(padx=20, anchor="w", pady=(2, 12))
+
+        # ── Backup Status Card ────────────────────────────────────────────
+        mgr = self._backup_mgr
+        bk = ctk.CTkFrame(parent, fg_color=CARD_BG, corner_radius=12)
+        bk.pack(fill="x", padx=28, pady=(0, 20))
+        # Header row
+        bk_hdr = ctk.CTkFrame(bk, fg_color="transparent"); bk_hdr.pack(fill="x", padx=20, pady=(16, 4))
+        ctk.CTkLabel(bk_hdr, text="🔄  Real-Time Backup", font=FONT_HEADING,
+                      text_color=TEXT_PRIMARY).pack(side="left")
+        # Status badge
+        bk_badge_var = ctk.StringVar(value=mgr.last_sync_status)
+        bk_badge = ctk.CTkLabel(bk_hdr, textvariable=bk_badge_var, font=FONT_SMALL,
+                                  text_color=SUCCESS if "✅" in mgr.last_sync_status else TEXT_MUTED)
+        bk_badge.pack(side="right")
+        # Info rows
+        def _bk_row(lbl, val, clickable_path=None):
+            r = ctk.CTkFrame(bk, fg_color="transparent"); r.pack(fill="x", padx=20, pady=2)
+            ctk.CTkLabel(r, text=lbl, font=FONT_SMALL, text_color=TEXT_SECONDARY,
+                          width=160, anchor="w").pack(side="left")
+            if clickable_path:
+                def _open(p=clickable_path):
+                    try: os.startfile(os.path.dirname(p))
+                    except Exception: pass
+                ctk.CTkButton(r, text=val, font=FONT_TINY, fg_color="transparent",
+                               hover_color=SURFACE_3, text_color=ACCENT, anchor="w",
+                               height=20, command=_open).pack(side="left", fill="x", expand=True)
+            else:
+                ctk.CTkLabel(r, text=val, font=FONT_TINY, text_color=TEXT_MUTED,
+                              anchor="w").pack(side="left", fill="x", expand=True)
+        _bk_row("Worker Details CSV:",  mgr.csv_path_str,       clickable_path=mgr.csv_path_str)
+        _bk_row("Backup Database:",     mgr.backup_db_path_str, clickable_path=mgr.backup_db_path_str)
+        # Last synced + Sync Now
+        ts_var = ctk.StringVar(value=f"Last synced: {mgr.last_sync_time}")
+        sync_row = ctk.CTkFrame(bk, fg_color="transparent"); sync_row.pack(fill="x", padx=20, pady=(8, 14))
+        ctk.CTkLabel(sync_row, textvariable=ts_var, font=FONT_SMALL,
+                      text_color=TEXT_MUTED, anchor="w").pack(side="left")
+        def _do_sync_now():
+            self.status_bar.set_message("🔄 Syncing backups…", ACCENT)
+            mgr.sync_now()
+            def _refresh():
+                ts_var.set(f"Last synced: {mgr.last_sync_time}")
+                bk_badge_var.set(mgr.last_sync_status)
+                bk_badge.configure(
+                    text_color=SUCCESS if "✅" in mgr.last_sync_status else DANGER)
+                self.status_bar.set_message("✅ Backup sync complete!", SUCCESS)
+            self.after(2500, _refresh)
+        ctk.CTkButton(sync_row, text="🔄  Sync Now", font=FONT_BODY_BOLD,
+                       fg_color=ACCENT, hover_color=ACCENT_HOVER, height=32,
+                       corner_radius=8, command=_do_sync_now).pack(side="right")
+        ctk.CTkFrame(bk, height=1, fg_color=SURFACE_3).pack(fill="x", padx=20)
+        ctk.CTkLabel(bk,
+                      text="  ℹ️  Backups update automatically within 2 seconds of any change to payroll.db",
+                      font=FONT_TINY, text_color=TEXT_MUTED, anchor="w"
+                      ).pack(padx=20, pady=(6, 14), anchor="w")
 
 
 if __name__ == "__main__":
