@@ -321,7 +321,15 @@ class PayrollApp(ctk.CTk):
                 path = filedialog.asksaveasfilename(defaultextension=".csv",
                     filetypes=[("CSV","*.csv")], initialfile=f"Payroll_{month_var.get()}.csv")
                 if path:
-                    pd.DataFrame([r.summary_row() for r in results]).to_csv(path, index=False)
+                    data = []
+                    for r in results:
+                        data.append({
+                            "Emp name": r.worker_name,
+                            "Total Sal": round(r.net_pay, 2),
+                            "IFSC Code": r.ifsc_code,
+                            "Account Number": r.bank_account
+                        })
+                    pd.DataFrame(data).to_csv(path, index=False)
                     self.status_bar.set_message(f"✅ CSV → {path}", SUCCESS)
                     messagebox.showinfo("Export", f"CSV saved:\n{path}")
             ctk.CTkButton(content, text="⬇️  Export CSV", font=FONT_BODY_BOLD,
@@ -366,6 +374,9 @@ class PayrollApp(ctk.CTk):
         ctk.CTkOptionMenu(ctrl, values=_branch_filter_list(), variable=branch_var, width=140,
                            font=FONT_BODY, fg_color=SURFACE_3, button_color=ACCENT,
                            button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 20))
+        search_var_att = ctk.StringVar(value="")
+        ctk.CTkEntry(ctrl, textvariable=search_var_att, placeholder_text="Search Name/ID...", width=140,
+                      font=FONT_SMALL, fg_color=SURFACE, border_color=TEXT_MUTED).pack(side="left", padx=(8, 20))
         ctk.CTkLabel(ctrl, text=f"(Max days: {config.working_days})",
                       font=FONT_SMALL, text_color=TEXT_MUTED).pack(side="left")
         table_frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -378,6 +389,9 @@ class PayrollApp(ctk.CTk):
             workers = get_all_workers()
             if branch_var.get() != "All":
                 workers = [w for w in workers if w.branch == branch_var.get()]
+            q_att = search_var_att.get().strip().lower()
+            if q_att:
+                workers = [w for w in workers if q_att in w.name.lower() or q_att in w.worker_id.lower()]
             existing = {a.worker_id: a for a in get_attendance(month_var.get())}
             sw_dict = get_skill_wages_dict()
             if not workers:
@@ -454,6 +468,7 @@ class PayrollApp(ctk.CTk):
 
         month_var.trace_add("write", lambda *_: refresh())
         branch_var.trace_add("write", lambda *_: refresh())
+        search_var_att.trace_add("write", lambda *_: refresh())
         refresh()
 
     def _build_detail_fields(self, parent, worker_id, att):
@@ -578,7 +593,10 @@ class PayrollApp(ctk.CTk):
             filt_var = ctk.StringVar(value="All")
             ctk.CTkOptionMenu(fc, values=_branch_filter_list(), variable=filt_var, width=140,
                                font=FONT_BODY, fg_color=SURFACE_3, button_color=ACCENT,
-                               button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 0))
+                               button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 20))
+            search_var_wk = ctk.StringVar(value="")
+            ctk.CTkEntry(fc, textvariable=search_var_wk, placeholder_text="Search Name/ID...", width=140,
+                          font=FONT_SMALL, fg_color=SURFACE, border_color=TEXT_MUTED).pack(side="left", padx=(8, 0))
             table_container = ctk.CTkFrame(tab_all, fg_color="transparent")
             table_container.pack(fill="both", expand=True, padx=8)
 
@@ -587,6 +605,9 @@ class PayrollApp(ctk.CTk):
                 workers = get_all_workers(active_only=False)
                 if filt_var.get() != "All":
                     workers = [w for w in workers if w.branch == filt_var.get()]
+                q_wk = search_var_wk.get().strip().lower()
+                if q_wk:
+                    workers = [w for w in workers if q_wk in w.name.lower() or q_wk in w.worker_id.lower()]
                 if not workers:
                     ef = ctk.CTkFrame(table_container, fg_color=CARD_BG, corner_radius=12)
                     ef.pack(fill="x", pady=30, padx=30)
@@ -667,7 +688,9 @@ class PayrollApp(ctk.CTk):
                         vals = table.tree.item(sel[0])["values"]
                         if vals: _populate_form(str(vals[0]))
                 table.tree.bind("<Double-1>", on_dbl)
-            filt_var.trace_add("write", update_table); update_table()
+            filt_var.trace_add("write", update_table)
+            search_var_wk.trace_add("write", update_table)
+            update_table()
 
         # ── Form ──
         form = ctk.CTkFrame(tab_add, fg_color=CARD_BG, corner_radius=10); form.pack(fill="x", padx=16, pady=16)
