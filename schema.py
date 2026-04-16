@@ -11,7 +11,7 @@ import json
 
 
 # ── Company-wide Constants ───────────────────────────────────────────────────
-# Branches are stored in the database (dynamic, managed via UI).
+# Units are stored in the database (dynamic, managed via UI).
 
 SKILL_CATEGORIES = [
     "Skilled",
@@ -54,7 +54,7 @@ class Worker:
     esic_number    : str  = ""    # ESIC IP Number
     joining_date   : str  = ""
     active         : bool = True
-    branch         : str  = ""    # Which branch (from branches table)
+    unit         : str  = ""    # Which unit (from units table)
     skill_category : str  = "Unskilled"
 
     def to_dict(self): return asdict(self)
@@ -65,7 +65,7 @@ class Worker:
         d["active"] = bool(d.get("active", True))
         defaults = dict(
             bank_name="", ifsc_code="",
-            branch="", skill_category="Unskilled",
+            unit="", skill_category="Unskilled",
             designation="",
         )
         for k, v in defaults.items():
@@ -125,7 +125,7 @@ class PayrollResult:
     worker_id      : str
     worker_name    : str
     profile_title  : str        # = designation (Sweeper, Janitor …)
-    location       : str        # = branch
+    location       : str        # = unit
     month          : str
     period_label   : str
     joining_date   : str
@@ -135,7 +135,7 @@ class PayrollResult:
     ifsc_code      : str
     uan_number     : str
     esic_number    : str
-    branch         : str = ""
+    unit         : str = ""
     skill_category : str = ""
 
     # Earnings
@@ -207,7 +207,7 @@ class PayrollResult:
         return {
             "Worker ID"      : self.worker_id,
             "Name"           : self.worker_name,
-            "Branch"         : self.branch,
+            "Unit"         : self.unit,
             "Skill"          : self.skill_category,
             "Designation"    : self.profile_title,
             "Days"           : self.days_present,

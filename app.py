@@ -21,9 +21,9 @@ from database import (
     upsert_worker, deactivate_worker, reactivate_worker,
     delete_worker, get_worker_by_id,
     get_config, save_config, get_months_with_data,
-    get_workers_by_branch, import_attendance_from_csv,
-    get_all_branches, add_branch, rename_branch, delete_branch,
-    branch_worker_count,
+    get_workers_by_unit, import_attendance_from_csv,
+    get_all_units, add_unit, rename_unit, delete_unit,
+    unit_worker_count,
     DB_PATH,
 )
 from payroll_engine import calculate_payroll, payroll_summary
@@ -86,11 +86,11 @@ def fmt_inr(amount):
     result = f"₹{fmt}.{p[1]}"
     return ("-" + result) if amount < 0 else result
 
-def _branch_list():
-    b = get_all_branches(); return b if b else ["(No branches)"]
+def _unit_list():
+    b = get_all_units(); return b if b else ["(No units)"]
 
-def _branch_filter_list():
-    b = get_all_branches(); return ["All"] + b if b else ["All"]
+def _unit_filter_list():
+    b = get_all_units(); return ["All"] + b if b else ["All"]
 
 def _page_header(parent, title, subtitle):
     """Compact page header — fixed-height accent bar avoids stretching in CTkScrollableFrame."""
@@ -252,7 +252,7 @@ class PayrollApp(ctk.CTk):
             ("Dashboard",      "📊", "dashboard"),
             ("Attendance",     "📋", "attendance"),
             ("Workers",        "👷", "workers"),
-            ("Branches",       "🏢", "branches"),
+            ("Units",       "🏢", "units"),
             ("Wage Rates",     "💰", "wages"),
             ("Generate Slips", "📄", "slips"),
             ("Settings",       "⚙️",  "settings"),
@@ -290,7 +290,7 @@ class PayrollApp(ctk.CTk):
                                        scrollbar_button_color=CARD_BORDER, scrollbar_fg_color=SURFACE)
         page.grid(row=0, column=0, sticky="nsew"); self._current_page = page
         {"dashboard": self._page_dashboard, "attendance": self._page_attendance,
-         "workers": self._page_workers, "branches": self._page_branches,
+         "workers": self._page_workers, "units": self._page_units,
          "wages": self._page_wages, "slips": self._page_slips,
          "settings": self._page_settings}.get(key, lambda p: None)(page)
         self.status_bar.set_message(f"Viewing: {key.replace('_',' ').title()}")
@@ -311,9 +311,9 @@ class PayrollApp(ctk.CTk):
         ctk.CTkOptionMenu(inner_ctrl, values=opts, variable=month_var, width=140,
                            font=FONT_BODY, fg_color=SURFACE_3, button_color=ACCENT,
                            button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 20))
-        ctk.CTkLabel(inner_ctrl, text="Branch:", font=FONT_BODY_BOLD, text_color=TEXT_PRIMARY).pack(side="left")
-        branch_var = ctk.StringVar(value="All")
-        ctk.CTkOptionMenu(inner_ctrl, values=_branch_filter_list(), variable=branch_var, width=150,
+        ctk.CTkLabel(inner_ctrl, text="Unit:", font=FONT_BODY_BOLD, text_color=TEXT_PRIMARY).pack(side="left")
+        unit_var = ctk.StringVar(value="All")
+        ctk.CTkOptionMenu(inner_ctrl, values=_unit_filter_list(), variable=unit_var, width=150,
                            font=FONT_BODY, fg_color=SURFACE_3, button_color=ACCENT,
                            button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 20))
         ctk.CTkButton(inner_ctrl, text="🔄 Refresh", font=FONT_BODY, width=100, fg_color=SURFACE_3,
@@ -327,8 +327,8 @@ class PayrollApp(ctk.CTk):
             workers = get_all_workers()
             sw = get_skill_wages_dict()
             att = get_attendance(month_var.get())
-            if branch_var.get() != "All":
-                workers = [w for w in workers if w.branch == branch_var.get()]
+            if unit_var.get() != "All":
+                workers = [w for w in workers if w.unit == unit_var.get()]
             results, warnings = calculate_payroll(workers, sw, att, month_var.get())
             if warnings:
                 wf = ctk.CTkFrame(content, fg_color="#3D2F00", corner_radius=8); wf.pack(fill="x", pady=(0, 10))
@@ -356,11 +356,11 @@ class PayrollApp(ctk.CTk):
             ]):
                 MetricCard(mf, l, v, color=c, icon=ic).grid(row=0, column=i, padx=5, pady=4, sticky="nsew")
             _section_label(content, "Payroll Breakdown")
-            cols = ("ID","Name","Branch","Skill","Designation","Days","Gross (₹)","EPF (₹)","ESI (₹)","Net Pay (₹)")
+            cols = ("ID","Name","Unit","Skill","Designation","Days","Gross (₹)","EPF (₹)","ESI (₹)","Net Pay (₹)")
             widths = [60,130,90,80,120,45,100,80,75,110]
             table = StyledTreeview(content, columns=cols, column_widths=widths, height=min(len(results), 14))
             table.pack(fill="both", expand=True, pady=(0, 10))
-            table.insert_rows([(r.worker_id, r.worker_name, r.branch, r.skill_category,
+            table.insert_rows([(r.worker_id, r.worker_name, r.unit, r.skill_category,
                                 r.profile_title, r.days_present, fmt_inr(r.gross),
                                 fmt_inr(r.epf_deduction), fmt_inr(r.esi_deduction),
                                 fmt_inr(r.net_pay)) for r in results])
@@ -385,7 +385,7 @@ class PayrollApp(ctk.CTk):
                            corner_radius=8, command=export_csv).pack(anchor="w", pady=(0, 16))
 
         month_var.trace_add("write", lambda *_: refresh())
-        branch_var.trace_add("write", lambda *_: refresh())
+        unit_var.trace_add("write", lambda *_: refresh())
         refresh()
 
     # ══════════════════════════════════════════════════════════════════════
@@ -411,9 +411,9 @@ class PayrollApp(ctk.CTk):
         ctk.CTkOptionMenu(ctrl, values=opts, variable=month_var, width=140, font=FONT_BODY,
                            fg_color=SURFACE_3, button_color=ACCENT,
                            button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 20))
-        ctk.CTkLabel(ctrl, text="Branch:", font=FONT_BODY_BOLD, text_color=TEXT_PRIMARY).pack(side="left")
-        branch_var = ctk.StringVar(value="All")
-        ctk.CTkOptionMenu(ctrl, values=_branch_filter_list(), variable=branch_var, width=140,
+        ctk.CTkLabel(ctrl, text="Unit:", font=FONT_BODY_BOLD, text_color=TEXT_PRIMARY).pack(side="left")
+        unit_var = ctk.StringVar(value="All")
+        ctk.CTkOptionMenu(ctrl, values=_unit_filter_list(), variable=unit_var, width=140,
                            font=FONT_BODY, fg_color=SURFACE_3, button_color=ACCENT,
                            button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 20))
         search_var_att = ctk.StringVar(value="")
@@ -444,8 +444,8 @@ class PayrollApp(ctk.CTk):
             for w in table_frame.winfo_children(): w.destroy()
             self._att_entries.clear()
             workers = get_all_workers()
-            if branch_var.get() != "All":
-                workers = [w for w in workers if w.branch == branch_var.get()]
+            if unit_var.get() != "All":
+                workers = [w for w in workers if w.unit == unit_var.get()]
             q_att = search_var_att.get().strip().lower()
             if q_att:
                 workers = [w for w in workers if q_att in w.name.lower() or q_att in w.worker_id.lower()]
@@ -458,7 +458,7 @@ class PayrollApp(ctk.CTk):
                           text_color=TEXT_PRIMARY, anchor="w").pack(fill="x", pady=(4, 6))
             hdr = ctk.CTkFrame(table_frame, fg_color=ACCENT_DARK, corner_radius=6)
             hdr.pack(fill="x", pady=(0, 2))
-            cols = [("ID",55), ("Name",110), ("Branch",75), ("Skill",70), ("Designation",90), ("Rate/Day",55), ("Days",55), ("OT Hours",80)]
+            cols = [("ID",55), ("Name",110), ("Unit",75), ("Skill",70), ("Designation",90), ("Rate/Day",55), ("Days",55), ("OT Hours",80)]
             for txt, w in cols:
                 ctk.CTkLabel(hdr, text=txt, font=(FONT_FAMILY, 10, "bold"),
                               text_color="white", anchor="w", width=w).pack(side="left", padx=6, pady=5)
@@ -476,7 +476,7 @@ class PayrollApp(ctk.CTk):
 
                 ctk.CTkLabel(row, text=w.worker_id, font=FONT_SMALL, text_color=TEXT_PRIMARY, width=55).pack(side="left", padx=6, pady=4)
                 ctk.CTkLabel(row, text=w.name, font=FONT_SMALL, text_color=TEXT_PRIMARY, width=110, anchor="w").pack(side="left", padx=6)
-                ctk.CTkLabel(row, text=w.branch, font=FONT_TINY, text_color=TEXT_SECONDARY, width=75, anchor="w").pack(side="left", padx=6)
+                ctk.CTkLabel(row, text=w.unit, font=FONT_TINY, text_color=TEXT_SECONDARY, width=75, anchor="w").pack(side="left", padx=6)
                 ctk.CTkLabel(row, text=w.skill_category, font=FONT_TINY, text_color=TEXT_SECONDARY, width=70, anchor="w").pack(side="left", padx=6)
                 ctk.CTkLabel(row, text=w.designation, font=FONT_TINY, text_color=TEXT_SECONDARY, width=90, anchor="w").pack(side="left", padx=6)
                 ctk.CTkLabel(row, text=rate, font=FONT_TINY, text_color=TEXT_SECONDARY, width=55, anchor="w").pack(side="left", padx=6)
@@ -511,7 +511,7 @@ class PayrollApp(ctk.CTk):
                        corner_radius=8, command=save_all).pack(fill="x", padx=12, pady=(4, 12))
 
         month_var.trace_add("write", lambda *_: refresh())
-        branch_var.trace_add("write", lambda *_: refresh())
+        unit_var.trace_add("write", lambda *_: refresh())
         search_var_att.trace_add("write", lambda *_: refresh())
         refresh()
 
@@ -596,7 +596,7 @@ class PayrollApp(ctk.CTk):
     # ══════════════════════════════════════════════════════════════════════
     def _page_workers(self, parent):
         _page_header(parent, "👷  Worker Master Data",
-                     "Add, edit, or delete workers — bank, PF/ESIC, branch, skill & designation")
+                     "Add, edit, or delete workers — bank, PF/ESIC, unit, skill & designation")
         tabview = ctk.CTkTabview(parent, fg_color=SURFACE_2, segmented_button_fg_color=SURFACE_3,
                                   segmented_button_selected_color=ACCENT,
                                   segmented_button_selected_hover_color=ACCENT_HOVER,
@@ -610,7 +610,7 @@ class PayrollApp(ctk.CTk):
             w = get_worker_by_id(wid_str)
             if not w: messagebox.showerror("Error", f"Worker '{wid_str}' not found."); return
             form_vars["wid"].set(w.worker_id); form_vars["name"].set(w.name)
-            form_vars["designation"].set(w.designation); form_vars["branch"].set(w.branch)
+            form_vars["designation"].set(w.designation); form_vars["unit"].set(w.unit)
             form_vars["skill"].set(w.skill_category); form_vars["join"].set(w.joining_date)
             form_vars["bank_acc"].set(w.bank_account); form_vars["bank_name"].set(w.bank_name)
             form_vars["ifsc"].set(w.ifsc_code); form_vars["uan"].set(w.uan_number)
@@ -622,8 +622,8 @@ class PayrollApp(ctk.CTk):
             for k in ["wid","name","designation","bank_acc","bank_name","ifsc","uan","esic"]:
                 form_vars[k].set("")
             form_vars["join"].set(datetime.date.today().strftime("%d/%m/%Y"))
-            b = get_all_branches()
-            form_vars["branch"].set(b[0] if b else "")
+            b = get_all_units()
+            form_vars["unit"].set(b[0] if b else "")
             form_vars["skill"].set(SKILL_CATEGORIES[-1])
             self.status_bar.set_message("Form cleared — ready to add a new worker.")
 
@@ -633,9 +633,9 @@ class PayrollApp(ctk.CTk):
             fc.pack(fill="x", padx=8, pady=(10, 8))
             inner_fc = ctk.CTkFrame(fc, fg_color="transparent")
             inner_fc.pack(fill="x", padx=14, pady=10)
-            ctk.CTkLabel(inner_fc, text="Branch:", font=FONT_BODY_BOLD, text_color=TEXT_PRIMARY).pack(side="left")
+            ctk.CTkLabel(inner_fc, text="Unit:", font=FONT_BODY_BOLD, text_color=TEXT_PRIMARY).pack(side="left")
             filt_var = ctk.StringVar(value="All")
-            ctk.CTkOptionMenu(inner_fc, values=_branch_filter_list(), variable=filt_var, width=140,
+            ctk.CTkOptionMenu(inner_fc, values=_unit_filter_list(), variable=filt_var, width=140,
                                font=FONT_BODY, fg_color=SURFACE_3, button_color=ACCENT,
                                button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 20))
             search_var_wk = ctk.StringVar(value="")
@@ -650,7 +650,7 @@ class PayrollApp(ctk.CTk):
                 for w in table_container.winfo_children(): w.destroy()
                 workers = get_all_workers(active_only=False)
                 if filt_var.get() != "All":
-                    workers = [w for w in workers if w.branch == filt_var.get()]
+                    workers = [w for w in workers if w.unit == filt_var.get()]
                 q_wk = search_var_wk.get().strip().lower()
                 if q_wk:
                     workers = [w for w in workers if q_wk in w.name.lower() or q_wk in w.worker_id.lower()]
@@ -662,12 +662,12 @@ class PayrollApp(ctk.CTk):
                     ctk.CTkLabel(ef, text='Use "➕ Add / Edit" tab to add your first worker.',
                                  font=FONT_SMALL, text_color=TEXT_MUTED).pack(pady=(4, 20))
                     return
-                cols = ("ID","Name","Branch","Skill","Designation","Bank","A/C","IFSC","UAN","ESIC","Status")
+                cols = ("ID","Name","Unit","Skill","Designation","Bank","A/C","IFSC","UAN","ESIC","Status")
                 widths = [55,120,80,70,90,90,100,90,80,70,45]
                 table = StyledTreeview(table_container, columns=cols, column_widths=widths,
                                         height=min(len(workers), 12))
                 table.pack(fill="both", expand=True, pady=(4, 4))
-                table.insert_rows([(w.worker_id, w.name, w.branch, w.skill_category,
+                table.insert_rows([(w.worker_id, w.name, w.unit, w.skill_category,
                                     w.designation, w.bank_name, w.bank_account, w.ifsc_code,
                                     w.uan_number, w.esic_number,
                                     "● Active" if w.active else "○ Inactive") for w in workers])
@@ -776,12 +776,12 @@ class PayrollApp(ctk.CTk):
         wname_var = mkf(ff, "Full Name *", 0, 1)
         wdesig_var = mkf(ff, "Designation (e.g. Sweeper)", 0, 2)
 
-        # Branch dropdown
+        # Unit dropdown
         bf = ctk.CTkFrame(ff, fg_color="transparent"); bf.grid(row=1, column=0, padx=8, pady=4, sticky="ew")
-        ctk.CTkLabel(bf, text="Branch *", font=FONT_SMALL, text_color=TEXT_SECONDARY).pack(anchor="w")
-        branches = _branch_list()
-        branch_var = ctk.StringVar(value=branches[0] if branches else "")
-        ctk.CTkOptionMenu(bf, values=branches, variable=branch_var, font=FONT_BODY,
+        ctk.CTkLabel(bf, text="Unit *", font=FONT_SMALL, text_color=TEXT_SECONDARY).pack(anchor="w")
+        units = _unit_list()
+        unit_var = ctk.StringVar(value=units[0] if units else "")
+        ctk.CTkOptionMenu(bf, values=units, variable=unit_var, font=FONT_BODY,
                            fg_color=SURFACE, button_color=ACCENT,
                            button_hover_color=ACCENT_HOVER, height=30).pack(fill="x")
 
@@ -802,7 +802,7 @@ class PayrollApp(ctk.CTk):
         wesic_var = mkf(ff, "ESIC IP Number", 3, 1)
 
         form_vars.update({"wid": wid_var, "name": wname_var, "designation": wdesig_var,
-                          "branch": branch_var, "skill": skill_var, "join": wjoin_var,
+                          "unit": unit_var, "skill": skill_var, "join": wjoin_var,
                           "bank_acc": wbank_var, "bank_name": wbname_var, "ifsc": wifsc_var,
                           "uan": wuan_var, "esic": wesic_var})
 
@@ -810,15 +810,15 @@ class PayrollApp(ctk.CTk):
             wid = wid_var.get().strip().upper(); wname = wname_var.get().strip()
             if not wid or not wname:
                 messagebox.showerror("Required", "Worker ID and Name are required."); return
-            b = branch_var.get()
-            if not b or b == "(No branches)":
-                messagebox.showerror("Required", "Create a Branch first (🏢 Branches)."); return
+            b = unit_var.get()
+            if not b or b == "(No units)":
+                messagebox.showerror("Required", "Create a Unit first (🏢 Units)."); return
             upsert_worker(Worker(
                 worker_id=wid, name=wname, designation=wdesig_var.get().strip(),
                 bank_account=wbank_var.get().strip(), bank_name=wbname_var.get().strip(),
                 ifsc_code=wifsc_var.get().strip(), uan_number=wuan_var.get().strip(),
                 esic_number=wesic_var.get().strip(), joining_date=wjoin_var.get().strip(),
-                active=True, branch=b, skill_category=skill_var.get()))
+                active=True, unit=b, skill_category=skill_var.get()))
             self.status_bar.set_message(f"✅ Worker {wid} saved!", SUCCESS)
             messagebox.showinfo("Saved", f"Worker {wid} saved!")
             _clear_form(); refresh_workers()
@@ -829,17 +829,17 @@ class PayrollApp(ctk.CTk):
         refresh_workers()
 
     # ══════════════════════════════════════════════════════════════════════
-    #   BRANCHES
+    #   UNITS
     # ══════════════════════════════════════════════════════════════════════
-    def _page_branches(self, parent):
-        _page_header(parent, "🏢  Branch Management",
-                     "Add, rename, or remove company branches")
+    def _page_units(self, parent):
+        _page_header(parent, "🏢  Unit Management",
+                     "Add, rename, or remove company units")
         content = ctk.CTkFrame(parent, fg_color="transparent")
         content.pack(fill="both", expand=True, padx=28, pady=(0, 20))
 
         def refresh():
             for w in content.winfo_children(): w.destroy()
-            branches = get_all_branches(); counts = branch_worker_count()
+            units = get_all_units(); counts = unit_worker_count()
 
             # Add card
             add_card = ctk.CTkFrame(content, fg_color=CARD_BG, corner_radius=14, border_width=1, border_color=CARD_BORDER)
@@ -847,32 +847,32 @@ class PayrollApp(ctk.CTk):
             ctk.CTkFrame(add_card, height=3, corner_radius=0, fg_color=ACCENT).pack(fill="x")
             add_inner = ctk.CTkFrame(add_card, fg_color="transparent")
             add_inner.pack(fill="x", padx=20, pady=16)
-            ctk.CTkLabel(add_inner, text="➕  New Branch", font=FONT_HEADING,
+            ctk.CTkLabel(add_inner, text="➕  New Unit", font=FONT_HEADING,
                           text_color=TEXT_PRIMARY).pack(anchor="w", pady=(0, 10))
             add_row = ctk.CTkFrame(add_inner, fg_color="transparent"); add_row.pack(fill="x")
             new_var = ctk.StringVar()
             ctk.CTkEntry(add_row, textvariable=new_var, height=38, width=320, font=FONT_BODY,
                           fg_color=SURFACE, border_color=CARD_BORDER, corner_radius=8,
-                          placeholder_text="Branch name e.g. Head Office…").pack(side="left", padx=(0, 12))
+                          placeholder_text="Unit name e.g. Head Office…").pack(side="left", padx=(0, 12))
             def do_add():
                 name = new_var.get().strip()
-                if not name: messagebox.showerror("Required", "Branch name cannot be empty."); return
-                try: add_branch(name); self.status_bar.set_message(f"✅ Branch '{name}' added!", SUCCESS); new_var.set(""); refresh()
+                if not name: messagebox.showerror("Required", "Unit name cannot be empty."); return
+                try: add_unit(name); self.status_bar.set_message(f"✅ Unit '{name}' added!", SUCCESS); new_var.set(""); refresh()
                 except Exception as e: messagebox.showerror("Error", f"Already exists or error:\n{e}")
-            ctk.CTkButton(add_row, text="➕  Add Branch", font=FONT_BODY_BOLD, fg_color=SUCCESS,
+            ctk.CTkButton(add_row, text="➕  Add Unit", font=FONT_BODY_BOLD, fg_color=SUCCESS,
                            hover_color="#16A34A", height=38, corner_radius=8, command=do_add).pack(side="left")
 
-            if not branches:
+            if not units:
                 ef = ctk.CTkFrame(content, fg_color=CARD_BG, corner_radius=14, border_width=1, border_color=CARD_BORDER)
                 ef.pack(fill="x", pady=10)
                 ctk.CTkLabel(ef, text="🏢", font=(FONT_FAMILY, 40)).pack(pady=(28, 6))
-                ctk.CTkLabel(ef, text="No branches yet", font=FONT_HEADING, text_color=TEXT_SECONDARY).pack()
-                ctk.CTkLabel(ef, text="Add your first branch above.",
+                ctk.CTkLabel(ef, text="No units yet", font=FONT_HEADING, text_color=TEXT_SECONDARY).pack()
+                ctk.CTkLabel(ef, text="Add your first unit above.",
                              font=FONT_SMALL, text_color=TEXT_MUTED).pack(pady=(4, 28))
                 return
 
-            _section_label(content, f"Branches  —  {len(branches)} total")
-            for b in branches:
+            _section_label(content, f"Units  —  {len(units)} total")
+            for b in units:
                 count = counts.get(b, 0)
                 card = ctk.CTkFrame(content, fg_color=CARD_BG, corner_radius=12,
                                     border_width=1, border_color=CARD_BORDER)
@@ -885,7 +885,7 @@ class PayrollApp(ctk.CTk):
                 accent_strip.pack_propagate(False)
                 ir = ctk.CTkFrame(inner_wrap, fg_color="transparent")
                 ir.pack(side="left", fill="x", expand=True, padx=14, pady=12)
-                # Branch name + pill count
+                # Unit name + pill count
                 left = ctk.CTkFrame(ir, fg_color="transparent")
                 left.pack(side="left", fill="y")
                 ctk.CTkLabel(left, text=f"📍  {b}", font=FONT_BODY_BOLD, text_color=TEXT_PRIMARY).pack(anchor="w")
@@ -895,10 +895,10 @@ class PayrollApp(ctk.CTk):
                 # Buttons
                 def mk_rename(bn=b):
                     def do():
-                        d = ctk.CTkInputDialog(text=f"Rename '{bn}' to:", title="Rename Branch")
+                        d = ctk.CTkInputDialog(text=f"Rename '{bn}' to:", title="Rename Unit")
                         nn = d.get_input()
                         if nn and nn.strip():
-                            try: rename_branch(bn, nn.strip()); self.status_bar.set_message(f"✅ Renamed → {nn.strip()}", SUCCESS); refresh()
+                            try: rename_unit(bn, nn.strip()); self.status_bar.set_message(f"✅ Renamed → {nn.strip()}", SUCCESS); refresh()
                             except Exception as e: messagebox.showerror("Error", str(e))
                     return do
                 ctk.CTkButton(ir, text="✏️  Rename", font=FONT_SMALL, fg_color=ACCENT,
@@ -907,9 +907,9 @@ class PayrollApp(ctk.CTk):
                 def mk_del(bn=b, wc=count):
                     def do():
                         extra = f"\n\n⚠️ {wc} worker(s) will become unassigned." if wc > 0 else ""
-                        if messagebox.askyesno("Delete Branch", f"Delete '{bn}'?{extra}",
+                        if messagebox.askyesno("Delete Unit", f"Delete '{bn}'?{extra}",
                                                 icon="warning" if wc > 0 else "question"):
-                            delete_branch(bn); self.status_bar.set_message(f"🗑️ '{bn}' deleted.", DANGER); refresh()
+                            delete_unit(bn); self.status_bar.set_message(f"🗑️ '{bn}' deleted.", DANGER); refresh()
                     return do
                 ctk.CTkButton(ir, text="🗑️", font=FONT_SMALL, fg_color=DANGER,
                                hover_color="#B91C1C", height=30, corner_radius=6, width=40,
@@ -995,7 +995,7 @@ class PayrollApp(ctk.CTk):
     # ══════════════════════════════════════════════════════════════════════
     def _page_slips(self, parent):
         _page_header(parent, "📄  Generate Salary Slips",
-                     "Generate PDF salary slips — per branch or for all workers")
+                     "Generate PDF salary slips — per unit or for all workers")
         ctrl = ctk.CTkFrame(parent, fg_color=SURFACE_3, corner_radius=10)
         ctrl.pack(fill="x", padx=28, pady=(4, 14))
         inner_ctrl = ctk.CTkFrame(ctrl, fg_color="transparent")
@@ -1006,9 +1006,9 @@ class PayrollApp(ctk.CTk):
         ctk.CTkOptionMenu(inner_ctrl, values=opts, variable=month_var, width=140, font=FONT_BODY,
                            fg_color=SURFACE, button_color=ACCENT,
                            button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 20))
-        ctk.CTkLabel(inner_ctrl, text="Branch:", font=FONT_BODY_BOLD, text_color=TEXT_PRIMARY).pack(side="left")
-        branch_var = ctk.StringVar(value="All")
-        ctk.CTkOptionMenu(inner_ctrl, values=_branch_filter_list(), variable=branch_var, width=150,
+        ctk.CTkLabel(inner_ctrl, text="Unit:", font=FONT_BODY_BOLD, text_color=TEXT_PRIMARY).pack(side="left")
+        unit_var = ctk.StringVar(value="All")
+        ctk.CTkOptionMenu(inner_ctrl, values=_unit_filter_list(), variable=unit_var, width=150,
                            font=FONT_BODY, fg_color=SURFACE, button_color=ACCENT,
                            button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 0))
         ctk.CTkButton(inner_ctrl, text="🔄 Refresh", font=FONT_BODY, width=100, fg_color=SURFACE,
@@ -1020,8 +1020,8 @@ class PayrollApp(ctk.CTk):
         def refresh():
             for w in content.winfo_children(): w.destroy()
             workers = get_all_workers()
-            if branch_var.get() != "All":
-                workers = [w for w in workers if w.branch == branch_var.get()]
+            if unit_var.get() != "All":
+                workers = [w for w in workers if w.unit == unit_var.get()]
             sw = get_skill_wages_dict(); att = get_attendance(month_var.get())
             results, warnings = calculate_payroll(workers, sw, att, month_var.get())
             if warnings:
@@ -1036,11 +1036,11 @@ class PayrollApp(ctk.CTk):
                              font=FONT_HEADING, text_color=TEXT_SECONDARY).pack(pady=(0, 20))
                 return
             _section_label(content, f"📊  Ready: {len(results)} slip(s) for {month_var.get()}")
-            cols = ("ID","Name","Branch","Skill","Designation","Net Pay (₹)")
+            cols = ("ID","Name","Unit","Skill","Designation","Net Pay (₹)")
             table = StyledTreeview(content, columns=cols, column_widths=[70,150,100,80,130,120],
                                     height=min(len(results), 10))
             table.pack(fill="both", expand=True, pady=(0, 10))
-            table.insert_rows([(r.worker_id, r.worker_name, r.branch, r.skill_category,
+            table.insert_rows([(r.worker_id, r.worker_name, r.unit, r.skill_category,
                                 r.profile_title, fmt_inr(r.net_pay)) for r in results])
 
             def gen_all():
@@ -1087,7 +1087,7 @@ class PayrollApp(ctk.CTk):
             ctk.CTkLabel(single, text="📄  Generate Single Slip", font=FONT_SUBHEADING,
                           text_color=TEXT_PRIMARY).pack(padx=16, pady=(12, 6), anchor="w")
             sc = ctk.CTkFrame(single, fg_color="transparent"); sc.pack(fill="x", padx=12, pady=(0, 12))
-            nl = [f"{r.worker_id} — {r.worker_name} [{r.branch}]" for r in results]
+            nl = [f"{r.worker_id} — {r.worker_name} [{r.unit}]" for r in results]
             sel_w = ctk.StringVar(value=nl[0] if nl else "")
             ctk.CTkOptionMenu(sc, values=nl, variable=sel_w, width=280, font=FONT_BODY,
                                fg_color=SURFACE, button_color=ACCENT,
@@ -1108,7 +1108,7 @@ class PayrollApp(ctk.CTk):
                            command=gen_single).pack(side="left")
 
         month_var.trace_add("write", lambda *_: refresh())
-        branch_var.trace_add("write", lambda *_: refresh())
+        unit_var.trace_add("write", lambda *_: refresh())
         refresh()
 
     # ══════════════════════════════════════════════════════════════════════
@@ -1168,7 +1168,7 @@ class PayrollApp(ctk.CTk):
         db_inner.grid_columnconfigure((0, 1), weight=1)
         for i, (label, val) in enumerate([
             ("Database", os.path.abspath(DB_PATH)),
-            ("Branches", str(len(get_all_branches()))),
+            ("Units", str(len(get_all_units()))),
             ("Workers (incl. inactive)", str(len(get_all_workers(active_only=False)))),
             ("App Version", "PayrollPro v2.1"),
         ]):

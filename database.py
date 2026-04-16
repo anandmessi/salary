@@ -24,7 +24,7 @@ def get_conn(db_path=DB_PATH):
         conn.close()
 
 DDL = """
-CREATE TABLE IF NOT EXISTS branches (
+CREATE TABLE IF NOT EXISTS units (
     name TEXT PRIMARY KEY
 );
 
@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS workers (
     esic_number    TEXT DEFAULT '',
     joining_date   TEXT DEFAULT '',
     active         INTEGER NOT NULL DEFAULT 1,
-    branch         TEXT NOT NULL DEFAULT '',
+    unit         TEXT NOT NULL DEFAULT '',
     skill_category TEXT NOT NULL DEFAULT 'Unskilled'
 );
 
@@ -106,36 +106,36 @@ def upsert_skill_wage(sw: SkillWage, db_path=DB_PATH):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#   BRANCHES
+#   UNITS
 # ══════════════════════════════════════════════════════════════════════════════
-def get_all_branches(db_path=DB_PATH) -> List[str]:
+def get_all_units(db_path=DB_PATH) -> List[str]:
     with get_conn(db_path) as conn:
-        rows = conn.execute("SELECT name FROM branches ORDER BY name").fetchall()
+        rows = conn.execute("SELECT name FROM units ORDER BY name").fetchall()
     return [r["name"] for r in rows]
 
-def add_branch(name: str, db_path=DB_PATH):
+def add_unit(name: str, db_path=DB_PATH):
     with get_conn(db_path) as conn:
-        conn.execute("INSERT INTO branches(name) VALUES(?)", (name.strip(),))
+        conn.execute("INSERT INTO units(name) VALUES(?)", (name.strip(),))
 
-def rename_branch(old_name: str, new_name: str, db_path=DB_PATH):
+def rename_unit(old_name: str, new_name: str, db_path=DB_PATH):
     new = new_name.strip()
     with get_conn(db_path) as conn:
-        conn.execute("UPDATE branches SET name=? WHERE name=?", (new, old_name))
-        conn.execute("UPDATE workers SET branch=? WHERE branch=?", (new, old_name))
+        conn.execute("UPDATE units SET name=? WHERE name=?", (new, old_name))
+        conn.execute("UPDATE workers SET unit=? WHERE unit=?", (new, old_name))
 
-def delete_branch(name: str, db_path=DB_PATH) -> int:
+def delete_unit(name: str, db_path=DB_PATH) -> int:
     with get_conn(db_path) as conn:
-        count = conn.execute("SELECT COUNT(*) FROM workers WHERE branch=?", (name,)).fetchone()[0]
+        count = conn.execute("SELECT COUNT(*) FROM workers WHERE unit=?", (name,)).fetchone()[0]
         if count > 0:
-            conn.execute("UPDATE workers SET branch='' WHERE branch=?", (name,))
-        conn.execute("DELETE FROM branches WHERE name=?", (name,))
+            conn.execute("UPDATE workers SET unit='' WHERE unit=?", (name,))
+        conn.execute("DELETE FROM units WHERE name=?", (name,))
     return count
 
-def branch_worker_count(db_path=DB_PATH) -> Dict[str, int]:
+def unit_worker_count(db_path=DB_PATH) -> Dict[str, int]:
     with get_conn(db_path) as conn:
         rows = conn.execute(
             "SELECT b.name, COUNT(w.worker_id) as cnt "
-            "FROM branches b LEFT JOIN workers w ON b.name=w.branch AND w.active=1 "
+            "FROM units b LEFT JOIN workers w ON b.name=w.unit AND w.active=1 "
             "GROUP BY b.name ORDER BY b.name").fetchall()
     return {r["name"]: r["cnt"] for r in rows}
 
@@ -149,31 +149,31 @@ def get_all_workers(db_path=DB_PATH, active_only=True):
         rows = conn.execute(sql).fetchall()
     return [Worker.from_dict(dict(r)) for r in rows]
 
-def get_workers_by_branch(branch, db_path=DB_PATH, active_only=True):
-    sql = "SELECT * FROM workers WHERE branch=?"
+def get_workers_by_unit(unit, db_path=DB_PATH, active_only=True):
+    sql = "SELECT * FROM workers WHERE unit=?"
     if active_only:
         sql += " AND active=1"
     sql += " ORDER BY name"
     with get_conn(db_path) as conn:
-        rows = conn.execute(sql, (branch,)).fetchall()
+        rows = conn.execute(sql, (unit,)).fetchall()
     return [Worker.from_dict(dict(r)) for r in rows]
 
 def upsert_worker(w: Worker, db_path=DB_PATH):
     with get_conn(db_path) as conn:
         conn.execute("""INSERT INTO workers
             (worker_id, name, designation, bank_account, bank_name, ifsc_code,
-             uan_number, esic_number, joining_date, active, branch, skill_category)
+             uan_number, esic_number, joining_date, active, unit, skill_category)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(worker_id) DO UPDATE SET
             name=excluded.name, designation=excluded.designation,
             bank_account=excluded.bank_account, bank_name=excluded.bank_name,
             ifsc_code=excluded.ifsc_code, uan_number=excluded.uan_number,
             esic_number=excluded.esic_number, joining_date=excluded.joining_date,
-            active=excluded.active, branch=excluded.branch,
+            active=excluded.active, unit=excluded.unit,
             skill_category=excluded.skill_category""",
             (w.worker_id, w.name, w.designation, w.bank_account, w.bank_name,
              w.ifsc_code, w.uan_number, w.esic_number, w.joining_date,
-             int(w.active), w.branch, w.skill_category))
+             int(w.active), w.unit, w.skill_category))
 
 def deactivate_worker(worker_id, db_path=DB_PATH):
     with get_conn(db_path) as conn:
