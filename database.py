@@ -3,8 +3,11 @@ database.py — SQLite Database Layer
 Wages are based on skill_category, not designation.
 """
 import sqlite3, json, logging
+import threading
 from contextlib import contextmanager
 from typing import List, Optional, Dict
+
+_local = threading.local()
 
 from schema import SkillWage, Worker, AttendanceRecord, CompanyConfig, SKILL_CATEGORIES
 from db_cache import cache
@@ -24,16 +27,17 @@ _PRAGMAS = (
 
 @contextmanager
 def get_conn(db_path=DB_PATH):
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    for pragma in _PRAGMAS:
-        conn.execute(pragma)
+    conn = getattr(_local, "conn", None)
+    if conn is None:
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        for pragma in _PRAGMAS:
+            conn.execute(pragma)
+        _local.conn = conn
     try:
         yield conn; conn.commit()
     except Exception:
         conn.rollback(); raise
-    finally:
-        conn.close()
 
 DDL = """
 CREATE TABLE IF NOT EXISTS units (
