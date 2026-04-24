@@ -24,6 +24,7 @@ from database import (
     get_workers_by_unit, import_attendance_from_csv,
     get_all_units, add_unit, rename_unit, delete_unit,
     unit_worker_count,
+    get_all_banks, get_bank_ifsc, add_bank, update_bank, delete_bank,
     DB_PATH,
 )
 from payroll_engine import calculate_payroll, payroll_summary
@@ -426,16 +427,30 @@ class PayrollApp(ctk.CTk):
         table_frame.pack(fill="x", expand=False, padx=12, pady=(0, 4))
         self._att_entries = {}
 
+        # ── Debounce helper: prevents hammering refresh on every keystroke ──
+        _debounce_id = [None]
+        def _debounced_refresh(*_):
+            if _debounce_id[0]:
+                try: parent.after_cancel(_debounce_id[0])
+                except Exception: pass
+            _debounce_id[0] = parent.after(300, refresh)
+
         def save_all():
             records = []
             existing_db = {a.worker_id: a for a in get_attendance(month_var.get())}
             for wid, entry in self._att_entries.items():
-                att = entry.get("detail_att", existing_db.get(wid, AttendanceRecord(wid, month_var.get())))
+                # Prefer already-built detail_att; fall back to existing DB record or blank
+                att = entry.get("detail_att")
+                if att is None:
+                    att = existing_db.get(wid)
+                    if att is None:
+                        att = AttendanceRecord(wid, month_var.get())
                 try:
                     att.days_present = float(entry["days"].get() or 0)
                     att.overtime_hours = float(entry["ot"].get() or 0)
                 except ValueError: pass
-                att.month = month_var.get(); records.append(att)
+                att.month = month_var.get()
+                records.append(att)
             bulk_upsert_attendance(records)
             self.status_bar.set_message(f"✅ Saved {len(records)} records for {month_var.get()}", SUCCESS)
             messagebox.showinfo("Saved", f"{len(records)} records saved for {month_var.get()}.")
@@ -465,9 +480,9 @@ class PayrollApp(ctk.CTk):
             for i, w in enumerate(workers):
                 att = existing.get(w.worker_id, AttendanceRecord(w.worker_id, month_var.get()))
                 sw = sw_dict.get(w.skill_category)
-                rate = f"₹{sw.daily_wage}" if sw else "—"
+                rate = f"\u20b9{sw.daily_wage}" if sw else "\u2014"
                 bg = SURFACE_2 if i % 2 == 0 else SURFACE_3
-                
+
                 worker_container = ctk.CTkFrame(table_frame, fg_color=bg, corner_radius=4)
                 worker_container.pack(fill="x", pady=1)
 
@@ -480,74 +495,108 @@ class PayrollApp(ctk.CTk):
                 ctk.CTkLabel(row, text=w.skill_category, font=FONT_TINY, text_color=TEXT_SECONDARY, width=70, anchor="w").pack(side="left", padx=6)
                 ctk.CTkLabel(row, text=w.designation, font=FONT_TINY, text_color=TEXT_SECONDARY, width=90, anchor="w").pack(side="left", padx=6)
                 ctk.CTkLabel(row, text=rate, font=FONT_TINY, text_color=TEXT_SECONDARY, width=55, anchor="w").pack(side="left", padx=6)
-                
+
                 days_var = ctk.StringVar(value=str(att.days_present))
                 ctk.CTkEntry(row, textvariable=days_var, width=55, height=24, font=FONT_SMALL,
                               fg_color=SURFACE, border_color=TEXT_MUTED, corner_radius=4).pack(side="left", padx=6)
-                
+
                 ot_var = ctk.StringVar(value=str(att.overtime_hours))
                 ctk.CTkEntry(row, textvariable=ot_var, width=80, height=24, font=FONT_SMALL,
                               fg_color=SURFACE, border_color=TEXT_MUTED, corner_radius=4).pack(side="left", padx=6)
-                
-                details = ctk.CTkFrame(worker_container, fg_color="transparent")
-                shown = [False]
-                toggle_btn = ctk.CTkButton(row, text="▼", font=FONT_SMALL, width=30, height=24,
-                    corner_radius=4, fg_color=SURFACE_3, hover_color=SURFACE_2, text_color=TEXT_SECONDARY)
-                toggle_btn.pack(side="left", padx=6)
 
-                def make_toggle(d=details, tb=toggle_btn, sh=shown):
+                # ── Lazy detail panel: only built on first expand ──────────
+                details = ctk.CTkFrame(worker_container, fg_color="transparent")
+                shown    = [False]
+                built    = [False]       # track whether widgets have been created
+                entry_data = {"days": days_var, "ot": ot_var}  # no detail_att yet
+                self._att_entries[w.worker_id] = entry_data
+
+                # Capture loop vars
+                def make_toggle(d=details, tb_ref=[None], sh=shown, blt=built,
+                                 ed=entry_data, wid=w.worker_id, att_snap=att):
+                    btn = ctk.CTkButton(row, text="\u25bc", font=FONT_SMALL, width=30, height=24,
+                        corner_radius=4, fg_color=SURFACE_3, hover_color=SURFACE_2,
+                        text_color=TEXT_SECONDARY)
+                    btn.pack(side="left", padx=6)
+                    tb_ref[0] = btn
                     def toggle():
-                        if sh[0]: d.pack_forget(); tb.configure(text="▼"); sh[0] = False
-                        else: d.pack(fill="x", padx=10, pady=(6, 10)); tb.configure(text="▲"); sh[0] = True
-                    tb.configure(command=toggle)
+                        if sh[0]:
+                            d.pack_forget()
+                            btn.configure(text="\u25bc")
+                            sh[0] = False
+                        else:
+                            # Lazy-build on first open
+                            if not blt[0]:
+                                self._build_detail_fields(d, wid, att_snap, ed)
+                                blt[0] = True
+                            d.pack(fill="x", padx=10, pady=(6, 10))
+                            btn.configure(text="\u25b2")
+                            sh[0] = True
+                    btn.configure(command=toggle)
                 make_toggle()
-                
-                self._build_detail_fields(details, w.worker_id, att)
-                self._att_entries[w.worker_id] = {"days": days_var, "ot": ot_var, "existing": att}
 
         # Save button lives OUTSIDE the scrollable table_frame — always visible
-        ctk.CTkButton(parent, text="💾  Save All Attendance", font=FONT_BODY_BOLD,
+        ctk.CTkButton(parent, text="\U0001f4be  Save All Attendance", font=FONT_BODY_BOLD,
                        fg_color=SUCCESS, hover_color="#2E7D32", height=40,
                        corner_radius=8, command=save_all).pack(fill="x", padx=12, pady=(4, 12))
 
         month_var.trace_add("write", lambda *_: refresh())
         unit_var.trace_add("write", lambda *_: refresh())
-        search_var_att.trace_add("write", lambda *_: refresh())
+        search_var_att.trace_add("write", _debounced_refresh)
         refresh()
 
-    def _build_detail_fields(self, parent, worker_id, att):
+    def _build_detail_fields(self, parent, worker_id, att, entry_data=None):
+        """Build the expandable allowance/deduction fields panel.
+        entry_data: the dict from self._att_entries[worker_id] — updated in-place.
+        """
         fields = [
-            ("DA (₹)","da"),("HRA (₹)","hra"),("CCA (₹)","cca"),
-            ("Arrears (₹)","arrears"),("N&FH Wages (₹)","nfh_wages"),
-            ("Leave Wages (₹)","leave_wages"),("Bonus (₹)","bonus"),
-            ("Maternity (₹)","maternity_benefit"),("Advance Pay (₹)","advances_pay"),
-            ("Other Allow. (₹)","other_allowances"),
+            ("DA (\u20b9)","da"),("HRA (\u20b9)","hra"),("CCA (\u20b9)","cca"),
+            ("Arrears (\u20b9)","arrears"),("N&FH Wages (\u20b9)","nfh_wages"),
+            ("Leave Wages (\u20b9)","leave_wages"),("Bonus (\u20b9)","bonus"),
+            ("Maternity (\u20b9)","maternity_benefit"),("Advance Pay (\u20b9)","advances_pay"),
+            ("Other Allow. (\u20b9)","other_allowances"),
             ("EPF Override (0=auto)","epf_override"),("ESI Override (0=auto)","esi_override"),
-            ("Welfare Fund (₹)","welfare_fund"),("TDS (₹)","tds"),
-            ("Prof. Tax (₹)","profession_tax"),("Adv. Repayment (₹)","advance_repayment"),
-            ("Fine (₹)","fine"),("Loss/Damages (₹)","loss_damages"),
-            ("Other Ded. (₹)","other_deductions"),
+            ("Welfare Fund (\u20b9)","welfare_fund"),("TDS (\u20b9)","tds"),
+            ("Prof. Tax (\u20b9)","profession_tax"),("Adv. Repayment (\u20b9)","advance_repayment"),
+            ("Fine (\u20b9)","fine"),("Loss/Damages (\u20b9)","loss_damages"),
+            ("Other Ded. (\u20b9)","other_deductions"),
         ]
         vars_dict = {}
+        row_frame = None
         for i, (label, attr) in enumerate(fields):
             if i % 3 == 0:
-                row_frame = ctk.CTkFrame(parent, fg_color="transparent"); row_frame.pack(fill="x", pady=2)
-            f = ctk.CTkFrame(row_frame, fg_color="transparent"); f.pack(side="left", expand=True, fill="x", padx=4)
+                row_frame = ctk.CTkFrame(parent, fg_color="transparent")
+                row_frame.pack(fill="x", pady=2)
+            f = ctk.CTkFrame(row_frame, fg_color="transparent")
+            f.pack(side="left", expand=True, fill="x", padx=4)
             ctk.CTkLabel(f, text=label, font=FONT_TINY, text_color=TEXT_SECONDARY, anchor="w").pack(anchor="w")
             var = ctk.StringVar(value=str(getattr(att, attr, 0.0)))
             ctk.CTkEntry(f, textvariable=var, width=110, height=24, font=FONT_SMALL,
                           fg_color=SURFACE, border_color=TEXT_MUTED, corner_radius=4).pack(anchor="w")
             vars_dict[attr] = var
+
         def build_record():
             kwargs = {"worker_id": worker_id, "month": att.month}
             for _, attr in fields:
                 try: kwargs[attr] = float(vars_dict[attr].get() or 0)
                 except ValueError: kwargs[attr] = 0.0
+            # Carry through days/ot from the main row entry if entry_data is available
+            if entry_data:
+                try: kwargs["days_present"] = float(entry_data["days"].get() or 0)
+                except (ValueError, KeyError): kwargs["days_present"] = att.days_present
+                try: kwargs["overtime_hours"] = float(entry_data["ot"].get() or 0)
+                except (ValueError, KeyError): kwargs["overtime_hours"] = att.overtime_hours
             return AttendanceRecord(**kwargs)
+
         def update(*_):
-            if worker_id in self._att_entries:
-                self._att_entries[worker_id]["detail_att"] = build_record()
-        for _, attr in fields: vars_dict[attr].trace_add("write", update)
+            target = entry_data if entry_data is not None else (
+                self._att_entries.get(worker_id) or {})
+            if target is not None:
+                target["detail_att"] = build_record()
+
+        # Use a single coalesced trace — only one write-back per field change
+        for _, attr in fields:
+            vars_dict[attr].trace_add("write", update)
         update()
 
     def _build_att_csv(self, parent):

@@ -13,8 +13,11 @@ DB_PATH = "payroll.db"
 
 @contextmanager
 def get_conn(db_path=DB_PATH):
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=4000")
     conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn; conn.commit()
@@ -32,6 +35,11 @@ CREATE TABLE IF NOT EXISTS skill_wages (
     skill_category TEXT PRIMARY KEY,
     daily_wage     REAL NOT NULL DEFAULT 0,
     ot_rate        REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS banks (
+    name      TEXT PRIMARY KEY,
+    ifsc_code TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS workers (
@@ -103,6 +111,39 @@ def upsert_skill_wage(sw: SkillWage, db_path=DB_PATH):
                ON CONFLICT(skill_category) DO UPDATE SET
                daily_wage=excluded.daily_wage, ot_rate=excluded.ot_rate""",
             (sw.skill_category, sw.daily_wage, sw.ot_rate))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#   BANKS  (preset bank list with IFSC)
+# ══════════════════════════════════════════════════════════════════════════════
+def get_all_banks(db_path=DB_PATH) -> List[dict]:
+    """Return list of {name, ifsc_code} dicts, ordered by name."""
+    with get_conn(db_path) as conn:
+        rows = conn.execute("SELECT name, ifsc_code FROM banks ORDER BY name").fetchall()
+    return [dict(r) for r in rows]
+
+def get_bank_ifsc(name: str, db_path=DB_PATH) -> str:
+    """Return IFSC for a given bank name, or '' if not found."""
+    with get_conn(db_path) as conn:
+        row = conn.execute("SELECT ifsc_code FROM banks WHERE name=?", (name,)).fetchone()
+    return row["ifsc_code"] if row else ""
+
+def add_bank(name: str, ifsc_code: str = "", db_path=DB_PATH):
+    with get_conn(db_path) as conn:
+        conn.execute("INSERT INTO banks(name, ifsc_code) VALUES(?,?)",
+                     (name.strip(), ifsc_code.strip()))
+
+def update_bank(old_name: str, new_name: str, ifsc_code: str, db_path=DB_PATH):
+    with get_conn(db_path) as conn:
+        conn.execute("UPDATE banks SET name=?, ifsc_code=? WHERE name=?",
+                     (new_name.strip(), ifsc_code.strip(), old_name))
+        # Also update any workers using this bank name
+        conn.execute("UPDATE workers SET bank_name=? WHERE bank_name=?",
+                     (new_name.strip(), old_name))
+
+def delete_bank(name: str, db_path=DB_PATH):
+    with get_conn(db_path) as conn:
+        conn.execute("DELETE FROM banks WHERE name=?", (name,))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -218,7 +259,16 @@ def upsert_attendance(a: AttendanceRecord, db_path=DB_PATH):
             f" ON CONFLICT(worker_id,month) DO UPDATE SET {sets}", vals)
 
 def bulk_upsert_attendance(records: List[AttendanceRecord], db_path=DB_PATH):
-    for a in records: upsert_attendance(a, db_path)
+    """Upsert all records in a single transaction — much faster than N separate calls."""
+    if not records:
+        return
+    sets = ", ".join(f"{c}=excluded.{c}" for c in _ATT_COLS[2:])
+    sql = (
+        f"INSERT INTO attendance({','.join(_ATT_COLS)}) VALUES({','.join('?'*len(_ATT_COLS))})"
+        f" ON CONFLICT(worker_id,month) DO UPDATE SET {sets}"
+    )
+    with get_conn(db_path) as conn:
+        conn.executemany(sql, [tuple(getattr(a, c) for c in _ATT_COLS) for a in records])
 
 def delete_attendance_for_worker(worker_id: str, month: str = None, db_path=DB_PATH):
     """Delete attendance records for a worker. If month given, only that month; else all months."""
