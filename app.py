@@ -25,6 +25,7 @@ from database import (
     get_all_units, add_unit, rename_unit, delete_unit,
     unit_worker_count,
     get_all_banks, add_bank, update_bank, delete_bank,
+    get_workers_and_attendance,
     DB_PATH,
 )
 from payroll_engine import calculate_payroll, payroll_summary
@@ -161,9 +162,12 @@ class StyledTreeview(ctk.CTkFrame):
         self.tree.tag_configure("unskilled",   foreground="#EF9A9A")
         self.tree.tag_configure("inactive",    foreground=TEXT_MUTED)
     def clear(self):
-        for item in self.tree.get_children(): self.tree.delete(item)
+        self.tree.delete(*self.tree.get_children())
     def insert_rows(self, rows):
-        self.clear()
+        """Batch-insert rows; freezes the treeview during load to prevent layout thrashing."""
+        self.tree.delete(*self.tree.get_children())
+        # Build all inserts before committing to the display
+        self.tree.update_idletasks()
         for i, row in enumerate(rows):
             self.tree.insert("", "end", values=row, tags=("even" if i % 2 == 0 else "odd",))
 
@@ -198,10 +202,72 @@ class StatusBar(ctk.CTkFrame):
         self._backup_label.configure(text=f"  {status}  ", text_color=color)
 
 
+# ── App-wide async / debounce helpers ─────────────────────────────────────────
+def _async_load(fetch_fn, done_fn, error_fn=None):
+    """Run *fetch_fn()* on a background thread, then post *done_fn(result)*
+    back onto the Tk main thread — BUT only if the page hasn't changed.
+
+    Uses a generation counter (_async_load._gen) that is bumped by _navigate().
+    Any callback whose captured generation no longer matches is silently dropped,
+    preventing crashes when the user switches pages mid-load.
+    """
+    my_gen = _async_load._gen   # snapshot at call time
+    def _worker():
+        try:
+            result = fetch_fn()
+            def _deliver():
+                # Drop stale callbacks (page changed while we were loading)
+                if _async_load._gen != my_gen:
+                    return
+                try:
+                    done_fn(result)
+                except Exception as exc:
+                    if error_fn:
+                        try: error_fn(exc)
+                        except Exception: pass
+            _async_load._root.after(0, _deliver)
+        except Exception as exc:
+            def _err():
+                if _async_load._gen != my_gen:
+                    return
+                if error_fn:
+                    try: error_fn(exc)
+                    except Exception: pass
+            _async_load._root.after(0, _err)
+    threading.Thread(target=_worker, daemon=True).start()
+
+_async_load._root = None   # set to the PayrollApp instance at startup
+_async_load._gen  = 0      # bumped on every _navigate call
+
+
+def _make_debouncer(widget, delay_ms=280):
+    """Return a debounce wrapper — only fires *fn* after *delay_ms* ms of silence."""
+    pending = [None]
+    def debounce(fn):
+        def wrapper(*args, **kwargs):
+            if pending[0]:
+                try: widget.after_cancel(pending[0])
+                except Exception: pass
+            pending[0] = widget.after(delay_ms, lambda: fn(*args, **kwargs))
+        return wrapper
+    return debounce
+
+
+def _show_loading(parent, text="Loading…"):
+    """Show a transient loading banner; caller destroys the returned frame."""
+    f = ctk.CTkFrame(parent, fg_color=SURFACE_2, corner_radius=10)
+    f.pack(fill="x", padx=28, pady=8)
+    ctk.CTkLabel(f, text=f"⏳  {text}", font=FONT_BODY,
+                 text_color=TEXT_SECONDARY).pack(pady=14)
+    parent.update_idletasks()
+    return f
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 class PayrollApp(ctk.CTk):
     def __init__(self):
         super().__init__()
+        _async_load._root = self          # enable background→main-thread posting
         self.title("PayrollPro — Professional Payroll Management")
         self.geometry("1300x800"); self.minsize(1050, 650)
         init_db(DB_PATH, seed=True)
@@ -213,7 +279,16 @@ class PayrollApp(ctk.CTk):
             on_sync=self._on_backup_sync,
         )
         self._backup_mgr.start()
+        # Pre-warm cache in background so first page loads hit RAM, not disk
+        def _prewarm():
+            try:
+                from database import get_all_workers, get_skill_wages_dict, get_all_units, get_config
+                get_all_workers(); get_skill_wages_dict(); get_all_units(); get_config()
+            except Exception:
+                pass
+        threading.Thread(target=_prewarm, daemon=True).start()
         self._navigate("dashboard")
+
 
     def _on_backup_sync(self, status: str, timestamp: str):
         """Called by BackupManager (background thread) after each sync."""
@@ -286,6 +361,8 @@ class PayrollApp(ctk.CTk):
 
     def _navigate(self, key):
         for k, btn in self._nav_buttons.items(): btn.set_active(k == key)
+        # Invalidate any in-flight async callbacks from the previous page
+        _async_load._gen += 1
         if self._current_page: self._current_page.destroy()
         page = ctk.CTkScrollableFrame(self.main_area, fg_color=SURFACE,
                                        scrollbar_button_color=CARD_BORDER, scrollbar_fg_color=SURFACE)
@@ -323,67 +400,94 @@ class PayrollApp(ctk.CTk):
         content = ctk.CTkFrame(parent, fg_color="transparent")
         content.pack(fill="both", expand=True, padx=28, pady=(0, 20))
 
+        _loading = [None]   # holds the loading banner frame
+
         def refresh():
             for w in content.winfo_children(): w.destroy()
-            workers = get_all_workers()
-            sw = get_skill_wages_dict()
-            att = get_attendance(month_var.get())
-            if unit_var.get() != "All":
-                workers = [w for w in workers if w.unit == unit_var.get()]
-            results, warnings = calculate_payroll(workers, sw, att, month_var.get())
-            if warnings:
-                wf = ctk.CTkFrame(content, fg_color="#3D2F00", corner_radius=8); wf.pack(fill="x", pady=(0, 10))
-                ctk.CTkLabel(wf, text=f"  ⚠️  {len(warnings)} warning(s): {warnings[0]}"
-                             + (" …" if len(warnings) > 1 else ""),
-                             font=FONT_SMALL, text_color=WARNING_CLR, anchor="w").pack(padx=12, pady=8)
-            if not results:
-                ef = ctk.CTkFrame(content, fg_color=CARD_BG, corner_radius=12)
-                ef.pack(fill="x", pady=30, padx=40)
-                ctk.CTkLabel(ef, text="📭", font=(FONT_FAMILY, 40)).pack(pady=(30, 6))
-                ctk.CTkLabel(ef, text="No payroll data for this period",
-                             font=FONT_HEADING, text_color=TEXT_SECONDARY).pack()
-                ctk.CTkLabel(ef, text="Enter attendance data first to see results.",
-                             font=FONT_SMALL, text_color=TEXT_MUTED).pack(pady=(4, 30))
-                return
-            s = payroll_summary(results)
-            mf = ctk.CTkFrame(content, fg_color="transparent"); mf.pack(fill="x", pady=(0, 18))
-            mf.grid_columnconfigure((0,1,2,3,4), weight=1)
-            for i, (l, v, c, ic) in enumerate([
-                ("Workers",     str(s["total_workers"]), ACCENT,      "👷"),
-                ("Total Gross", fmt_inr(s["total_gross"]), "#26A69A",  "💰"),
-                ("Total EPF",   fmt_inr(s["total_epf"]),  WARNING_CLR, "🏦"),
-                ("Total ESI",   fmt_inr(s["total_esi"]),  "#AB47BC",   "🏥"),
-                ("Total Net Pay",fmt_inr(s["total_net"]), SUCCESS,      "✅"),
-            ]):
-                MetricCard(mf, l, v, color=c, icon=ic).grid(row=0, column=i, padx=5, pady=4, sticky="nsew")
-            _section_label(content, "Payroll Breakdown")
-            cols = ("ID","Name","Unit","Skill","Designation","Days","Gross (₹)","EPF (₹)","ESI (₹)","Net Pay (₹)")
-            widths = [60,130,90,80,120,45,100,80,75,110]
-            table = StyledTreeview(content, columns=cols, column_widths=widths, height=min(len(results), 14))
-            table.pack(fill="both", expand=True, pady=(0, 10))
-            table.insert_rows([(r.worker_id, r.worker_name, r.unit, r.skill_category,
-                                r.profile_title, r.days_present, fmt_inr(r.gross),
-                                fmt_inr(r.epf_deduction), fmt_inr(r.esi_deduction),
-                                fmt_inr(r.net_pay)) for r in results])
-            def export_csv():
-                import pandas as pd
-                path = filedialog.asksaveasfilename(defaultextension=".csv",
-                    filetypes=[("CSV","*.csv")], initialfile=f"Payroll_{month_var.get()}.csv")
-                if path:
-                    data = []
-                    for r in results:
-                        data.append({
-                            "Emp name": r.worker_name,
-                            "Total Sal": round(r.net_pay, 2),
-                            "IFSC Code": r.ifsc_code,
-                            "Account Number": r.bank_account
-                        })
-                    pd.DataFrame(data).to_csv(path, index=False)
-                    self.status_bar.set_message(f"✅ CSV → {path}", SUCCESS)
-                    messagebox.showinfo("Export", f"CSV saved:\n{path}")
-            ctk.CTkButton(content, text="⬇️  Export CSV", font=FONT_BODY_BOLD,
-                           fg_color=ACCENT, hover_color=ACCENT_HOVER, height=36,
-                           corner_radius=8, command=export_csv).pack(anchor="w", pady=(0, 16))
+            _loading[0] = _show_loading(content, "Calculating payroll…")
+
+            month  = month_var.get()
+            unit   = unit_var.get()
+
+            def _fetch():
+                workers, att_dict = get_workers_and_attendance(month)
+                sw = get_skill_wages_dict()
+                return workers, sw, list(att_dict.values()), month, unit
+
+            def _render(data):
+                workers, sw, att, month, unit = data
+                # Guard: abort if the content frame was destroyed (page navigated away)
+                try:
+                    if not content.winfo_exists():
+                        return
+                except Exception:
+                    return
+                # Clear banner
+                if _loading[0]:
+                    try: _loading[0].destroy()
+                    except Exception: pass
+                    _loading[0] = None
+                for w in content.winfo_children(): w.destroy()
+
+                if unit != "All":
+                    workers = [w for w in workers if w.unit == unit]
+                results, warnings = calculate_payroll(workers, sw, att, month)
+                if warnings:
+                    wf = ctk.CTkFrame(content, fg_color="#3D2F00", corner_radius=8); wf.pack(fill="x", pady=(0, 10))
+                    ctk.CTkLabel(wf, text=f"  ⚠️  {len(warnings)} warning(s): {warnings[0]}"
+                                 + (" …" if len(warnings) > 1 else ""),
+                                 font=FONT_SMALL, text_color=WARNING_CLR, anchor="w").pack(padx=12, pady=8)
+                if not results:
+                    ef = ctk.CTkFrame(content, fg_color=CARD_BG, corner_radius=12)
+                    ef.pack(fill="x", pady=30, padx=40)
+                    ctk.CTkLabel(ef, text="📭", font=(FONT_FAMILY, 40)).pack(pady=(30, 6))
+                    ctk.CTkLabel(ef, text="No payroll data for this period",
+                                 font=FONT_HEADING, text_color=TEXT_SECONDARY).pack()
+                    ctk.CTkLabel(ef, text="Enter attendance data first to see results.",
+                                 font=FONT_SMALL, text_color=TEXT_MUTED).pack(pady=(4, 30))
+                    return
+                s = payroll_summary(results)
+                mf = ctk.CTkFrame(content, fg_color="transparent"); mf.pack(fill="x", pady=(0, 18))
+                mf.grid_columnconfigure((0,1,2,3,4), weight=1)
+                for i, (l, v, c, ic) in enumerate([
+                    ("Workers",     str(s["total_workers"]), ACCENT,      "👷"),
+                    ("Total Gross", fmt_inr(s["total_gross"]), "#26A69A",  "💰"),
+                    ("Total EPF",   fmt_inr(s["total_epf"]),  WARNING_CLR, "🏦"),
+                    ("Total ESI",   fmt_inr(s["total_esi"]),  "#AB47BC",   "🏥"),
+                    ("Total Net Pay",fmt_inr(s["total_net"]), SUCCESS,      "✅"),
+                ]):
+                    MetricCard(mf, l, v, color=c, icon=ic).grid(row=0, column=i, padx=5, pady=4, sticky="nsew")
+                _section_label(content, "Payroll Breakdown")
+                cols = ("ID","Name","Unit","Skill","Designation","Days","Gross (₹)","EPF (₹)","ESI (₹)","Net Pay (₹)")
+                widths = [60,130,90,80,120,45,100,80,75,110]
+                table = StyledTreeview(content, columns=cols, column_widths=widths, height=min(len(results), 14))
+                table.pack(fill="both", expand=True, pady=(0, 10))
+                table.insert_rows([(r.worker_id, r.worker_name, r.unit, r.skill_category,
+                                    r.profile_title, r.days_present, fmt_inr(r.gross),
+                                    fmt_inr(r.epf_deduction), fmt_inr(r.esi_deduction),
+                                    fmt_inr(r.net_pay)) for r in results])
+                def export_csv():
+                    import pandas as pd
+                    path = filedialog.asksaveasfilename(defaultextension=".csv",
+                        filetypes=[("CSV","*.csv")], initialfile=f"Payroll_{month}.csv")
+                    if path:
+                        data = [{"Emp name": r.worker_name, "Total Sal": round(r.net_pay, 2),
+                                 "IFSC Code": r.ifsc_code, "Account Number": r.bank_account}
+                                for r in results]
+                        pd.DataFrame(data).to_csv(path, index=False)
+                        self.status_bar.set_message(f"✅ CSV → {path}", SUCCESS)
+                        messagebox.showinfo("Export", f"CSV saved:\n{path}")
+                ctk.CTkButton(content, text="⬇️  Export CSV", font=FONT_BODY_BOLD,
+                               fg_color=ACCENT, hover_color=ACCENT_HOVER, height=36,
+                               corner_radius=8, command=export_csv).pack(anchor="w", pady=(0, 16))
+
+            def _on_error(exc):
+                if _loading[0]:
+                    try: _loading[0].destroy()
+                    except Exception: pass
+                self.status_bar.set_message(f"⚠️ Load error: {exc}", DANGER)
+
+            _async_load(_fetch, _render, _on_error)
 
         month_var.trace_add("write", lambda *_: refresh())
         unit_var.trace_add("write", lambda *_: refresh())
@@ -406,6 +510,8 @@ class PayrollApp(ctk.CTk):
 
     def _build_att_manual(self, parent):
         opts = month_options(); config = get_config()
+
+        # ── Controls bar ─────────────────────────────────────────────────────
         ctrl = ctk.CTkFrame(parent, fg_color="transparent"); ctrl.pack(fill="x", padx=12, pady=(12, 8))
         ctk.CTkLabel(ctrl, text="Month:", font=FONT_BODY_BOLD, text_color=TEXT_PRIMARY).pack(side="left")
         month_var = ctk.StringVar(value=opts[-1])
@@ -422,128 +528,223 @@ class PayrollApp(ctk.CTk):
                       font=FONT_SMALL, fg_color=SURFACE, border_color=TEXT_MUTED).pack(side="left", padx=(8, 20))
         ctk.CTkLabel(ctrl, text=f"(Max days: {config.working_days})",
                       font=FONT_SMALL, text_color=TEXT_MUTED).pack(side="left")
-        table_frame = ctk.CTkScrollableFrame(parent, fg_color="transparent", height=420,
-                                              scrollbar_button_color=TEXT_MUTED, scrollbar_fg_color=SURFACE)
-        table_frame.pack(fill="x", expand=False, padx=12, pady=(0, 4))
-        self._att_entries = {}
 
-        # ── Debounce helper: prevents hammering refresh on every keystroke ──
-        _debounce_id = [None]
-        def _debounced_refresh(*_):
-            if _debounce_id[0]:
-                try: parent.after_cancel(_debounce_id[0])
-                except Exception: pass
-            _debounce_id[0] = parent.after(300, refresh)
+        # ── Treeview (fast — single native widget for all rows) ───────────────
+        tree_cols = ("ID", "Name", "Unit", "Skill", "Designation", "Rate/Day", "Days", "OT Hrs")
+        tree_widths = [60, 150, 90, 80, 120, 70, 60, 70]
+        table = StyledTreeview(parent, columns=tree_cols, column_widths=tree_widths, height=12)
+        table.pack(fill="both", expand=False, padx=12, pady=(0, 0))
+
+        # ── Edit panel (shown below, populated when a row is clicked) ─────────
+        edit_card = ctk.CTkFrame(parent, fg_color=CARD_BG, corner_radius=10,
+                                  border_width=1, border_color=CARD_BORDER)
+        edit_card.pack(fill="x", padx=12, pady=(6, 0))
+        ctk.CTkFrame(edit_card, height=3, corner_radius=0, fg_color=ACCENT).pack(fill="x")
+        ep_hdr = ctk.CTkFrame(edit_card, fg_color="transparent"); ep_hdr.pack(fill="x", padx=14, pady=(8, 2))
+        ep_title = ctk.CTkLabel(ep_hdr, text="← Select a worker row to edit",
+                                 font=FONT_BODY_BOLD, text_color=TEXT_SECONDARY)
+        ep_title.pack(side="left")
+        ep_save_btn = ctk.CTkButton(ep_hdr, text="💾 Save Row", font=FONT_BODY_BOLD,
+                                     fg_color=SUCCESS, hover_color="#2E7D32", height=30,
+                                     corner_radius=6, width=110, state="disabled",
+                                     command=lambda: _save_current())
+        ep_save_btn.pack(side="right")
+
+        # Days + OT row
+        ep_basic = ctk.CTkFrame(edit_card, fg_color="transparent"); ep_basic.pack(fill="x", padx=14, pady=4)
+        ctk.CTkLabel(ep_basic, text="Days Present:", font=FONT_SMALL, text_color=TEXT_SECONDARY, width=90).pack(side="left")
+        ep_days = ctk.CTkEntry(ep_basic, width=70, height=28, font=FONT_BODY,
+                                fg_color=SURFACE, border_color=TEXT_MUTED, corner_radius=6, state="disabled")
+        ep_days.pack(side="left", padx=(4, 20))
+        ctk.CTkLabel(ep_basic, text="OT Hours:", font=FONT_SMALL, text_color=TEXT_SECONDARY, width=70).pack(side="left")
+        ep_ot = ctk.CTkEntry(ep_basic, width=70, height=28, font=FONT_BODY,
+                              fg_color=SURFACE, border_color=TEXT_MUTED, corner_radius=6, state="disabled")
+        ep_ot.pack(side="left", padx=(4, 0))
+
+        # Detail fields (allowances + deductions) in a scrollable sub-area
+        ep_details_outer = ctk.CTkScrollableFrame(edit_card, fg_color="transparent", height=130,
+                                                   scrollbar_button_color=TEXT_MUTED, scrollbar_fg_color=SURFACE)
+        ep_details_outer.pack(fill="x", padx=14, pady=(2, 10))
+
+        detail_fields = [
+            ("DA (₹)","da"),("HRA (₹)","hra"),("CCA (₹)","cca"),
+            ("Arrears (₹)","arrears"),("N&FH Wages (₹)","nfh_wages"),
+            ("Leave Wages (₹)","leave_wages"),("Bonus (₹)","bonus"),
+            ("Maternity (₹)","maternity_benefit"),("Advance Pay (₹)","advances_pay"),
+            ("Other Allow. (₹)","other_allowances"),
+            ("EPF Override","epf_override"),("ESI Override","esi_override"),
+            ("Welfare Fund (₹)","welfare_fund"),("TDS (₹)","tds"),
+            ("Prof. Tax (₹)","profession_tax"),("Adv. Repayment (₹)","advance_repayment"),
+            ("Fine (₹)","fine"),("Loss/Damages (₹)","loss_damages"),
+            ("Other Ded. (₹)","other_deductions"),
+        ]
+        ep_detail_vars = {}  # attr -> StringVar
+        ep_detail_entries = {}  # attr -> Entry widget
+        row_frame = None
+        for i, (label, attr) in enumerate(detail_fields):
+            if i % 4 == 0:
+                row_frame = ctk.CTkFrame(ep_details_outer, fg_color="transparent")
+                row_frame.pack(fill="x", pady=1)
+            f = ctk.CTkFrame(row_frame, fg_color="transparent")
+            f.pack(side="left", expand=True, fill="x", padx=3)
+            ctk.CTkLabel(f, text=label, font=FONT_TINY, text_color=TEXT_SECONDARY, anchor="w").pack(anchor="w")
+            var = ctk.StringVar(value="0.0")
+            ent = ctk.CTkEntry(f, textvariable=var, width=100, height=24, font=FONT_SMALL,
+                                fg_color=SURFACE, border_color=TEXT_MUTED, corner_radius=4, state="disabled")
+            ent.pack(anchor="w")
+            ep_detail_vars[attr] = var
+            ep_detail_entries[attr] = ent
+
+        # ── Internal state ────────────────────────────────────────────────────
+        self._att_entries = {}    # worker_id -> AttendanceRecord (holds all edits)
+        _state = {
+            "workers": [],        # current filtered worker list
+            "att_dict": {},       # worker_id -> AttendanceRecord from DB
+            "sw_dict": {},        # skill_category -> SkillWage
+            "selected_wid": None, # currently selected worker_id
+        }
+
+        def _populate_edit_panel(worker_id):
+            """Load a worker's data into the edit panel."""
+            _state["selected_wid"] = worker_id
+            w = next((x for x in _state["workers"] if x.worker_id == worker_id), None)
+            if not w: return
+            att = self._att_entries.get(worker_id) or _state["att_dict"].get(
+                worker_id, AttendanceRecord(worker_id, month_var.get()))
+            ep_title.configure(text=f"✏️  {w.name}  [{w.worker_id}]", text_color=TEXT_PRIMARY)
+            ep_save_btn.configure(state="normal")
+            # Enable and populate days/OT
+            ep_days.configure(state="normal"); ep_days.delete(0, "end"); ep_days.insert(0, str(att.days_present))
+            ep_ot.configure(state="normal");  ep_ot.delete(0, "end");   ep_ot.insert(0, str(att.overtime_hours))
+            # Enable and populate detail fields
+            for attr, var in ep_detail_vars.items():
+                ep_detail_entries[attr].configure(state="normal")
+                var.set(str(getattr(att, attr, 0.0)))
+
+        def _save_current():
+            """Save the currently visible edit panel back to _att_entries."""
+            wid = _state["selected_wid"]
+            if not wid: return
+            base = self._att_entries.get(wid) or _state["att_dict"].get(
+                wid, AttendanceRecord(wid, month_var.get()))
+            kwargs = {"worker_id": wid, "month": month_var.get()}
+            for _, attr in detail_fields:
+                try: kwargs[attr] = float(ep_detail_vars[attr].get() or 0)
+                except ValueError: kwargs[attr] = getattr(base, attr, 0.0)
+            try: kwargs["days_present"]   = float(ep_days.get() or 0)
+            except ValueError: kwargs["days_present"] = base.days_present
+            try: kwargs["overtime_hours"] = float(ep_ot.get() or 0)
+            except ValueError: kwargs["overtime_hours"] = base.overtime_hours
+            rec = AttendanceRecord(**kwargs)
+            self._att_entries[wid] = rec
+            upsert_attendance(rec)
+            self.status_bar.set_message(f"✅ Saved {wid}", SUCCESS)
+            # Refresh the treeview row
+            _refresh_tree_row(wid, rec)
+
+        def _refresh_tree_row(wid, att):
+            """Update a single treeview row without rebuilding the whole table."""
+            w = next((x for x in _state["workers"] if x.worker_id == wid), None)
+            if not w: return
+            sw = _state["sw_dict"].get(w.skill_category)
+            rate = f"₹{sw.daily_wage}" if sw else "—"
+            for item in table.tree.get_children():
+                vals = table.tree.item(item, "values")
+                if vals and str(vals[0]) == wid:
+                    table.tree.item(item, values=(w.worker_id, w.name, w.unit,
+                                                   w.skill_category, w.designation,
+                                                   rate, att.days_present, att.overtime_hours))
+                    break
 
         def save_all():
-            records = []
-            existing_db = {a.worker_id: a for a in get_attendance(month_var.get())}
-            for wid, entry in self._att_entries.items():
-                # Prefer already-built detail_att; fall back to existing DB record or blank
-                att = entry.get("detail_att")
-                if att is None:
-                    att = existing_db.get(wid)
-                    if att is None:
-                        att = AttendanceRecord(wid, month_var.get())
-                try:
-                    att.days_present = float(entry["days"].get() or 0)
-                    att.overtime_hours = float(entry["ot"].get() or 0)
-                except ValueError: pass
-                att.month = month_var.get()
-                records.append(att)
+            """Save every record in _att_entries (all edits made this session)."""
+            # Also flush the currently-visible panel
+            _save_current()
+            if not self._att_entries:
+                messagebox.showinfo("Nothing to Save", "No changes have been made."); return
+            records = list(self._att_entries.values())
             bulk_upsert_attendance(records)
             self.status_bar.set_message(f"✅ Saved {len(records)} records for {month_var.get()}", SUCCESS)
             messagebox.showinfo("Saved", f"{len(records)} records saved for {month_var.get()}.")
 
-        def refresh():
-            for w in table_frame.winfo_children(): w.destroy()
-            self._att_entries.clear()
-            workers = get_all_workers()
-            if unit_var.get() != "All":
-                workers = [w for w in workers if w.unit == unit_var.get()]
-            q_att = search_var_att.get().strip().lower()
-            if q_att:
-                workers = [w for w in workers if q_att in w.name.lower() or q_att in w.worker_id.lower()]
-            existing = {a.worker_id: a for a in get_attendance(month_var.get())}
-            sw_dict = get_skill_wages_dict()
-            if not workers:
-                ctk.CTkLabel(table_frame, text="No workers found. Add workers first.",
-                              font=FONT_BODY, text_color=TEXT_MUTED).pack(pady=30); return
-            ctk.CTkLabel(table_frame, text="Days Present & Overtime", font=FONT_SUBHEADING,
-                          text_color=TEXT_PRIMARY, anchor="w").pack(fill="x", pady=(4, 6))
-            hdr = ctk.CTkFrame(table_frame, fg_color=ACCENT_DARK, corner_radius=6)
-            hdr.pack(fill="x", pady=(0, 2))
-            cols = [("ID",55), ("Name",110), ("Unit",75), ("Skill",70), ("Designation",90), ("Rate/Day",55), ("Days",55), ("OT Hours",80)]
-            for txt, w in cols:
-                ctk.CTkLabel(hdr, text=txt, font=(FONT_FAMILY, 10, "bold"),
-                              text_color="white", anchor="w", width=w).pack(side="left", padx=6, pady=5)
-            for i, w in enumerate(workers):
-                att = existing.get(w.worker_id, AttendanceRecord(w.worker_id, month_var.get()))
+        def _build_tree(workers, att_dict, sw_dict):
+            """Populate the treeview — fast because it's a single native widget."""
+            table.tree.delete(*table.tree.get_children())
+            for w in workers:
+                att = self._att_entries.get(w.worker_id) or att_dict.get(
+                    w.worker_id, AttendanceRecord(w.worker_id, month_var.get()))
                 sw = sw_dict.get(w.skill_category)
-                rate = f"\u20b9{sw.daily_wage}" if sw else "\u2014"
-                bg = SURFACE_2 if i % 2 == 0 else SURFACE_3
+                rate = f"₹{sw.daily_wage}" if sw else "—"
+                table.tree.insert("", "end", iid=w.worker_id,
+                                  values=(w.worker_id, w.name, w.unit, w.skill_category,
+                                          w.designation, rate, att.days_present, att.overtime_hours))
 
-                worker_container = ctk.CTkFrame(table_frame, fg_color=bg, corner_radius=4)
-                worker_container.pack(fill="x", pady=1)
+        def _on_tree_select(event):
+            sel = table.tree.selection()
+            if sel:
+                _populate_edit_panel(str(sel[0]))
 
-                row = ctk.CTkFrame(worker_container, fg_color="transparent")
-                row.pack(fill="x")
+        table.tree.bind("<<TreeviewSelect>>", _on_tree_select)
 
-                ctk.CTkLabel(row, text=w.worker_id, font=FONT_SMALL, text_color=TEXT_PRIMARY, width=55).pack(side="left", padx=6, pady=4)
-                ctk.CTkLabel(row, text=w.name, font=FONT_SMALL, text_color=TEXT_PRIMARY, width=110, anchor="w").pack(side="left", padx=6)
-                ctk.CTkLabel(row, text=w.unit, font=FONT_TINY, text_color=TEXT_SECONDARY, width=75, anchor="w").pack(side="left", padx=6)
-                ctk.CTkLabel(row, text=w.skill_category, font=FONT_TINY, text_color=TEXT_SECONDARY, width=70, anchor="w").pack(side="left", padx=6)
-                ctk.CTkLabel(row, text=w.designation, font=FONT_TINY, text_color=TEXT_SECONDARY, width=90, anchor="w").pack(side="left", padx=6)
-                ctk.CTkLabel(row, text=rate, font=FONT_TINY, text_color=TEXT_SECONDARY, width=55, anchor="w").pack(side="left", padx=6)
+        # ── Loading + async refresh ───────────────────────────────────────────
+        _loading_att = [None]
+        _debounce = _make_debouncer(parent)
 
-                days_var = ctk.StringVar(value=str(att.days_present))
-                ctk.CTkEntry(row, textvariable=days_var, width=55, height=24, font=FONT_SMALL,
-                              fg_color=SURFACE, border_color=TEXT_MUTED, corner_radius=4).pack(side="left", padx=6)
+        def refresh():
+            if _loading_att[0]:
+                try: _loading_att[0].destroy()
+                except Exception: pass
+            table.tree.delete(*table.tree.get_children())
+            # Show a single loading row
+            table.tree.insert("", "end", iid="__loading__",
+                               values=("⏳", "Loading…", "", "", "", "", "", ""))
 
-                ot_var = ctk.StringVar(value=str(att.overtime_hours))
-                ctk.CTkEntry(row, textvariable=ot_var, width=80, height=24, font=FONT_SMALL,
-                              fg_color=SURFACE, border_color=TEXT_MUTED, corner_radius=4).pack(side="left", padx=6)
+            month = month_var.get()
+            unit  = unit_var.get()
+            q     = search_var_att.get().strip().lower()
 
-                # ── Lazy detail panel: only built on first expand ──────────
-                details = ctk.CTkFrame(worker_container, fg_color="transparent")
-                shown    = [False]
-                built    = [False]       # track whether widgets have been created
-                entry_data = {"days": days_var, "ot": ot_var}  # no detail_att yet
-                self._att_entries[w.worker_id] = entry_data
+            def _fetch():
+                workers, att_dict = get_workers_and_attendance(month)
+                sw_dict = get_skill_wages_dict()
+                return workers, att_dict, sw_dict
 
-                # Capture loop vars
-                def make_toggle(d=details, tb_ref=[None], sh=shown, blt=built,
-                                 ed=entry_data, wid=w.worker_id, att_snap=att):
-                    btn = ctk.CTkButton(row, text="\u25bc", font=FONT_SMALL, width=30, height=24,
-                        corner_radius=4, fg_color=SURFACE_3, hover_color=SURFACE_2,
-                        text_color=TEXT_SECONDARY)
-                    btn.pack(side="left", padx=6)
-                    tb_ref[0] = btn
-                    def toggle():
-                        if sh[0]:
-                            d.pack_forget()
-                            btn.configure(text="\u25bc")
-                            sh[0] = False
-                        else:
-                            # Lazy-build on first open
-                            if not blt[0]:
-                                self._build_detail_fields(d, wid, att_snap, ed)
-                                blt[0] = True
-                            d.pack(fill="x", padx=10, pady=(6, 10))
-                            btn.configure(text="\u25b2")
-                            sh[0] = True
-                    btn.configure(command=toggle)
-                make_toggle()
+            def _render(data):
+                workers, att_dict, sw_dict = data
+                # Guard: abort if parent was destroyed (page navigated away)
+                try:
+                    if not parent.winfo_exists():
+                        return
+                except Exception:
+                    return
+                # Filter
+                if unit != "All":
+                    workers = [w for w in workers if w.unit == unit]
+                if q:
+                    workers = [w for w in workers if q in w.name.lower() or q in w.worker_id.lower()]
+                # Update state
+                _state["workers"]  = workers
+                _state["att_dict"] = att_dict
+                _state["sw_dict"]  = sw_dict
+                # Clear loading row and fill treeview
+                _build_tree(workers, att_dict, sw_dict)
+                if not workers:
+                    table.tree.insert("", "end", iid="__empty__",
+                                       values=("", "No workers found. Add workers first.",
+                                               "", "", "", "", "", ""))
 
-        # Save button lives OUTSIDE the scrollable table_frame — always visible
+            _async_load(_fetch, _render)
+
+        # ── Save All button ───────────────────────────────────────────────────
         ctk.CTkButton(parent, text="\U0001f4be  Save All Attendance", font=FONT_BODY_BOLD,
                        fg_color=SUCCESS, hover_color="#2E7D32", height=40,
-                       corner_radius=8, command=save_all).pack(fill="x", padx=12, pady=(4, 12))
+                       corner_radius=8, command=save_all).pack(fill="x", padx=12, pady=(6, 12))
 
         month_var.trace_add("write", lambda *_: refresh())
         unit_var.trace_add("write", lambda *_: refresh())
-        search_var_att.trace_add("write", _debounced_refresh)
+        search_var_att.trace_add("write", _debounce(lambda *_: refresh()))
         refresh()
+
+
 
     def _build_detail_fields(self, parent, worker_id, att, entry_data=None):
         """Build the expandable allowance/deduction fields panel.
@@ -916,96 +1117,112 @@ class PayrollApp(ctk.CTk):
                 ent.bind("<Escape>",   lambda e: (_pending_flush.__setitem__(0, None), _destroy_cell()))
                 _cell_editor[0] = ent
 
+        _wk_debounce  = _make_debouncer(tab_all)
+        _wk_loading   = [None]
+
         def update_table(*_):
             _destroy_cell()
             action_bar.pack_forget()
             for w in table_container.winfo_children(): w.destroy()
-            workers = get_all_workers(active_only=False)
-            if filt_var.get() != "All":
-                workers = [w for w in workers if w.unit == filt_var.get()]
-            q = search_var_wk.get().strip().lower()
-            if q:
-                workers = [w for w in workers if q in w.name.lower() or q in w.worker_id.lower()]
-            if not workers:
-                ef = ctk.CTkFrame(table_container, fg_color=CARD_BG, corner_radius=12)
-                ef.pack(fill="x", pady=30, padx=30)
-                ctk.CTkLabel(ef, text="👤", font=(FONT_FAMILY, 36)).pack(pady=(20, 4))
-                ctk.CTkLabel(ef, text="No workers yet", font=FONT_HEADING, text_color=TEXT_SECONDARY).pack()
-                ctk.CTkLabel(ef, text='Use "➕ Add New Worker" tab.',
-                             font=FONT_SMALL, text_color=TEXT_MUTED).pack(pady=(4, 20))
-                return
+            _wk_loading[0] = _show_loading(table_container, "Loading workers…")
 
-            cols = ("ID", "Name", "Unit", "Skill", "Designation", "Bank", "A/C", "IFSC", "UAN", "ESIC", "Status")
-            widths = [55, 140, 80, 75, 90, 100, 110, 95, 85, 75, 50]
-            table = StyledTreeview(table_container, columns=cols, column_widths=widths,
-                                    height=min(len(workers), 12))
-            table.pack(fill="both", expand=True, pady=(4, 0))
-            table.insert_rows([(w.worker_id, w.name, w.unit, w.skill_category,
-                                w.designation, w.bank_name, w.bank_account, w.ifsc_code,
-                                w.uan_number, w.esic_number,
-                                "● Active" if w.active else "○ Inactive") for w in workers])
-            for item in table.tree.get_children():
-                vals = table.tree.item(item, "values")
-                skill  = str(vals[3])  if len(vals) > 3  else ""
-                status = str(vals[10]) if len(vals) > 10 else ""
-                if status.startswith("○"):
-                    table.tree.item(item, tags=("inactive",))
-                elif skill == "Skilled":
-                    table.tree.item(item, tags=("skilled",))
-                elif "Semi" in skill:
-                    table.tree.item(item, tags=("semi",))
+            filt = filt_var.get()
+            q    = search_var_wk.get().strip().lower()
 
-            ctk.CTkLabel(table_container,
-                text="💡 Click any cell to edit  •  Switching rows auto-saves  •  Click Status to toggle active",
-                font=FONT_TINY, text_color=TEXT_MUTED).pack(anchor="w", pady=(2, 0))
+            def _fetch():
+                return get_all_workers(active_only=False)
 
-            worker_map = {w.worker_id: w for w in workers}
+            def _render(workers):
+                try:
+                    if not table_container.winfo_exists():
+                        return
+                except Exception:
+                    return
+                if _wk_loading[0]:
+                    try: _wk_loading[0].destroy()
+                    except Exception: pass
+                    _wk_loading[0] = None
+                for w in table_container.winfo_children(): w.destroy()
 
-            def _on_click(event):
-                item = table.tree.identify_row(event.y)
-                col  = table.tree.identify_column(event.x)   # '#1', '#2', …
-                if not item or not col:
-                    _destroy_cell(); return
-                col_idx  = int(col.lstrip('#')) - 1
-                if col_idx < 0 or col_idx >= len(cols): return
-                col_name = cols[col_idx]
-
-                vals = table.tree.item(item)["values"]
-                if not vals: return
-                w = worker_map.get(str(vals[0]))
-                if not w: return
-
-                # ── Auto-save previous row when switching employees ──────────
-                if _editing_item[0] and _editing_item[0] != item:
-                    _auto_save_row()
-
-                # ── Clicking Status cell → instant toggle ─────────────────
-                if col_name == "Status":
-                    _editing_wid[0] = w.worker_id
-                    if w.active:
-                        if messagebox.askyesno("Deactivate",
-                                f"Deactivate '{w.name}' ({w.worker_id})?"):
-                            deactivate_worker(w.worker_id)
-                            self.status_bar.set_message(
-                                f"Worker {w.worker_id} deactivated.", WARNING_CLR)
-                            action_bar.pack_forget(); update_table()
-                    else:
-                        reactivate_worker(w.worker_id)
-                        self.status_bar.set_message(
-                            f"Worker {w.worker_id} re-activated.", SUCCESS)
-                        action_bar.pack_forget(); update_table()
+                if filt != "All":
+                    workers = [w for w in workers if w.unit == filt]
+                if q:
+                    workers = [w for w in workers if q in w.name.lower() or q in w.worker_id.lower()]
+                if not workers:
+                    ef = ctk.CTkFrame(table_container, fg_color=CARD_BG, corner_radius=12)
+                    ef.pack(fill="x", pady=30, padx=30)
+                    ctk.CTkLabel(ef, text="👤", font=(FONT_FAMILY, 36)).pack(pady=(20, 4))
+                    ctk.CTkLabel(ef, text="No workers yet", font=FONT_HEADING, text_color=TEXT_SECONDARY).pack()
+                    ctk.CTkLabel(ef, text='Use "➕ Add New Worker" tab.',
+                                 font=FONT_SMALL, text_color=TEXT_MUTED).pack(pady=(4, 20))
                     return
 
-                # ── For all other columns: show action bar + open cell editor
-                _show_action_bar(table.tree, item, w)
-                bbox = table.tree.bbox(item, col)
-                if not bbox: return
-                _on_cell_click(table.tree, item, col_name, col_idx, bbox, worker_map)
+                cols = ("ID", "Name", "Unit", "Skill", "Designation", "Bank", "A/C", "IFSC", "UAN", "ESIC", "Status")
+                widths = [55, 140, 80, 75, 90, 100, 110, 95, 85, 75, 50]
+                table = StyledTreeview(table_container, columns=cols, column_widths=widths,
+                                        height=min(len(workers), 12))
+                table.pack(fill="both", expand=True, pady=(4, 0))
+                table.insert_rows([(w.worker_id, w.name, w.unit, w.skill_category,
+                                    w.designation, w.bank_name, w.bank_account, w.ifsc_code,
+                                    w.uan_number, w.esic_number,
+                                    "● Active" if w.active else "○ Inactive") for w in workers])
+                for item in table.tree.get_children():
+                    vals = table.tree.item(item, "values")
+                    skill  = str(vals[3])  if len(vals) > 3  else ""
+                    status = str(vals[10]) if len(vals) > 10 else ""
+                    if status.startswith("○"):
+                        table.tree.item(item, tags=("inactive",))
+                    elif skill == "Skilled":
+                        table.tree.item(item, tags=("skilled",))
+                    elif "Semi" in skill:
+                        table.tree.item(item, tags=("semi",))
 
-            table.tree.bind("<ButtonRelease-1>", _on_click)
+                ctk.CTkLabel(table_container,
+                    text="💡 Click any cell to edit  •  Switching rows auto-saves  •  Click Status to toggle active",
+                    font=FONT_TINY, text_color=TEXT_MUTED).pack(anchor="w", pady=(2, 0))
+
+                worker_map = {w.worker_id: w for w in workers}
+
+                def _on_click(event):
+                    item = table.tree.identify_row(event.y)
+                    col  = table.tree.identify_column(event.x)
+                    if not item or not col:
+                        _destroy_cell(); return
+                    col_idx  = int(col.lstrip('#')) - 1
+                    if col_idx < 0 or col_idx >= len(cols): return
+                    col_name = cols[col_idx]
+                    vals = table.tree.item(item)["values"]
+                    if not vals: return
+                    w = worker_map.get(str(vals[0]))
+                    if not w: return
+                    if _editing_item[0] and _editing_item[0] != item:
+                        _auto_save_row()
+                    if col_name == "Status":
+                        _editing_wid[0] = w.worker_id
+                        if w.active:
+                            if messagebox.askyesno("Deactivate",
+                                    f"Deactivate '{w.name}' ({w.worker_id})?"):
+                                deactivate_worker(w.worker_id)
+                                self.status_bar.set_message(
+                                    f"Worker {w.worker_id} deactivated.", WARNING_CLR)
+                                action_bar.pack_forget(); update_table()
+                        else:
+                            reactivate_worker(w.worker_id)
+                            self.status_bar.set_message(
+                                f"Worker {w.worker_id} re-activated.", SUCCESS)
+                            action_bar.pack_forget(); update_table()
+                        return
+                    _show_action_bar(table.tree, item, w)
+                    bbox = table.tree.bbox(item, col)
+                    if not bbox: return
+                    _on_cell_click(table.tree, item, col_name, col_idx, bbox, worker_map)
+
+                table.tree.bind("<ButtonRelease-1>", _on_click)
+
+            _async_load(_fetch, _render)
 
         filt_var.trace_add("write", update_table)
-        search_var_wk.trace_add("write", update_table)
+        search_var_wk.trace_add("write", _wk_debounce(update_table))
         update_table()
 
         # ══════════════════════════════════════════════════════════════════
@@ -1323,96 +1540,110 @@ class PayrollApp(ctk.CTk):
                        corner_radius=8, command=lambda: refresh()).pack(side="right")
         content = ctk.CTkFrame(parent, fg_color="transparent")
         content.pack(fill="both", expand=True, padx=28, pady=(0, 20))
+        _slips_loading = [None]
 
         def refresh():
             for w in content.winfo_children(): w.destroy()
-            workers = get_all_workers()
-            if unit_var.get() != "All":
-                workers = [w for w in workers if w.unit == unit_var.get()]
-            sw = get_skill_wages_dict(); att = get_attendance(month_var.get())
-            results, warnings = calculate_payroll(workers, sw, att, month_var.get())
-            if warnings:
-                wf = ctk.CTkFrame(content, fg_color="#3D2F00", corner_radius=8); wf.pack(fill="x", pady=(0, 8))
-                ctk.CTkLabel(wf, text=f"  ⚠️  {len(warnings)} warning(s)",
-                             font=FONT_SMALL, text_color=WARNING_CLR).pack(padx=12, pady=6)
-            if not results:
-                ef = ctk.CTkFrame(content, fg_color=CARD_BG, corner_radius=12)
-                ef.pack(fill="x", pady=30, padx=40)
-                ctk.CTkLabel(ef, text="📭", font=(FONT_FAMILY, 36)).pack(pady=(20, 4))
-                ctk.CTkLabel(ef, text="No payroll data. Add attendance first.",
-                             font=FONT_HEADING, text_color=TEXT_SECONDARY).pack(pady=(0, 20))
-                return
-            _section_label(content, f"📊  Ready: {len(results)} slip(s) for {month_var.get()}")
-            cols = ("ID","Name","Unit","Skill","Designation","Net Pay (₹)")
-            table = StyledTreeview(content, columns=cols, column_widths=[70,150,100,80,130,120],
-                                    height=min(len(results), 10))
-            table.pack(fill="both", expand=True, pady=(0, 10))
-            table.insert_rows([(r.worker_id, r.worker_name, r.unit, r.skill_category,
-                                r.profile_title, fmt_inr(r.net_pay)) for r in results])
+            _slips_loading[0] = _show_loading(content, "Calculating payroll…")
+            month = month_var.get()
+            unit  = unit_var.get()
 
-            def gen_all():
-                zip_path = filedialog.asksaveasfilename(
-                    title="Save Salary Slips ZIP",
-                    defaultextension=".zip",
-                    filetypes=[("ZIP Archive", "*.zip")],
-                    initialfile=f"SalarySlips_{month_var.get()}.zip"
-                )
-                if not zip_path: return
-                self.status_bar.set_message("⏳ Generating ZIP...", ACCENT); self.update()
-                def do():
-                    cfg = get_config()
-                    # Generate into a temp dir, zip_only keeps output clean
-                    temp_dir = tempfile.mkdtemp(prefix="payroll_slips_")
-                    try:
-                        gen = generate_bulk_pdfs(results, cfg, temp_dir, zip_output=True, zip_only=True)
-                        # Move the generated zip to the user-chosen path
-                        if gen.get("zip_path") and os.path.exists(gen["zip_path"]):
-                            import shutil
-                            shutil.move(gen["zip_path"], zip_path)
-                    finally:
-                        # Clean up temp dir
+            def _fetch():
+                workers, att_dict = get_workers_and_attendance(month)
+                sw = get_skill_wages_dict()
+                return workers, sw, list(att_dict.values()), month, unit
+
+            def _render(data):
+                workers, sw, att, month, unit = data
+                try:
+                    if not content.winfo_exists():
+                        return
+                except Exception:
+                    return
+                if _slips_loading[0]:
+                    try: _slips_loading[0].destroy()
+                    except Exception: pass
+                    _slips_loading[0] = None
+                for w in content.winfo_children(): w.destroy()
+                if unit != "All":
+                    workers = [w for w in workers if w.unit == unit]
+                results, warnings = calculate_payroll(workers, sw, att, month)
+                if warnings:
+                    wf = ctk.CTkFrame(content, fg_color="#3D2F00", corner_radius=8); wf.pack(fill="x", pady=(0, 8))
+                    ctk.CTkLabel(wf, text=f"  ⚠️  {len(warnings)} warning(s)",
+                                 font=FONT_SMALL, text_color=WARNING_CLR).pack(padx=12, pady=6)
+                if not results:
+                    ef = ctk.CTkFrame(content, fg_color=CARD_BG, corner_radius=12)
+                    ef.pack(fill="x", pady=30, padx=40)
+                    ctk.CTkLabel(ef, text="📭", font=(FONT_FAMILY, 36)).pack(pady=(20, 4))
+                    ctk.CTkLabel(ef, text="No payroll data. Add attendance first.",
+                                 font=FONT_HEADING, text_color=TEXT_SECONDARY).pack(pady=(0, 20))
+                    return
+                _section_label(content, f"📊  Ready: {len(results)} slip(s) for {month}")
+                cols = ("ID","Name","Unit","Skill","Designation","Net Pay (₹)")
+                table = StyledTreeview(content, columns=cols, column_widths=[70,150,100,80,130,120],
+                                        height=min(len(results), 10))
+                table.pack(fill="both", expand=True, pady=(0, 10))
+                table.insert_rows([(r.worker_id, r.worker_name, r.unit, r.skill_category,
+                                    r.profile_title, fmt_inr(r.net_pay)) for r in results])
+
+                def gen_all():
+                    zip_path = filedialog.asksaveasfilename(
+                        title="Save Salary Slips ZIP", defaultextension=".zip",
+                        filetypes=[("ZIP Archive", "*.zip")],
+                        initialfile=f"SalarySlips_{month}.zip")
+                    if not zip_path: return
+                    self.status_bar.set_message("⏳ Generating ZIP...", ACCENT); self.update()
+                    def do():
+                        cfg = get_config()
+                        temp_dir = tempfile.mkdtemp(prefix="payroll_slips_")
                         try:
-                            import shutil
-                            shutil.rmtree(temp_dir, ignore_errors=True)
+                            gen = generate_bulk_pdfs(results, cfg, temp_dir, zip_output=True, zip_only=True)
+                            if gen.get("zip_path") and os.path.exists(gen["zip_path"]):
+                                import shutil; shutil.move(gen["zip_path"], zip_path)
+                        finally:
+                            try:
+                                import shutil; shutil.rmtree(temp_dir, ignore_errors=True)
+                            except: pass
+                        self.after(0, lambda: done(gen, zip_path))
+                    def done(gen, zp):
+                        self.status_bar.set_message(f"✅ {gen['success_count']} slips → {zp}", SUCCESS)
+                        messagebox.showinfo("Done", f"{gen['success_count']} salary slips saved as ZIP.\n\n{zp}")
+                        try: os.startfile(os.path.dirname(zp))
                         except: pass
-                    self.after(0, lambda: done(gen, zip_path))
-                def done(gen, zp):
-                    self.status_bar.set_message(f"✅ {gen['success_count']} slips → {zp}", SUCCESS)
-                    messagebox.showinfo("Done", f"{gen['success_count']} salary slips saved as ZIP.\n\n{zp}")
-                    try: os.startfile(os.path.dirname(zp))
+                    threading.Thread(target=do, daemon=True).start()
+
+                ctk.CTkButton(content, text="📦  Download All Slips as ZIP", font=FONT_BODY_BOLD,
+                               fg_color=ACCENT, hover_color=ACCENT_HOVER, height=46,
+                               corner_radius=10, command=gen_all).pack(fill="x", pady=(10, 10))
+                single = ctk.CTkFrame(content, fg_color=CARD_BG, corner_radius=12,
+                                       border_width=1, border_color=CARD_BORDER)
+                single.pack(fill="x", pady=(6, 4))
+                ctk.CTkFrame(single, height=3, corner_radius=0, fg_color=SUCCESS).pack(fill="x")
+                ctk.CTkLabel(single, text="📄  Generate Single Slip", font=FONT_SUBHEADING,
+                              text_color=TEXT_PRIMARY).pack(padx=16, pady=(12, 6), anchor="w")
+                sc = ctk.CTkFrame(single, fg_color="transparent"); sc.pack(fill="x", padx=12, pady=(0, 12))
+                nl = [f"{r.worker_id} — {r.worker_name} [{r.unit}]" for r in results]
+                sel_w = ctk.StringVar(value=nl[0] if nl else "")
+                ctk.CTkOptionMenu(sc, values=nl, variable=sel_w, width=280, font=FONT_BODY,
+                                   fg_color=SURFACE, button_color=ACCENT,
+                                   button_hover_color=ACCENT_HOVER).pack(side="left", padx=(0, 12))
+                def gen_single():
+                    wid = sel_w.get().split(" — ")[0].strip()
+                    r = next((r for r in results if r.worker_id == wid), None)
+                    if not r: return
+                    od = filedialog.askdirectory(title="Output folder")
+                    if not od: return
+                    path = generate_slip_pdf(r, get_config(), od)
+                    self.status_bar.set_message(f"✅ Slip → {path}", SUCCESS)
+                    messagebox.showinfo("Done", f"Slip saved:\n{path}")
+                    try: os.startfile(path)
                     except: pass
-                threading.Thread(target=do, daemon=True).start()
+                ctk.CTkButton(sc, text="👁️  Generate & Open", font=FONT_BODY_BOLD, fg_color=SUCCESS,
+                               hover_color="#2E7D32", height=36, corner_radius=8,
+                               command=gen_single).pack(side="left")
 
-            ctk.CTkButton(content, text="📦  Download All Slips as ZIP", font=FONT_BODY_BOLD,
-                           fg_color=ACCENT, hover_color=ACCENT_HOVER, height=46,
-                           corner_radius=10, command=gen_all).pack(fill="x", pady=(10, 10))
-
-            single = ctk.CTkFrame(content, fg_color=CARD_BG, corner_radius=12,
-                                   border_width=1, border_color=CARD_BORDER)
-            single.pack(fill="x", pady=(6, 4))
-            ctk.CTkFrame(single, height=3, corner_radius=0, fg_color=SUCCESS).pack(fill="x")
-            ctk.CTkLabel(single, text="📄  Generate Single Slip", font=FONT_SUBHEADING,
-                          text_color=TEXT_PRIMARY).pack(padx=16, pady=(12, 6), anchor="w")
-            sc = ctk.CTkFrame(single, fg_color="transparent"); sc.pack(fill="x", padx=12, pady=(0, 12))
-            nl = [f"{r.worker_id} — {r.worker_name} [{r.unit}]" for r in results]
-            sel_w = ctk.StringVar(value=nl[0] if nl else "")
-            ctk.CTkOptionMenu(sc, values=nl, variable=sel_w, width=280, font=FONT_BODY,
-                               fg_color=SURFACE, button_color=ACCENT,
-                               button_hover_color=ACCENT_HOVER).pack(side="left", padx=(0, 12))
-            def gen_single():
-                wid = sel_w.get().split(" — ")[0].strip()
-                r = next((r for r in results if r.worker_id == wid), None)
-                if not r: return
-                od = filedialog.askdirectory(title="Output folder")
-                if not od: return
-                path = generate_slip_pdf(r, get_config(), od)
-                self.status_bar.set_message(f"✅ Slip → {path}", SUCCESS)
-                messagebox.showinfo("Done", f"Slip saved:\n{path}")
-                try: os.startfile(path)
-                except: pass
-            ctk.CTkButton(sc, text="👁️  Generate & Open", font=FONT_BODY_BOLD, fg_color=SUCCESS,
-                           hover_color="#2E7D32", height=36, corner_radius=8,
-                           command=gen_single).pack(side="left")
+            _async_load(_fetch, _render)
 
         month_var.trace_add("write", lambda *_: refresh())
         unit_var.trace_add("write", lambda *_: refresh())
