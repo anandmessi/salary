@@ -24,7 +24,7 @@ from database import (
     get_workers_by_unit, import_attendance_from_csv,
     get_all_units, add_unit, rename_unit, delete_unit,
     unit_worker_count,
-    get_all_banks, get_bank_ifsc, add_bank, update_bank, delete_bank,
+    get_all_banks, add_bank, update_bank, delete_bank,
     DB_PATH,
 )
 from payroll_engine import calculate_payroll, payroll_summary
@@ -617,7 +617,6 @@ class PayrollApp(ctk.CTk):
                 with open(path, "w", newline="") as f:
                     wr = csv.writer(f); wr.writerow(tpl)
                     for w in workers: wr.writerow([w.worker_id] + [0]*(len(tpl)-1))
-                self.status_bar.set_message(f"✅ Template → {path}", SUCCESS)
         ctk.CTkButton(parent, text="⬇️  Download Template", font=FONT_BODY, fg_color=SURFACE_3,
                        hover_color=SURFACE_2, text_color=TEXT_PRIMARY, height=32,
                        corner_radius=8, command=download_tpl).pack(padx=16, anchor="w", pady=(0, 12))
@@ -645,173 +644,394 @@ class PayrollApp(ctk.CTk):
     # ══════════════════════════════════════════════════════════════════════
     def _page_workers(self, parent):
         _page_header(parent, "👷  Worker Master Data",
-                     "Add, edit, or delete workers — bank, PF/ESIC, unit, skill & designation")
+                     "Add, edit, or delete workers — click a row to edit inline")
         tabview = ctk.CTkTabview(parent, fg_color=SURFACE_2, segmented_button_fg_color=SURFACE_3,
                                   segmented_button_selected_color=ACCENT,
                                   segmented_button_selected_hover_color=ACCENT_HOVER,
                                   segmented_button_unselected_color=SURFACE_3,
                                   segmented_button_unselected_hover_color=SIDEBAR_HOVER, corner_radius=10)
         tabview.pack(fill="both", expand=True, padx=28, pady=(0, 20))
-        tab_all = tabview.add("👥 All Workers"); tab_add = tabview.add("➕ Add / Edit")
+        tab_all = tabview.add("👥 All Workers")
+        tab_add = tabview.add("➕ Add New Worker")
         form_vars = {}
 
-        def _populate_form(wid_str):
-            w = get_worker_by_id(wid_str)
-            if not w: messagebox.showerror("Error", f"Worker '{wid_str}' not found."); return
-            form_vars["wid"].set(w.worker_id); form_vars["name"].set(w.name)
-            form_vars["designation"].set(w.designation); form_vars["unit"].set(w.unit)
-            form_vars["skill"].set(w.skill_category); form_vars["join"].set(w.joining_date)
-            form_vars["bank_acc"].set(w.bank_account); form_vars["bank_name"].set(w.bank_name)
-            form_vars["ifsc"].set(w.ifsc_code); form_vars["uan"].set(w.uan_number)
-            form_vars["esic"].set(w.esic_number)
-            tabview.set("➕ Add / Edit")
-            self.status_bar.set_message(f"Editing worker {w.worker_id} — {w.name}", ACCENT)
+        SKILL_COLORS_MAP = {
+            "Skilled":      ("#22C55E", "#052E16"),
+            "Semi-Skilled": ("#F59E0B", "#2D1B00"),
+            "Unskilled":    ("#3B82F6", "#0A1628"),
+        }
 
+        def _skill_color(s):
+            return SKILL_COLORS_MAP.get(s, (ACCENT, SURFACE_3))[0]
+
+        def _bank_names():
+            bs = get_all_banks()
+            return bs if bs else ["(No banks — add in Settings)"]
+
+        # ══════════════════════════════════════════════════════════════════
+        # ── ALL WORKERS TAB ───────────────────────────────────────────────
+        # ══════════════════════════════════════════════════════════════════
+        # ── Filter bar ───────────────────────────────────────────────────
+        fc = ctk.CTkFrame(tab_all, fg_color=SURFACE_2, corner_radius=10)
+        fc.pack(fill="x", padx=8, pady=(10, 8))
+        inner_fc = ctk.CTkFrame(fc, fg_color="transparent")
+        inner_fc.pack(fill="x", padx=14, pady=10)
+        ctk.CTkLabel(inner_fc, text="Unit:", font=FONT_BODY_BOLD, text_color=TEXT_PRIMARY).pack(side="left")
+        filt_var = ctk.StringVar(value="All")
+        ctk.CTkOptionMenu(inner_fc, values=_unit_filter_list(), variable=filt_var, width=140,
+                           font=FONT_BODY, fg_color=SURFACE_3, button_color=ACCENT,
+                           button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 20))
+        search_var_wk = ctk.StringVar(value="")
+        ctk.CTkLabel(inner_fc, text="🔍", font=(FONT_FAMILY, 13), text_color=TEXT_SECONDARY).pack(side="left")
+        ctk.CTkEntry(inner_fc, textvariable=search_var_wk, placeholder_text="Search by Name or ID…", width=200,
+                      font=FONT_SMALL, fg_color=SURFACE, border_color=TEXT_MUTED,
+                      corner_radius=8).pack(side="left", padx=(4, 0))
+
+        # ── Table area ───────────────────────────────────────────────────
+        table_container = ctk.CTkFrame(tab_all, fg_color="transparent")
+        table_container.pack(fill="both", expand=True, padx=8)
+
+        # ── Per-cell editor state (persists across update_table calls) ────
+        _cell_editor   = [None]   # current single-cell overlay widget
+        _editing_wid   = [None]   # worker_id of the selected row
+        _editing_item  = [None]   # treeview item id
+        _pending_flush = [None]   # fn() → writes open cell value into treeview before save
+
+        # Columns that use a Combobox (not a free-text Entry)
+        COMBO_COLS = {"Unit", "Skill", "Bank"}
+
+        _ENTRY_KW = {
+            "bg": "#0D1B35", "fg": TEXT_PRIMARY,
+            "insertbackground": TEXT_PRIMARY,
+            "relief": "flat", "font": (FONT_FAMILY, 9),
+            "highlightthickness": 1,
+            "highlightbackground": ACCENT,
+            "highlightcolor": ACCENT,
+        }
+
+        # Style ttk Combobox dropdown to match dark theme
+        _cb_style = ttk.Style()
+        _cb_style.configure("Dark.TCombobox",
+                            fieldbackground="#0D1B35",
+                            background="#0D1B35",
+                            foreground=TEXT_PRIMARY,
+                            arrowcolor=TEXT_PRIMARY,
+                            borderwidth=0)
+        _cb_style.map("Dark.TCombobox",
+                      fieldbackground=[("readonly", "#0D1B35")],
+                      foreground=[("readonly", TEXT_PRIMARY)],
+                      background=[("readonly", "#0D2A4E"), ("active", ACCENT)])
+
+        def _destroy_cell():
+            """Flush pending value then destroy the overlay widget."""
+            if _pending_flush[0]:
+                try: _pending_flush[0]()
+                except Exception: pass
+                _pending_flush[0] = None
+            if _cell_editor[0]:
+                try: _cell_editor[0].destroy()
+                except Exception: pass
+                _cell_editor[0] = None
+
+        def _auto_save_row():
+            """Silently save the current row to DB WITHOUT rebuilding the table.
+            Called automatically when the user switches to a different row so
+            edits on the previous row are never lost.
+            """
+            # flush open entry value into treeview first
+            if _pending_flush[0]:
+                try: _pending_flush[0]()
+                except Exception: pass
+                _pending_flush[0] = None
+            # destroy cell widget (pending_flush already cleared)
+            if _cell_editor[0]:
+                try: _cell_editor[0].destroy()
+                except Exception: pass
+                _cell_editor[0] = None
+            wid  = _editing_wid[0]
+            item = _editing_item[0]
+            if not wid or not item: return
+            try:
+                tree = getattr(action_bar, '_tree_ref', None)
+                if tree is None: return
+                vals = tree.item(item)["values"]
+            except Exception: return
+            if not vals: return
+            name = str(vals[1]).strip()
+            if not name: return   # skip silently if name was cleared
+            w_obj = get_worker_by_id(wid)
+            bname = str(vals[5]).strip()
+            if bname.startswith("(No"): bname = ""
+            try:
+                upsert_worker(Worker(
+                    worker_id=wid, name=name,
+                    unit=str(vals[2]).strip(),
+                    skill_category=str(vals[3]).strip(),
+                    designation=str(vals[4]).strip(),
+                    bank_name=bname,
+                    bank_account=str(vals[6]).strip(),
+                    ifsc_code=str(vals[7]).strip(),
+                    uan_number=str(vals[8]).strip(),
+                    esic_number=str(vals[9]).strip(),
+                    joining_date=w_obj.joining_date if w_obj else "",
+                    active=w_obj.active if w_obj else True))
+                self.status_bar.set_message(f"\u2705 {wid} auto-saved!", SUCCESS)
+            except Exception:
+                pass   # silent — user can always Save explicitly
+
+        # ── Action bar (built once under the table container) ─────────────
+        action_bar = ctk.CTkFrame(tab_all, fg_color="#0D2A4E", corner_radius=8, height=42)
+        _ab_lbl = ctk.CTkLabel(action_bar, text="", font=FONT_SMALL, text_color=TEXT_SECONDARY)
+        _ab_lbl.pack(side="left", padx=14)
+
+        def _ab_save():
+            # _destroy_cell() flushes _pending_flush FIRST so the value
+            # lands in the treeview before we read vals below.
+            _destroy_cell()
+            wid = _editing_wid[0]; item = _editing_item[0]
+            if not wid or not item: return
+            # Read live values straight from the treeview cells
+            vals = action_bar._tree_ref.item(item)["values"]
+            if not vals: return
+            w_obj = get_worker_by_id(wid)
+            bname = str(vals[5]).strip()
+            if bname.startswith("(No"): bname = ""
+            name = str(vals[1]).strip()
+            if not name:
+                messagebox.showerror("Required", "Name cannot be empty."); return
+            upsert_worker(Worker(
+                worker_id=wid,
+                name=name,
+                unit=str(vals[2]).strip(),
+                skill_category=str(vals[3]).strip(),
+                designation=str(vals[4]).strip(),
+                bank_name=bname,
+                bank_account=str(vals[6]).strip(),
+                ifsc_code=str(vals[7]).strip(),
+                uan_number=str(vals[8]).strip(),
+                esic_number=str(vals[9]).strip(),
+                joining_date=w_obj.joining_date if w_obj else "",
+                active=w_obj.active if w_obj else True))
+            self.status_bar.set_message(f"✅ Worker {wid} saved!", SUCCESS)
+            _editing_wid[0] = None; _editing_item[0] = None
+            action_bar.pack_forget(); update_table()
+
+        def _ab_cancel():
+            _destroy_cell()
+            _editing_wid[0] = None; _editing_item[0] = None
+            action_bar.pack_forget(); update_table()
+
+        def _ab_toggle():
+            _destroy_cell()
+            wid = _editing_wid[0]
+            if not wid: return
+            w = get_worker_by_id(wid)
+            if not w: return
+            if w.active:
+                if messagebox.askyesno("Confirm", f"Deactivate '{w.name}' ({wid})?"):
+                    deactivate_worker(wid)
+                    self.status_bar.set_message(f"Worker {wid} deactivated.", WARNING_CLR)
+                    action_bar.pack_forget(); update_table()
+            else:
+                reactivate_worker(wid)
+                self.status_bar.set_message(f"Worker {wid} re-activated.", SUCCESS)
+                action_bar.pack_forget(); update_table()
+
+        def _ab_delete():
+            _destroy_cell()
+            wid = _editing_wid[0]
+            if not wid: return
+            w = get_worker_by_id(wid)
+            wname = w.name if w else wid
+            if messagebox.askyesno("⚠️ Delete",
+                f"Permanently delete '{wname}' ({wid}) and ALL attendance?\nCannot undo.", icon="warning"):
+                delete_worker(wid)
+                self.status_bar.set_message(f"Worker {wid} deleted.", DANGER)
+                action_bar.pack_forget(); update_table()
+
+        for txt, fg, cmd in [
+            ("💾 Save",              SUCCESS,     _ab_save),
+            ("✖ Cancel",            SURFACE_2,   _ab_cancel),
+            ("⏸ Toggle",            WARNING_CLR, _ab_toggle),
+            ("🗑️ Delete",           DANGER,      _ab_delete),
+        ]:
+            ctk.CTkButton(action_bar, text=txt, font=FONT_SMALL,
+                           fg_color=fg, hover_color=ACCENT_HOVER if fg == SUCCESS else fg,
+                           height=30, corner_radius=6, width=90,
+                           command=cmd).pack(side="right", padx=(0, 8), pady=6)
+
+        def _show_action_bar(tree, item, w_obj):
+            action_bar._tree_ref = tree       # store reference for save to read values
+            _editing_wid[0]  = w_obj.worker_id
+            _editing_item[0] = item
+            _ab_lbl.configure(text=f"✏️  {w_obj.worker_id}  —  {w_obj.name}")
+            if not action_bar.winfo_ismapped():
+                action_bar.pack(fill="x", padx=8, pady=(4, 0))
+
+        # ── Cell click handler ────────────────────────────────────────────
+        def _on_cell_click(tree, item, col_name, col_idx, bbox, worker_map):
+            _destroy_cell()
+            if col_name in ("ID", "Status"): return   # non-editable columns
+
+            x, y, w_, h = bbox
+            current = str(tree.item(item)["values"][col_idx])
+
+            if col_name in COMBO_COLS:
+                choices = {
+                    "Unit":  _unit_list,
+                    "Skill": lambda: SKILL_CATEGORIES,
+                    "Bank":  _bank_names,
+                }[col_name]()
+                var = tk.StringVar(value=current)
+                cb = ttk.Combobox(tree, textvariable=var, values=choices,
+                                   state="readonly", font=(FONT_FAMILY, 9),
+                                   style="Dark.TCombobox")
+                cb.place(x=x, y=y, width=w_, height=h)
+                cb.focus()
+                def _cb_sel(ev=None, _item=item, _col_name=col_name, _var=var):
+                    tree.set(_item, _col_name, _var.get())
+                    _destroy_cell()
+                cb.bind("<<ComboboxSelected>>", _cb_sel)
+                cb.bind("<Escape>", lambda e: _destroy_cell())
+                _cell_editor[0] = cb
+            else:
+                var = tk.StringVar(value=current)
+                ent = tk.Entry(tree, textvariable=var, **_ENTRY_KW)
+                ent.place(x=x, y=y, width=w_, height=h)
+                ent.select_range(0, "end")
+                ent.icursor("end")
+                ent.focus()
+                # Register a flush fn so _ab_save() can pull the value
+                # before the Entry's FocusOut fires (race condition fix)
+                def _flush(_item=item, _col_name=col_name, _var=var):
+                    try: tree.set(_item, _col_name, _var.get())
+                    except Exception: pass
+                _pending_flush[0] = _flush
+                def _commit(ev=None, _fl=_flush):
+                    _fl()
+                    _pending_flush[0] = None
+                    _destroy_cell()
+                ent.bind("<Return>",   _commit)
+                ent.bind("<FocusOut>", _commit)
+                ent.bind("<Escape>",   lambda e: (_pending_flush.__setitem__(0, None), _destroy_cell()))
+                _cell_editor[0] = ent
+
+        def update_table(*_):
+            _destroy_cell()
+            action_bar.pack_forget()
+            for w in table_container.winfo_children(): w.destroy()
+            workers = get_all_workers(active_only=False)
+            if filt_var.get() != "All":
+                workers = [w for w in workers if w.unit == filt_var.get()]
+            q = search_var_wk.get().strip().lower()
+            if q:
+                workers = [w for w in workers if q in w.name.lower() or q in w.worker_id.lower()]
+            if not workers:
+                ef = ctk.CTkFrame(table_container, fg_color=CARD_BG, corner_radius=12)
+                ef.pack(fill="x", pady=30, padx=30)
+                ctk.CTkLabel(ef, text="👤", font=(FONT_FAMILY, 36)).pack(pady=(20, 4))
+                ctk.CTkLabel(ef, text="No workers yet", font=FONT_HEADING, text_color=TEXT_SECONDARY).pack()
+                ctk.CTkLabel(ef, text='Use "➕ Add New Worker" tab.',
+                             font=FONT_SMALL, text_color=TEXT_MUTED).pack(pady=(4, 20))
+                return
+
+            cols = ("ID", "Name", "Unit", "Skill", "Designation", "Bank", "A/C", "IFSC", "UAN", "ESIC", "Status")
+            widths = [55, 140, 80, 75, 90, 100, 110, 95, 85, 75, 50]
+            table = StyledTreeview(table_container, columns=cols, column_widths=widths,
+                                    height=min(len(workers), 12))
+            table.pack(fill="both", expand=True, pady=(4, 0))
+            table.insert_rows([(w.worker_id, w.name, w.unit, w.skill_category,
+                                w.designation, w.bank_name, w.bank_account, w.ifsc_code,
+                                w.uan_number, w.esic_number,
+                                "● Active" if w.active else "○ Inactive") for w in workers])
+            for item in table.tree.get_children():
+                vals = table.tree.item(item, "values")
+                skill  = str(vals[3])  if len(vals) > 3  else ""
+                status = str(vals[10]) if len(vals) > 10 else ""
+                if status.startswith("○"):
+                    table.tree.item(item, tags=("inactive",))
+                elif skill == "Skilled":
+                    table.tree.item(item, tags=("skilled",))
+                elif "Semi" in skill:
+                    table.tree.item(item, tags=("semi",))
+
+            ctk.CTkLabel(table_container,
+                text="💡 Click any cell to edit  •  Switching rows auto-saves  •  Click Status to toggle active",
+                font=FONT_TINY, text_color=TEXT_MUTED).pack(anchor="w", pady=(2, 0))
+
+            worker_map = {w.worker_id: w for w in workers}
+
+            def _on_click(event):
+                item = table.tree.identify_row(event.y)
+                col  = table.tree.identify_column(event.x)   # '#1', '#2', …
+                if not item or not col:
+                    _destroy_cell(); return
+                col_idx  = int(col.lstrip('#')) - 1
+                if col_idx < 0 or col_idx >= len(cols): return
+                col_name = cols[col_idx]
+
+                vals = table.tree.item(item)["values"]
+                if not vals: return
+                w = worker_map.get(str(vals[0]))
+                if not w: return
+
+                # ── Auto-save previous row when switching employees ──────────
+                if _editing_item[0] and _editing_item[0] != item:
+                    _auto_save_row()
+
+                # ── Clicking Status cell → instant toggle ─────────────────
+                if col_name == "Status":
+                    _editing_wid[0] = w.worker_id
+                    if w.active:
+                        if messagebox.askyesno("Deactivate",
+                                f"Deactivate '{w.name}' ({w.worker_id})?"):
+                            deactivate_worker(w.worker_id)
+                            self.status_bar.set_message(
+                                f"Worker {w.worker_id} deactivated.", WARNING_CLR)
+                            action_bar.pack_forget(); update_table()
+                    else:
+                        reactivate_worker(w.worker_id)
+                        self.status_bar.set_message(
+                            f"Worker {w.worker_id} re-activated.", SUCCESS)
+                        action_bar.pack_forget(); update_table()
+                    return
+
+                # ── For all other columns: show action bar + open cell editor
+                _show_action_bar(table.tree, item, w)
+                bbox = table.tree.bbox(item, col)
+                if not bbox: return
+                _on_cell_click(table.tree, item, col_name, col_idx, bbox, worker_map)
+
+            table.tree.bind("<ButtonRelease-1>", _on_click)
+
+        filt_var.trace_add("write", update_table)
+        search_var_wk.trace_add("write", update_table)
+        update_table()
+
+        # ══════════════════════════════════════════════════════════════════
+        # ── ADD NEW WORKER FORM ───────────────────────────────────────────
+        # ══════════════════════════════════════════════════════════════════
         def _clear_form():
-            for k in ["wid","name","designation","bank_acc","bank_name","ifsc","uan","esic"]:
+            for k in ["wid", "name", "designation", "bank_acc", "ifsc", "uan", "esic"]:
                 form_vars[k].set("")
             form_vars["join"].set(datetime.date.today().strftime("%d/%m/%Y"))
             b = get_all_units()
             form_vars["unit"].set(b[0] if b else "")
             form_vars["skill"].set(SKILL_CATEGORIES[-1])
+            bl = get_all_banks()
+            form_vars["bank_name"].set(bl[0] if bl else "")
             self.status_bar.set_message("Form cleared — ready to add a new worker.")
 
-        def refresh_workers():
-            for w in tab_all.winfo_children(): w.destroy()
-            fc = ctk.CTkFrame(tab_all, fg_color=SURFACE_2, corner_radius=10)
-            fc.pack(fill="x", padx=8, pady=(10, 8))
-            inner_fc = ctk.CTkFrame(fc, fg_color="transparent")
-            inner_fc.pack(fill="x", padx=14, pady=10)
-            ctk.CTkLabel(inner_fc, text="Unit:", font=FONT_BODY_BOLD, text_color=TEXT_PRIMARY).pack(side="left")
-            filt_var = ctk.StringVar(value="All")
-            ctk.CTkOptionMenu(inner_fc, values=_unit_filter_list(), variable=filt_var, width=140,
-                               font=FONT_BODY, fg_color=SURFACE_3, button_color=ACCENT,
-                               button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 20))
-            search_var_wk = ctk.StringVar(value="")
-            ctk.CTkLabel(inner_fc, text="🔍", font=(FONT_FAMILY, 13), text_color=TEXT_SECONDARY).pack(side="left")
-            ctk.CTkEntry(inner_fc, textvariable=search_var_wk, placeholder_text="Search by Name or ID…", width=180,
-                          font=FONT_SMALL, fg_color=SURFACE, border_color=TEXT_MUTED,
-                          corner_radius=8).pack(side="left", padx=(4, 0))
-            table_container = ctk.CTkFrame(tab_all, fg_color="transparent")
-            table_container.pack(fill="both", expand=True, padx=8)
-
-            def update_table(*_):
-                for w in table_container.winfo_children(): w.destroy()
-                workers = get_all_workers(active_only=False)
-                if filt_var.get() != "All":
-                    workers = [w for w in workers if w.unit == filt_var.get()]
-                q_wk = search_var_wk.get().strip().lower()
-                if q_wk:
-                    workers = [w for w in workers if q_wk in w.name.lower() or q_wk in w.worker_id.lower()]
-                if not workers:
-                    ef = ctk.CTkFrame(table_container, fg_color=CARD_BG, corner_radius=12)
-                    ef.pack(fill="x", pady=30, padx=30)
-                    ctk.CTkLabel(ef, text="👤", font=(FONT_FAMILY, 36)).pack(pady=(20, 4))
-                    ctk.CTkLabel(ef, text="No workers yet", font=FONT_HEADING, text_color=TEXT_SECONDARY).pack()
-                    ctk.CTkLabel(ef, text='Use "➕ Add / Edit" tab to add your first worker.',
-                                 font=FONT_SMALL, text_color=TEXT_MUTED).pack(pady=(4, 20))
-                    return
-                cols = ("ID","Name","Unit","Skill","Designation","Bank","A/C","IFSC","UAN","ESIC","Status")
-                widths = [55,120,80,70,90,90,100,90,80,70,45]
-                table = StyledTreeview(table_container, columns=cols, column_widths=widths,
-                                        height=min(len(workers), 12))
-                table.pack(fill="both", expand=True, pady=(4, 4))
-                table.insert_rows([(w.worker_id, w.name, w.unit, w.skill_category,
-                                    w.designation, w.bank_name, w.bank_account, w.ifsc_code,
-                                    w.uan_number, w.esic_number,
-                                    "● Active" if w.active else "○ Inactive") for w in workers])
-                # Apply color tags using row values only (no outer-loop 'w' reference)
-                for item in table.tree.get_children():
-                    vals = table.tree.item(item, "values")
-                    skill  = str(vals[3])  if len(vals) >  3 else ""
-                    status = str(vals[10]) if len(vals) > 10 else ""
-                    if status.startswith("○"):
-                        table.tree.item(item, tags=("inactive",))
-                    elif skill == "Skilled":
-                        table.tree.item(item, tags=("skilled",))
-                    elif "Semi" in skill:
-                        table.tree.item(item, tags=("semi",))
-
-                # ── Action panel ──
-                ap = ctk.CTkFrame(table_container, fg_color=CARD_BG, corner_radius=10)
-                ap.pack(fill="x", pady=(8, 4))
-                ap_inner = ctk.CTkFrame(ap, fg_color="transparent")
-                ap_inner.pack(fill="x", padx=14, pady=10)
-                # Show "ID — Name" in dropdown for easy identification
-                all_labels = [f"{w.worker_id} — {w.name}" for w in workers]
-                sel_var = ctk.StringVar(value=all_labels[0] if all_labels else "")
-
-                def _get_selected_id():
-                    """Extract worker_id from the 'ID — Name' dropdown value."""
-                    val = sel_var.get()
-                    return val.split(" — ")[0].strip() if " — " in val else val.strip()
-
-                ctk.CTkLabel(ap_inner, text="Worker:", font=FONT_BODY_BOLD, text_color=TEXT_PRIMARY).pack(side="left")
-                ctk.CTkOptionMenu(ap_inner, values=all_labels, variable=sel_var, width=230, font=FONT_BODY,
-                                   fg_color=SURFACE_3, button_color=ACCENT,
-                                   button_hover_color=ACCENT_HOVER).pack(side="left", padx=(8, 16))
-                ctk.CTkButton(ap_inner, text="✏️  Edit", font=FONT_BODY_BOLD, fg_color=ACCENT,
-                               hover_color=ACCENT_HOVER, height=34, corner_radius=8, width=90,
-                               command=lambda: _populate_form(_get_selected_id())).pack(side="left", padx=(0, 6))
-                def do_toggle():
-                    wid = _get_selected_id()
-                    w = get_worker_by_id(wid)
-                    if not w: return
-                    if w.active:
-                        if messagebox.askyesno("Confirm", f"Deactivate '{w.name}' ({wid})?"):
-                            deactivate_worker(wid)
-                            self.status_bar.set_message(f"Worker {wid} deactivated.", WARNING_CLR); update_table()
-                    else:
-                        reactivate_worker(wid)
-                        self.status_bar.set_message(f"Worker {wid} re-activated.", SUCCESS); update_table()
-                ctk.CTkButton(ap_inner, text="⏸  Toggle", font=FONT_BODY_BOLD, fg_color=WARNING_CLR,
-                               hover_color="#E65100", height=34, corner_radius=8, width=100,
-                               command=do_toggle).pack(side="left", padx=(0, 6))
-                def do_delete():
-                    wid = _get_selected_id()
-                    w = get_worker_by_id(wid)
-                    wname = w.name if w else wid
-                    if messagebox.askyesno("⚠️ Delete",
-                        f"Permanently delete '{wname}' ({wid}) and ALL their attendance?\nCannot undo.", icon="warning"):
-                        delete_worker(wid)
-                        self.status_bar.set_message(f"Worker {wid} deleted.", DANGER); update_table()
-                ctk.CTkButton(ap_inner, text="🗑️  Delete", font=FONT_BODY_BOLD, fg_color=DANGER,
-                               hover_color="#C62828", height=34, corner_radius=8, width=90,
-                               command=do_delete).pack(side="left")
-
-                # Clicking a row in the table updates the dropdown
-                def on_select(event):
-                    sel = table.tree.selection()
-                    if sel:
-                        vals = table.tree.item(sel[0])["values"]
-                        if vals:
-                            wid = str(vals[0])
-                            # Find matching label in dropdown
-                            for lbl in all_labels:
-                                if lbl.startswith(wid + " — "):
-                                    sel_var.set(lbl); break
-                table.tree.bind("<<TreeviewSelect>>", on_select)
-
-                def on_dbl(event):
-                    sel = table.tree.selection()
-                    if sel:
-                        vals = table.tree.item(sel[0])["values"]
-                        if vals: _populate_form(str(vals[0]))
-                table.tree.bind("<Double-1>", on_dbl)
-            filt_var.trace_add("write", update_table)
-            search_var_wk.trace_add("write", update_table)
-            update_table()
-
-        # ── Form ──
-        form = ctk.CTkFrame(tab_add, fg_color=CARD_BG, corner_radius=10); form.pack(fill="x", padx=16, pady=16)
+        form = ctk.CTkFrame(tab_add, fg_color=CARD_BG, corner_radius=10)
+        form.pack(fill="x", padx=16, pady=16)
         fh = ctk.CTkFrame(form, fg_color="transparent"); fh.pack(fill="x", padx=16, pady=(16, 10))
-        ctk.CTkLabel(fh, text="Worker Registration Form", font=FONT_HEADING,
+        ctk.CTkLabel(fh, text="New Worker Registration", font=FONT_HEADING,
                       text_color=TEXT_PRIMARY).pack(side="left")
         ctk.CTkButton(fh, text="🧹 Clear", font=FONT_SMALL, fg_color=SURFACE_3,
                        hover_color=SURFACE_2, text_color=TEXT_SECONDARY, height=28, width=80,
                        corner_radius=6, command=lambda: _clear_form()).pack(side="right")
         ff = ctk.CTkFrame(form, fg_color="transparent"); ff.pack(fill="x", padx=16, pady=(0, 10))
-        ff.grid_columnconfigure((0,1,2), weight=1)
+        ff.grid_columnconfigure((0, 1, 2), weight=1)
 
         def mkf(p, lbl, r, c, default=""):
             f = ctk.CTkFrame(p, fg_color="transparent"); f.grid(row=r, column=c, padx=8, pady=4, sticky="ew")
@@ -821,39 +1041,75 @@ class PayrollApp(ctk.CTk):
                           border_color=TEXT_MUTED, corner_radius=6).pack(fill="x")
             return v
 
-        wid_var = mkf(ff, "Worker ID *", 0, 0)
-        wname_var = mkf(ff, "Full Name *", 0, 1)
+        wid_var    = mkf(ff, "Worker ID *", 0, 0)
+        wname_var  = mkf(ff, "Full Name *", 0, 1)
         wdesig_var = mkf(ff, "Designation (e.g. Sweeper)", 0, 2)
 
-        # Unit dropdown
-        bf = ctk.CTkFrame(ff, fg_color="transparent"); bf.grid(row=1, column=0, padx=8, pady=4, sticky="ew")
-        ctk.CTkLabel(bf, text="Unit *", font=FONT_SMALL, text_color=TEXT_SECONDARY).pack(anchor="w")
+        bf2 = ctk.CTkFrame(ff, fg_color="transparent"); bf2.grid(row=1, column=0, padx=8, pady=4, sticky="ew")
+        ctk.CTkLabel(bf2, text="Unit *", font=FONT_SMALL, text_color=TEXT_SECONDARY).pack(anchor="w")
         units = _unit_list()
         unit_var = ctk.StringVar(value=units[0] if units else "")
-        ctk.CTkOptionMenu(bf, values=units, variable=unit_var, font=FONT_BODY,
+        ctk.CTkOptionMenu(bf2, values=units, variable=unit_var, font=FONT_BODY,
                            fg_color=SURFACE, button_color=ACCENT,
                            button_hover_color=ACCENT_HOVER, height=30).pack(fill="x")
 
-        # Skill dropdown
-        sf = ctk.CTkFrame(ff, fg_color="transparent"); sf.grid(row=1, column=1, padx=8, pady=4, sticky="ew")
-        ctk.CTkLabel(sf, text="Skill Category *  (determines wage)", font=FONT_SMALL,
+        skf2 = ctk.CTkFrame(ff, fg_color="transparent"); skf2.grid(row=1, column=1, padx=8, pady=4, sticky="ew")
+        ctk.CTkLabel(skf2, text="Skill Category *  (determines wage)", font=FONT_SMALL,
                       text_color=TEXT_SECONDARY).pack(anchor="w")
         skill_var = ctk.StringVar(value=SKILL_CATEGORIES[-1])
-        ctk.CTkOptionMenu(sf, values=SKILL_CATEGORIES, variable=skill_var, font=FONT_BODY,
-                           fg_color=SURFACE, button_color=ACCENT,
-                           button_hover_color=ACCENT_HOVER, height=30).pack(fill="x")
+        skill_menu2 = ctk.CTkOptionMenu(skf2, values=SKILL_CATEGORIES, variable=skill_var,
+            font=FONT_BODY, fg_color=SURFACE, button_color=_skill_color(skill_var.get()),
+            button_hover_color=ACCENT_HOVER, height=30)
+        skill_menu2.pack(fill="x")
+        skill_var.trace_add("write", lambda *_: skill_menu2.configure(button_color=_skill_color(skill_var.get())))
 
         wjoin_var = mkf(ff, "Joining Date (DD/MM/YYYY)", 1, 2, datetime.date.today().strftime("%d/%m/%Y"))
         wbank_var = mkf(ff, "Bank Account Number", 2, 0)
-        wbname_var = mkf(ff, "Bank Name", 2, 1)
+
+        bnf2 = ctk.CTkFrame(ff, fg_color="transparent"); bnf2.grid(row=2, column=1, padx=8, pady=4, sticky="ew")
+        ctk.CTkLabel(bnf2, text="Bank Name  (select or ➕ add)", font=FONT_SMALL,
+                      text_color=TEXT_SECONDARY).pack(anchor="w")
+        bnf2_row = ctk.CTkFrame(bnf2, fg_color="transparent"); bnf2_row.pack(fill="x")
+        wbname_var = ctk.StringVar()
+        bank_om2 = ctk.CTkOptionMenu(bnf2_row, values=_bank_names(), variable=wbname_var,
+            font=FONT_BODY, fg_color=SURFACE, button_color=ACCENT,
+            button_hover_color=ACCENT_HOVER, height=30, width=160)
+        bank_om2.pack(side="left", fill="x", expand=True)
+
+        def _form_add_bank():
+            dlg = ctk.CTkToplevel(self)
+            dlg.title("Add Bank"); dlg.geometry("300x130"); dlg.grab_set(); dlg.resizable(False, False)
+            nv = ctk.StringVar()
+            ctk.CTkLabel(dlg, text="Bank Name:", font=FONT_SMALL, text_color=TEXT_SECONDARY
+                          ).pack(padx=16, pady=(14, 4), anchor="w")
+            ctk.CTkEntry(dlg, textvariable=nv, font=FONT_BODY, fg_color=SURFACE,
+                          border_color=TEXT_MUTED, height=32).pack(fill="x", padx=16)
+            def _sv():
+                n = nv.get().strip()
+                if not n: return
+                try:
+                    add_bank(n); bank_om2.configure(values=_bank_names()); wbname_var.set(n)
+                    self.status_bar.set_message(f"✅ Bank '{n}' added!", SUCCESS); dlg.destroy()
+                except Exception as e: messagebox.showerror("Error", str(e), parent=dlg)
+            ctk.CTkButton(dlg, text="➕ Add", font=FONT_BODY_BOLD, fg_color=SUCCESS,
+                           hover_color="#16A34A", height=32, corner_radius=6, command=_sv).pack(pady=10)
+        ctk.CTkButton(bnf2_row, text="➕", font=FONT_BODY_BOLD, width=34, height=30,
+                       fg_color=SUCCESS, hover_color="#16A34A", corner_radius=6,
+                       command=_form_add_bank).pack(side="left", padx=(6, 0))
+
         wifsc_var = mkf(ff, "IFSC Code", 2, 2)
-        wuan_var = mkf(ff, "UAN / PF ID Number", 3, 0)
+        wuan_var  = mkf(ff, "UAN / PF ID Number", 3, 0)
         wesic_var = mkf(ff, "ESIC IP Number", 3, 1)
 
-        form_vars.update({"wid": wid_var, "name": wname_var, "designation": wdesig_var,
-                          "unit": unit_var, "skill": skill_var, "join": wjoin_var,
-                          "bank_acc": wbank_var, "bank_name": wbname_var, "ifsc": wifsc_var,
-                          "uan": wuan_var, "esic": wesic_var})
+        initial_banks = _bank_names()
+        wbname_var.set(initial_banks[0] if initial_banks else "")
+
+        form_vars.update({
+            "wid": wid_var, "name": wname_var, "designation": wdesig_var,
+            "unit": unit_var, "skill": skill_var, "join": wjoin_var,
+            "bank_acc": wbank_var, "bank_name": wbname_var, "ifsc": wifsc_var,
+            "uan": wuan_var, "esic": wesic_var,
+        })
 
         def save_worker():
             wid = wid_var.get().strip().upper(); wname = wname_var.get().strip()
@@ -862,20 +1118,22 @@ class PayrollApp(ctk.CTk):
             b = unit_var.get()
             if not b or b == "(No units)":
                 messagebox.showerror("Required", "Create a Unit first (🏢 Units)."); return
+            bname = wbname_var.get().strip()
+            if bname.startswith("(No"): bname = ""
             upsert_worker(Worker(
                 worker_id=wid, name=wname, designation=wdesig_var.get().strip(),
-                bank_account=wbank_var.get().strip(), bank_name=wbname_var.get().strip(),
+                bank_account=wbank_var.get().strip(), bank_name=bname,
                 ifsc_code=wifsc_var.get().strip(), uan_number=wuan_var.get().strip(),
                 esic_number=wesic_var.get().strip(), joining_date=wjoin_var.get().strip(),
                 active=True, unit=b, skill_category=skill_var.get()))
             self.status_bar.set_message(f"✅ Worker {wid} saved!", SUCCESS)
             messagebox.showinfo("Saved", f"Worker {wid} saved!")
-            _clear_form(); refresh_workers()
+            _clear_form(); update_table()
 
         ctk.CTkButton(form, text="💾  Save Worker", font=FONT_BODY_BOLD, fg_color=SUCCESS,
                        hover_color="#2E7D32", height=40, corner_radius=8,
                        command=save_worker).pack(pady=(4, 16))
-        refresh_workers()
+
 
     # ══════════════════════════════════════════════════════════════════════
     #   UNITS
@@ -1226,6 +1484,97 @@ class PayrollApp(ctk.CTk):
             f.grid(row=r, column=c, padx=6, pady=4, sticky="ew")
             ctk.CTkLabel(f, text=label, font=FONT_TINY, text_color=TEXT_MUTED).pack(anchor="w", padx=10, pady=(6, 0))
             ctk.CTkLabel(f, text=val, font=(FONT_FAMILY, 10, "bold"), text_color=TEXT_PRIMARY).pack(anchor="w", padx=10, pady=(0, 8))
+
+        # ── Bank Presets Card ─────────────────────────────────────────────
+        bk_card = ctk.CTkFrame(parent, fg_color=CARD_BG, corner_radius=14,
+                                border_width=1, border_color=CARD_BORDER)
+        bk_card.pack(fill="x", padx=28, pady=(0, 16))
+        ctk.CTkFrame(bk_card, height=3, corner_radius=0, fg_color="#26A69A").pack(fill="x")
+
+        bk_hdr = ctk.CTkFrame(bk_card, fg_color="transparent")
+        bk_hdr.pack(fill="x", padx=20, pady=(14, 6))
+        ctk.CTkLabel(bk_hdr, text="🏦  Bank Presets", font=FONT_HEADING,
+                      text_color=TEXT_PRIMARY).pack(side="left")
+        ctk.CTkLabel(bk_hdr, text="Preset banks appear as a dropdown in the Worker form",
+                      font=FONT_TINY, text_color=TEXT_MUTED).pack(side="left", padx=(12, 0))
+
+        bk_body = ctk.CTkFrame(bk_card, fg_color="transparent")
+        bk_body.pack(fill="x", padx=20, pady=(0, 14))
+
+        def _refresh_banks():
+            for w in bk_body.winfo_children(): w.destroy()
+            banks = get_all_banks()   # now List[str]
+
+            # ── Add new bank ──
+            add_row = ctk.CTkFrame(bk_body, fg_color=SURFACE_3, corner_radius=8)
+            add_row.pack(fill="x", pady=(0, 10))
+            add_inner = ctk.CTkFrame(add_row, fg_color="transparent")
+            add_inner.pack(fill="x", padx=12, pady=10)
+            nv = ctk.StringVar()
+            ctk.CTkLabel(add_inner, text="Bank Name:", font=FONT_SMALL, text_color=TEXT_SECONDARY,
+                          width=80, anchor="w").pack(side="left")
+            ctk.CTkEntry(add_inner, textvariable=nv, font=FONT_BODY, fg_color=SURFACE,
+                          border_color=TEXT_MUTED, height=30, width=280).pack(side="left", padx=(0, 10))
+            def _add():
+                n = nv.get().strip()
+                if not n: messagebox.showerror("Required", "Bank name cannot be empty."); return
+                try: add_bank(n); self.status_bar.set_message(f"✅ Bank '{n}' added!", SUCCESS); _refresh_banks()
+                except Exception as e: messagebox.showerror("Error", f"Already exists:\n{e}")
+            ctk.CTkButton(add_inner, text="➕ Add", font=FONT_BODY_BOLD, fg_color=SUCCESS,
+                           hover_color="#16A34A", height=30, corner_radius=6, width=80,
+                           command=_add).pack(side="left")
+
+            if not banks:
+                ctk.CTkLabel(bk_body, text="No bank presets yet — add one above.",
+                              font=FONT_SMALL, text_color=TEXT_MUTED).pack(pady=8)
+                return
+
+            # ── Bank list ──
+            list_frame = ctk.CTkFrame(bk_body, fg_color="transparent")
+            list_frame.pack(fill="x")
+            hdr = ctk.CTkFrame(list_frame, fg_color=ACCENT_DARK, corner_radius=6)
+            hdr.pack(fill="x", pady=(0, 2))
+            ctk.CTkLabel(hdr, text="Bank Name", font=(FONT_FAMILY, 10, "bold"),
+                          text_color="white", anchor="w").pack(side="left", padx=12, pady=6, fill="x",
+                          expand=True)
+            ctk.CTkLabel(hdr, text="Actions", font=(FONT_FAMILY, 10, "bold"),
+                          text_color="white", width=90, anchor="w").pack(side="left", padx=8, pady=6)
+
+            for idx, bname in enumerate(banks):
+                bg = SURFACE_2 if idx % 2 == 0 else SURFACE_3
+                brow = ctk.CTkFrame(list_frame, fg_color=bg, corner_radius=4)
+                brow.pack(fill="x", pady=1)
+                binner = ctk.CTkFrame(brow, fg_color="transparent")
+                binner.pack(fill="x", padx=8, pady=4)
+
+                ev_name = ctk.StringVar(value=bname)
+                ctk.CTkEntry(binner, textvariable=ev_name, font=FONT_SMALL,
+                              fg_color=SURFACE, border_color=TEXT_MUTED,
+                              height=28, corner_radius=4).pack(side="left", fill="x",
+                              expand=True, padx=(0, 8))
+
+                def _mk_save(old=bname, nvar=ev_name):
+                    def _save():
+                        nn = nvar.get().strip()
+                        if not nn: messagebox.showerror("Required", "Name cannot be empty."); return
+                        try: update_bank(old, nn); self.status_bar.set_message(f"✅ Bank renamed!", SUCCESS); _refresh_banks()
+                        except Exception as e: messagebox.showerror("Error", str(e))
+                    return _save
+
+                def _mk_del(name=bname):
+                    def _del():
+                        if messagebox.askyesno("Delete Bank", f"Remove '{name}' from presets?"):
+                            delete_bank(name); self.status_bar.set_message(f"🗑️ '{name}' removed.", DANGER); _refresh_banks()
+                    return _del
+
+                ctk.CTkButton(binner, text="💾 Save", font=FONT_SMALL, width=68, height=28,
+                               fg_color=ACCENT, hover_color=ACCENT_HOVER, corner_radius=4,
+                               command=_mk_save()).pack(side="left", padx=(0, 4))
+                ctk.CTkButton(binner, text="🗑️", font=FONT_SMALL, width=34, height=28,
+                               fg_color=DANGER, hover_color="#B91C1C", corner_radius=4,
+                               command=_mk_del()).pack(side="left")
+
+        _refresh_banks()
 
         # ── Backup Status Card ────────────────────────────────────────────
         mgr = self._backup_mgr

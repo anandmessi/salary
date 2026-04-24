@@ -114,32 +114,22 @@ def upsert_skill_wage(sw: SkillWage, db_path=DB_PATH):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#   BANKS  (preset bank list with IFSC)
+#   BANKS  (preset bank names only)
 # ══════════════════════════════════════════════════════════════════════════════
-def get_all_banks(db_path=DB_PATH) -> List[dict]:
-    """Return list of {name, ifsc_code} dicts, ordered by name."""
+def get_all_banks(db_path=DB_PATH) -> List[str]:
+    """Return sorted list of bank name strings."""
     with get_conn(db_path) as conn:
-        rows = conn.execute("SELECT name, ifsc_code FROM banks ORDER BY name").fetchall()
-    return [dict(r) for r in rows]
+        rows = conn.execute("SELECT name FROM banks ORDER BY name").fetchall()
+    return [r["name"] for r in rows]
 
-def get_bank_ifsc(name: str, db_path=DB_PATH) -> str:
-    """Return IFSC for a given bank name, or '' if not found."""
+def add_bank(name: str, db_path=DB_PATH):
     with get_conn(db_path) as conn:
-        row = conn.execute("SELECT ifsc_code FROM banks WHERE name=?", (name,)).fetchone()
-    return row["ifsc_code"] if row else ""
+        conn.execute("INSERT INTO banks(name) VALUES(?)", (name.strip(),))
 
-def add_bank(name: str, ifsc_code: str = "", db_path=DB_PATH):
+def update_bank(old_name: str, new_name: str, db_path=DB_PATH):
     with get_conn(db_path) as conn:
-        conn.execute("INSERT INTO banks(name, ifsc_code) VALUES(?,?)",
-                     (name.strip(), ifsc_code.strip()))
-
-def update_bank(old_name: str, new_name: str, ifsc_code: str, db_path=DB_PATH):
-    with get_conn(db_path) as conn:
-        conn.execute("UPDATE banks SET name=?, ifsc_code=? WHERE name=?",
-                     (new_name.strip(), ifsc_code.strip(), old_name))
-        # Also update any workers using this bank name
-        conn.execute("UPDATE workers SET bank_name=? WHERE bank_name=?",
-                     (new_name.strip(), old_name))
+        conn.execute("UPDATE banks SET name=? WHERE name=?", (new_name.strip(), old_name))
+        conn.execute("UPDATE workers SET bank_name=? WHERE bank_name=?", (new_name.strip(), old_name))
 
 def delete_bank(name: str, db_path=DB_PATH):
     with get_conn(db_path) as conn:
