@@ -699,8 +699,14 @@ class PayrollApp(ctk.CTk):
                 target["detail_att"] = build_record()
 
         # Use a single coalesced trace ÔÇö only one write-back per field change
+        _pending = [None]
+        def _coalesced(*_):
+            if _pending[0]:
+                try: parent.after_cancel(_pending[0])
+                except Exception: pass
+            _pending[0] = parent.after(400, update)
         for _, attr in fields:
-            vars_dict[attr].trace_add("write", update)
+            vars_dict[attr].trace_add("write", _coalesced)
         update()
 
     def _build_att_csv(self, parent):

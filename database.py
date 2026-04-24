@@ -7,7 +7,7 @@ import threading
 from contextlib import contextmanager
 from typing import List, Optional, Dict
 
-_local = threading.local()
+_db_local = threading.local()
 
 from schema import SkillWage, Worker, AttendanceRecord, CompanyConfig, SKILL_CATEGORIES
 from db_cache import cache
@@ -27,17 +27,20 @@ _PRAGMAS = (
 
 @contextmanager
 def get_conn(db_path=DB_PATH):
-    conn = getattr(_local, "conn", None)
-    if conn is None:
+    conn = getattr(_db_local, 'conn', None)
+    if conn is None or getattr(_db_local, 'path', None) != db_path:
         conn = sqlite3.connect(db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         for pragma in _PRAGMAS:
             conn.execute(pragma)
-        _local.conn = conn
+        _db_local.conn = conn
+        _db_local.path = db_path
     try:
-        yield conn; conn.commit()
+        yield conn
+        conn.commit()
     except Exception:
-        conn.rollback(); raise
+        conn.rollback()
+        raise
 
 DDL = """
 CREATE TABLE IF NOT EXISTS units (
