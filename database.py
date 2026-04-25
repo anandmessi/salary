@@ -160,7 +160,7 @@ def update_bank(old_name: str, new_name: str, db_path=DB_PATH):
     with get_conn(db_path) as conn:
         conn.execute("UPDATE banks SET name=? WHERE name=?", (new_name.strip(), old_name))
         conn.execute("UPDATE workers SET bank_name=? WHERE bank_name=?", (new_name.strip(), old_name))
-    cache.invalidate(f"banks:{db_path}", f"workers:{db_path}")
+    cache.invalidate(f"banks:{db_path}", f"workers:{db_path}:active", f"workers:{db_path}:all")
 
 def delete_bank(name: str, db_path=DB_PATH):
     with get_conn(db_path) as conn:
@@ -192,7 +192,7 @@ def rename_unit(old_name: str, new_name: str, db_path=DB_PATH):
     with get_conn(db_path) as conn:
         conn.execute("UPDATE units SET name=? WHERE name=?", (new, old_name))
         conn.execute("UPDATE workers SET unit=? WHERE unit=?", (new, old_name))
-    cache.invalidate(f"units:{db_path}", f"workers:{db_path}")
+    cache.invalidate(f"units:{db_path}", f"workers:{db_path}:active", f"workers:{db_path}:all", f"unit_worker_count:{db_path}")
 
 def delete_unit(name: str, db_path=DB_PATH) -> int:
     with get_conn(db_path) as conn:
@@ -200,7 +200,7 @@ def delete_unit(name: str, db_path=DB_PATH) -> int:
         if count > 0:
             conn.execute("UPDATE workers SET unit='' WHERE unit=?", (name,))
         conn.execute("DELETE FROM units WHERE name=?", (name,))
-    cache.invalidate(f"units:{db_path}", f"workers:{db_path}")
+    cache.invalidate(f"units:{db_path}", f"workers:{db_path}:active", f"workers:{db_path}:all", f"unit_worker_count:{db_path}")
     return count
 
 def unit_worker_count(db_path=DB_PATH) -> Dict[str, int]:
@@ -289,6 +289,55 @@ def get_worker_by_id(worker_id, db_path=DB_PATH):
         row = conn.execute("SELECT * FROM workers WHERE worker_id=?", (worker_id,)).fetchone()
     return Worker.from_dict(dict(row)) if row else None
 
+def import_workers_from_csv(filepath, db_path=DB_PATH):
+    import csv
+    records, errors = [], []
+    with open(filepath, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader, 2):
+            wid = row.get("worker_id", "").strip()
+            name = row.get("name", "").strip()
+            if not wid or not name:
+                errors.append(f"Row {i}: missing worker_id or name")
+                continue
+            try:
+                w = Worker(
+                    worker_id=wid, name=name,
+                    designation=row.get("designation", "").strip(),
+                    bank_account=row.get("bank_account", "").strip(),
+                    bank_name=row.get("bank_name", "").strip(),
+                    ifsc_code=row.get("ifsc_code", "").strip(),
+                    uan_number=row.get("uan_number", "").strip(),
+                    esic_number=row.get("esic_number", "").strip(),
+                    joining_date=row.get("joining_date", "").strip(),
+                    active=str(row.get("active", "1")).strip().lower() in ("1", "true", "yes", "y", "t"),
+                    unit=row.get("unit", "").strip(),
+                    skill_category=row.get("skill_category", "Unskilled").strip()
+                )
+                records.append(w)
+            except Exception as e:
+                errors.append(f"Row {i}: {e}")
+                
+    if records:
+        with get_conn(db_path) as conn:
+            for w in records:
+                conn.execute("""INSERT INTO workers
+                    (worker_id, name, designation, bank_account, bank_name, ifsc_code,
+                     uan_number, esic_number, joining_date, active, unit, skill_category)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(worker_id) DO UPDATE SET
+                    name=excluded.name, designation=excluded.designation,
+                    bank_account=excluded.bank_account, bank_name=excluded.bank_name,
+                    ifsc_code=excluded.ifsc_code, uan_number=excluded.uan_number,
+                    esic_number=excluded.esic_number, joining_date=excluded.joining_date,
+                    active=excluded.active, unit=excluded.unit,
+                    skill_category=excluded.skill_category""",
+                    (w.worker_id, w.name, w.designation, w.bank_account, w.bank_name,
+                     w.ifsc_code, w.uan_number, w.esic_number, w.joining_date,
+                     int(w.active), w.unit, w.skill_category))
+        cache.invalidate(f"workers:{db_path}:active", f"workers:{db_path}:all", f"unit_worker_count:{db_path}")
+    return {"imported": len(records), "errors": errors}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #   ATTENDANCE
@@ -349,7 +398,7 @@ def delete_attendance_for_worker(worker_id: str, month: str = None, db_path=DB_P
 def import_attendance_from_csv(filepath, month, db_path=DB_PATH):
     import csv
     records, errors = [], []
-    workers = {w.worker_id for w in get_all_workers(db_path)}
+    workers = {w.worker_id for w in get_all_workers(db_path, active_only=False)}
     with open(filepath, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for i, row in enumerate(reader, 2):
@@ -381,7 +430,7 @@ def get_workers_and_attendance(month: str, db_path=DB_PATH):
     attendance_dict maps worker_id -> AttendanceRecord.
     Caches both pieces independently so individual invalidation still works.
     """
-    workers = get_all_workers(db_path)
+    workers = get_all_workers(db_path, active_only=False)
     att_list = get_attendance(month, db_path)
     att_dict = {a.worker_id: a for a in att_list}
     return workers, att_dict

@@ -131,11 +131,10 @@ def calculate_payroll(
     att_idx  = {a.worker_id: a for a in attendance if a.month == month}
 
     for w in workers:
-        if not w.active:
-            continue
         att = att_idx.get(w.worker_id)
         if att is None:
-            warnings.append(f"No attendance for {w.name} ({w.worker_id}) in {month}.")
+            if w.active:
+                warnings.append(f"No attendance for {w.name} ({w.worker_id}) in {month}.")
             continue
         sw = skill_wages.get(w.skill_category)
         if sw is None:

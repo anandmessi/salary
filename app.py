@@ -25,7 +25,7 @@ from database import (
     upsert_worker, deactivate_worker, reactivate_worker,
     delete_worker, get_worker_by_id,
     get_config, save_config, get_months_with_data,
-    get_workers_by_unit, import_attendance_from_csv,
+    get_workers_by_unit, import_attendance_from_csv, import_workers_from_csv,
     get_all_units, add_unit, rename_unit, delete_unit,
     unit_worker_count,
     get_all_banks, add_bank, update_bank, delete_bank,
@@ -184,12 +184,22 @@ QLabel#metric_lbl {{
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def month_options():
     today = datetime.date.today()
-    m_list = []
-    for i in range(11, -1, -1):
+    m_set = set()
+    for i in range(11, -3, -1):  # Include 11 past months, current month (0), and 2 future months (-1, -2)
         y, m = today.year, today.month - i
         while m <= 0: m += 12; y -= 1
-        m_list.append(f"{y}-{m:02d}")
-    return m_list
+        while m > 12: m -= 12; y += 1
+        m_set.add(f"{y}-{m:02d}")
+    
+    # Include any historical months that have attendance data
+    try:
+        existing = get_months_with_data()
+        if existing:
+            m_set.update(existing)
+    except Exception:
+        pass
+        
+    return sorted(list(m_set))
 
 def fmt_inr(amount):
     s = f"{abs(amount):,.2f}"; p = s.split(".")
@@ -208,6 +218,18 @@ def _unit_list():
 
 def _unit_filter_list():
     b = get_all_units(); return ["All"] + b if b else ["All"]
+
+def _bank_names():
+    b = get_all_banks(); return b if b else ["(No banks — add in Settings)"]
+
+def sync_combo(cb, items, keep_current=True):
+    cur = cb.currentText()
+    cb.blockSignals(True)
+    cb.clear()
+    cb.addItems(items)
+    if keep_current and cur in items: cb.setCurrentText(cur)
+    elif items: cb.setCurrentIndex(0)
+    cb.blockSignals(False)
 
 def _page_header(layout, title, subtitle):
     row = QHBoxLayout()
@@ -336,7 +358,7 @@ class StyledTable(QTableWidget):
                     tag = tags[r_idx]
                     if tag == "skilled": item.setForeground(QColor("#80CBC4"))
                     elif tag == "semi": item.setForeground(QColor("#FFD54F"))
-                    elif tag == "unskilled": item.setForeground(QColor("#EF9A9A"))
+                    elif tag == "unskilled": item.setForeground(QColor("white"))
                     elif tag == "inactive": item.setForeground(QColor(TEXT_MUTED))
                 self.setItem(r_idx, c_idx, item)
 
@@ -355,8 +377,11 @@ class FetchThread(QThread):
 
 # ══════════════════════════════════════════════════════════════════════════════
 class PayrollApp(QMainWindow):
+    backup_sync_signal = pyqtSignal(str, str)
+
     def __init__(self):
         super().__init__()
+        self.backup_sync_signal.connect(self._update_backup_label)
         self.setWindowTitle("PayrollPro — Professional Payroll Management")
         self.resize(1300, 800)
         self.setMinimumSize(1050, 650)
@@ -386,14 +411,15 @@ class PayrollApp(QMainWindow):
         self._navigate("dashboard")
 
     def _on_backup_sync(self, status: str, timestamp: str):
-        def _update():
-            if "Error" in status or "⚠" in status:
-                self.backup_lbl.setText(f"  🔴 Backup: {timestamp}  ")
-                self.backup_lbl.setStyleSheet(f"color: {DANGER};")
-            else:
-                self.backup_lbl.setText(f"  🟢 Backup: {timestamp}  ")
-                self.backup_lbl.setStyleSheet(f"color: {SUCCESS};")
-        QTimer.singleShot(0, _update)
+        self.backup_sync_signal.emit(status, timestamp)
+
+    def _update_backup_label(self, status: str, timestamp: str):
+        if "Error" in status or "⚠" in status:
+            self.backup_lbl.setText(f"  🔴 Backup: {timestamp}  ")
+            self.backup_lbl.setStyleSheet(f"color: {DANGER};")
+        else:
+            self.backup_lbl.setText(f"  🟢 Backup: {timestamp}  ")
+            self.backup_lbl.setStyleSheet(f"color: {SUCCESS};")
 
     def _build_sidebar(self):
         self.sidebar = QFrame()
@@ -567,6 +593,8 @@ class PayrollApp(QMainWindow):
         layout.addWidget(content)
 
         def refresh():
+            sync_combo(m_cb, month_options())
+            sync_combo(u_cb, _unit_filter_list())
             while content_layout.count():
                 it = content_layout.takeAt(0)
                 if it.widget(): it.widget().deleteLater()
@@ -627,13 +655,18 @@ class PayrollApp(QMainWindow):
                 exp_btn = QPushButton("⬇️ Export CSV")
                 exp_btn.setFixedWidth(120)
                 def exp():
-                    import pandas as pd
+                    import csv
                     path, _ = QFileDialog.getSaveFileName(self, "Save CSV", f"Payroll_{month}.csv", "CSV (*.csv)")
                     if path:
-                        data = [{"Emp name": r.worker_name, "Total Sal": round(r.net_pay, 2),
-                                 "IFSC Code": r.ifsc_code, "Account Number": r.bank_account} for r in results]
-                        pd.DataFrame(data).to_csv(path, index=False)
-                        self.set_message(f"✅ CSV → {path}", SUCCESS)
+                        try:
+                            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                                writer = csv.writer(f)
+                                writer.writerow(["Emp name", "Total Sal", "IFSC Code", "Account Number"])
+                                for r in results:
+                                    writer.writerow([r.worker_name, round(r.net_pay, 2), r.ifsc_code, r.bank_account])
+                            self.set_message(f"✅ CSV → {path}", SUCCESS)
+                        except Exception as e:
+                            self.set_message(f"⚠️ Export error: {e}", DANGER)
                 exp_btn.clicked.connect(exp)
                 content_layout.addWidget(exp_btn)
                 
@@ -695,6 +728,8 @@ class PayrollApp(QMainWindow):
             self.set_message(f"✅ Saved {len(records)} records for {month}", SUCCESS)
             
         def refresh():
+            sync_combo(m_cb, month_options())
+            sync_combo(u_cb, _unit_filter_list())
             workers = get_all_workers()
             unit = u_cb.currentText()
             if unit != "All": workers = [w for w in workers if w.unit == unit]
@@ -753,6 +788,7 @@ class PayrollApp(QMainWindow):
             if fp:
                 res = import_attendance_from_csv(fp, m_cb.currentText())
                 self.set_message(f"✅ Imported {res['imported']} records.", SUCCESS)
+                self._navigate("attendance")
         b2 = QPushButton("📁 Import CSV")
         b2.clicked.connect(imp)
         cl.addWidget(b2); cl.addStretch()
@@ -769,8 +805,10 @@ class PayrollApp(QMainWindow):
         
         tab_all = QWidget(); tl = QVBoxLayout(tab_all)
         tab_add = QWidget(); al = QVBoxLayout(tab_add)
+        tab_csv = QWidget(); cl = QVBoxLayout(tab_csv)
         tabs.addTab(tab_all, "👥 All Workers")
         tabs.addTab(tab_add, "➕ Add New Worker")
+        tabs.addTab(tab_csv, "📁 CSV Import")
         
         # All Workers
         fc = QFrame(); fc.setObjectName("surface2")
@@ -839,6 +877,11 @@ class PayrollApp(QMainWindow):
         table.itemSelectionChanged.connect(row_sel)
 
         def refresh():
+            sync_combo(u_cb, _unit_filter_list())
+            try:
+                sync_combo(e_unit, _unit_list())
+                sync_combo(e_bank_name, _bank_names())
+            except NameError: pass
             workers = get_all_workers(active_only=False)
             filt = u_cb.currentText()
             q = s_ent.text().strip().lower()
@@ -921,6 +964,43 @@ class PayrollApp(QMainWindow):
         btn_sv.clicked.connect(sv)
         fl.addWidget(btn_sv)
         al.addWidget(form); al.addStretch()
+        
+        self._build_workers_csv(cl)
+
+    def _build_workers_csv(self, layout):
+        layout.addWidget(QLabel("Upload a CSV to import new workers in bulk.", styleSheet=f"color: {TEXT_SECONDARY};"))
+        info = QFrame(); info.setObjectName("card"); il = QVBoxLayout(info)
+        il.addWidget(QLabel("<b>Supported columns:</b>"))
+        il.addWidget(QLabel("worker_id, name, designation, bank_account, bank_name, ifsc_code,\nuan_number, esic_number, joining_date, active, unit, skill_category", styleSheet=f"color: {TEXT_MUTED}; font-size: 10px;"))
+        layout.addWidget(info)
+        
+        def dl():
+            path, _ = QFileDialog.getSaveFileName(self, "Save Template", "workers_template.csv", "CSV (*.csv)")
+            if path:
+                with open(path, "w", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(["worker_id","name","designation","bank_account","bank_name","ifsc_code",
+                                "uan_number","esic_number","joining_date","active","unit","skill_category"])
+                    w.writerow(["EMP001","John Doe","Helper","123456789","SBI","SBIN0001234",
+                                "100000000000","2000000000","01/01/2026","1","Unit A","Unskilled"])
+        b1 = QPushButton("📥 Download Template")
+        b1.setStyleSheet(f"background-color: {SURFACE_3};")
+        b1.clicked.connect(dl)
+        b1.setFixedWidth(160)
+        layout.addWidget(b1)
+        
+        def imp():
+            fp, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV (*.csv)")
+            if fp:
+                res = import_workers_from_csv(fp)
+                self.set_message(f"✅ Imported {res['imported']} workers.", SUCCESS)
+                self._navigate("workers")
+                
+        b2 = QPushButton("📁 Import CSV")
+        b2.clicked.connect(imp)
+        b2.setFixedWidth(160)
+        layout.addWidget(b2)
+        layout.addStretch()
 
     # ══════════════════════════════════════════════════════════════════════
     #   UNITS
@@ -1041,6 +1121,8 @@ class PayrollApp(QMainWindow):
         layout.addWidget(content)
         
         def refresh():
+            sync_combo(m_cb, month_options())
+            sync_combo(u_cb, _unit_filter_list())
             while content_layout.count():
                 it = content_layout.takeAt(0)
                 if it.widget(): it.widget().deleteLater()
@@ -1080,8 +1162,10 @@ class PayrollApp(QMainWindow):
                             gen = generate_bulk_pdfs(results, get_config(), td, zip_output=True, zip_only=True)
                             if gen.get("zip_path"):
                                 import shutil; shutil.move(gen["zip_path"], path)
-                            self.set_message("✅ Done", SUCCESS)
-                        threading.Thread(target=do, daemon=True).start()
+                            return True
+                        self._pdf_thread = FetchThread(do)
+                        self._pdf_thread.result_ready.connect(lambda _: self.set_message("✅ Done", SUCCESS))
+                        self._pdf_thread.start()
                 
                 bz = QPushButton("📦 Download All as ZIP"); bz.clicked.connect(gen_all); content_layout.addWidget(bz)
                 
