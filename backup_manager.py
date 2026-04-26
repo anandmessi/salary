@@ -23,6 +23,15 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
+import sys
+
+def _get_base_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+BASE_DIR = _get_base_dir()
+DEFAULT_DB_PATH = os.path.join(BASE_DIR, "payroll.db")
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +78,7 @@ class BackupManager:
 
     def __init__(
         self,
-        db_path: str = "payroll.db",
+        db_path: str = DEFAULT_DB_PATH,
         on_sync: Optional[Callable[[str, str], None]] = None,
     ):
         """

@@ -12,7 +12,15 @@ import os
 import shutil
 import tempfile
 import zipfile
+import sys
 from typing import List
+
+def resource_path(relative_path: str) -> str:
+    if getattr(sys, 'frozen', False):
+        base = sys._MEIPASS
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, relative_path)
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm

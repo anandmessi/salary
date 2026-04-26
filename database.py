@@ -13,7 +13,16 @@ from schema import SkillWage, Worker, AttendanceRecord, CompanyConfig, SKILL_CAT
 from db_cache import cache
 
 logger  = logging.getLogger(__name__)
-DB_PATH = "payroll.db"
+
+import sys, os
+
+def _get_base_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+BASE_DIR = _get_base_dir()
+DB_PATH  = os.path.join(BASE_DIR, "payroll.db")
 
 # ── PRAGMAs applied once at first connection ───────────────────────────────────
 _PRAGMAS = (

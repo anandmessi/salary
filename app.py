@@ -6,6 +6,13 @@ Run with:  python app.py
 """
 
 import os, sys, csv, datetime, threading, tempfile
+
+if getattr(sys, 'frozen', False):
+    os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = os.path.join(
+        sys._MEIPASS, 'PyQt6', 'Qt6', 'plugins', 'platforms'
+    )
+
+from version import APP_NAME, APP_VERSION
 from backup_manager import BackupManager
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -381,8 +388,9 @@ class PayrollApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self._active_threads = []
         self.backup_sync_signal.connect(self._update_backup_label)
-        self.setWindowTitle("PayrollPro — Professional Payroll Management")
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — Professional Payroll Management")
         self.resize(1300, 800)
         self.setMinimumSize(1050, 650)
         self.setStyleSheet(QSS)
@@ -409,6 +417,10 @@ class PayrollApp(QMainWindow):
         threading.Thread(target=_prewarm, daemon=True).start()
         
         self._navigate("dashboard")
+
+    def closeEvent(self, event):
+        self._backup_mgr.stop()
+        event.accept()
 
     def _on_backup_sync(self, status: str, timestamp: str):
         self.backup_sync_signal.emit(status, timestamp)
@@ -521,9 +533,11 @@ class PayrollApp(QMainWindow):
         v.addWidget(sb)
         self.main_layout.addLayout(v, 1)
 
-    def set_message(self, msg, color=TEXT_MUTED):
+    def set_message(self, msg: str, color: str = TEXT_MUTED, auto_clear: bool = True):
         self.status_lbl.setText(f"  {msg}")
         self.status_lbl.setStyleSheet(f"font-size: 10px; color: {color};")
+        if auto_clear and color != DANGER:
+            QTimer.singleShot(4000, lambda: self.set_message("Ready", TEXT_MUTED, False))
 
     def _navigate(self, key):
         for k, btn in self._nav_buttons.items():
@@ -559,10 +573,12 @@ class PayrollApp(QMainWindow):
         self.set_message(f"Viewing: {key.replace('_',' ').title()}")
 
     def _async_load(self, fetch_fn, render_fn):
-        self.thread = FetchThread(fetch_fn)
-        self.thread.result_ready.connect(render_fn)
-        self.thread.error_ready.connect(lambda e: self.set_message(f"⚠️ Load error: {e}", DANGER))
-        self.thread.start()
+        thread = FetchThread(fetch_fn)
+        thread.result_ready.connect(render_fn)
+        thread.error_ready.connect(lambda e: self.set_message(f"⚠️ Load error: {e}", DANGER))
+        thread.finished.connect(lambda: self._active_threads.remove(thread) if thread in self._active_threads else None)
+        self._active_threads.append(thread)
+        thread.start()
 
     # ══════════════════════════════════════════════════════════════════════
     #   DASHBOARD
@@ -989,35 +1005,6 @@ class PayrollApp(QMainWindow):
             else: act_bar.setVisible(False)
         table.itemSelectionChanged.connect(row_sel)
 
-        def refresh():
-            sync_combo(u_cb, _unit_filter_list())
-            try:
-                sync_combo(e_unit, _unit_list())
-                sync_combo(e_bank_name, _bank_names())
-            except NameError: pass
-            workers = get_all_workers(active_only=False)
-            filt = u_cb.currentText()
-            q = s_ent.text().strip().lower()
-            if filt != "All": workers = [w for w in workers if w.unit == filt]
-            if q: workers = [w for w in workers if q in w.name.lower() or q in w.worker_id.lower()]
-            
-            tags = []
-            rows = []
-            for w in workers:
-                rows.append([w.worker_id, w.name, w.unit, w.skill_category,
-                             w.designation, w.bank_name, w.bank_account, w.ifsc_code,
-                             w.uan_number, w.esic_number, "● Active" if w.active else "○ Inactive"])
-                if not w.active: tags.append("inactive")
-                elif w.skill_category == "Skilled": tags.append("skilled")
-                elif "Semi" in w.skill_category: tags.append("semi")
-                else: tags.append("unskilled")
-            table.insert_rows(rows, tags)
-            act_bar.setVisible(False)
-
-        u_cb.currentTextChanged.connect(refresh)
-        s_ent.textChanged.connect(refresh)
-        refresh()
-
         # Add Worker
         form = QFrame(); form.setObjectName("card")
         fl = QVBoxLayout(form); fl.setContentsMargins(16, 16, 16, 16)
@@ -1053,6 +1040,35 @@ class PayrollApp(QMainWindow):
         mk_row([("UAN", e_uan), ("ESIC", e_esic), ("", QWidget())])
         
         fl.addWidget(grid)
+
+        def refresh():
+            sync_combo(u_cb, _unit_filter_list())
+            sync_combo(e_unit, _unit_list())
+            sync_combo(e_bank_name, _bank_names())
+            workers = get_all_workers(active_only=False)
+            filt = u_cb.currentText()
+            q = s_ent.text().strip().lower()
+            if filt != "All": workers = [w for w in workers if w.unit == filt]
+            if q: workers = [w for w in workers if q in w.name.lower() or q in w.worker_id.lower()]
+            
+            tags = []
+            rows = []
+            for w in workers:
+                rows.append([w.worker_id, w.name, w.unit, w.skill_category,
+                             w.designation, w.bank_name, w.bank_account, w.ifsc_code,
+                             w.uan_number, w.esic_number, "● Active" if w.active else "○ Inactive"])
+                if not w.active: tags.append("inactive")
+                elif w.skill_category == "Skilled": tags.append("skilled")
+                elif "Semi" in w.skill_category: tags.append("semi")
+                else: tags.append("unskilled")
+            table.insert_rows(rows, tags)
+            act_bar.setVisible(False)
+
+        u_cb.currentTextChanged.connect(refresh)
+        s_ent.textChanged.connect(refresh)
+        refresh()
+
+
         btn_sv = QPushButton("💾 Save Worker")
         btn_sv.setStyleSheet(f"background-color: {SUCCESS}; height: 35px;")
         
@@ -1476,9 +1492,6 @@ class PayrollApp(QMainWindow):
         lay.addWidget(table)
         dlg.exec()
 
-def _bank_names():
-    bs = get_all_banks()
-    return bs if bs else ["(No banks — add in Settings)"]
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
