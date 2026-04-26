@@ -1304,39 +1304,7 @@ class PayrollApp(QMainWindow):
                 
                 bz = QPushButton("📦 Download All as ZIP"); bz.clicked.connect(gen_all); content_layout.addWidget(bz)
                 
-                def email_all():
-                    cfg = get_config()
-                    if not cfg.target_email:
-                        QMessageBox.warning(self, "No Target Email", "Please configure an automation target email in the Settings tab first.")
-                        return
-                    self.set_message("⏳ Generating and Emailing...", ACCENT)
-                    def do_email():
-                        td = tempfile.mkdtemp()
-                        gen = generate_bulk_pdfs(results, cfg, td, zip_output=True, zip_only=True)
-                        zip_path = gen.get("zip_path")
-                        if zip_path:
-                            try:
-                                import smtplib
-                                from email.message import EmailMessage
-                                msg = EmailMessage()
-                                msg['Subject'] = f'Salary Slips for {month}'
-                                msg['From'] = cfg.email or "payroll@localhost"
-                                msg['To'] = cfg.target_email
-                                msg.set_content(f'Attached are the generated salary slips for {month}.')
-                                with open(zip_path, 'rb') as f:
-                                    msg.add_attachment(f.read(), maintype='application', subtype='zip', filename=os.path.basename(zip_path))
-                                with smtplib.SMTP('localhost', 25) as s: # Default local relay
-                                    s.send_message(msg)
-                                return f"Email successfully sent to {cfg.target_email}"
-                            except Exception as e:
-                                return f"Slips generated, but SMTP failed: {e}"
-                        return "No slips generated"
-                        
-                    self._pdf_thread = FetchThread(do_email)
-                    self._pdf_thread.result_ready.connect(lambda msg: self.set_message(f"✅ {msg}" if "failed" not in msg else f"⚠️ {msg}", SUCCESS if "failed" not in msg else WARNING_CLR))
-                    self._pdf_thread.start()
-                    
-                be = QPushButton("📧 Email All Slips to Target"); be.setStyleSheet("background-color: #3B82F6;"); be.clicked.connect(email_all); content_layout.addWidget(be)
+
                 
                 sc = QHBoxLayout()
                 sel_w = QComboBox()
