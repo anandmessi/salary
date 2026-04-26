@@ -111,36 +111,52 @@ QPushButton#sidebarBtn[active="true"] {{
     color: white;
 }}
 QLineEdit, QComboBox {{
-    background-color: {SURFACE};
-    border: 1px solid {TEXT_MUTED};
-    border-radius: 4px;
-    padding: 4px;
+    background-color: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 5px;
+    padding: 6px 10px;
     color: {TEXT_PRIMARY};
+}}
+QLineEdit:focus, QComboBox:focus {{
+    border: 1px solid {ACCENT};
+    background-color: rgba(255, 255, 255, 0.05);
 }}
 QComboBox::drop-down {{
     border: none;
+    width: 20px;
 }}
 QComboBox QAbstractItemView {{
     background-color: {SURFACE_3};
     color: {TEXT_PRIMARY};
     selection-background-color: {ACCENT};
+    border-radius: 4px;
+    border: 1px solid {CARD_BORDER};
 }}
 QTableWidget {{
     background-color: {SURFACE_3};
-    alternate-background-color: #1A1A2E;
-    gridline-color: {CARD_BORDER};
+    alternate-background-color: #151522;
+    gridline-color: rgba(255, 255, 255, 0.03);
     border: none;
+    outline: none;
+}}
+QTableWidget::item {{
+    padding: 4px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.02);
+}}
+QTableWidget::item:selected {{
+    background-color: rgba(66, 165, 245, 0.15);
 }}
 QHeaderView::section {{
-    background-color: #0D2A4E;
+    background-color: #0B1D33;
     color: #90CAF9;
     font-weight: bold;
     border: none;
-    padding: 4px;
+    border-bottom: 2px solid #1E3A5F;
+    padding: 8px 6px;
 }}
 QTabWidget::pane {{
     border: none;
-    background-color: {SURFACE_2};
+    background-color: transparent;
 }}
 QTabBar::tab {{
     background-color: {SURFACE_3};
@@ -337,16 +353,19 @@ class WorkerDelegate(QStyledItemDelegate):
             self.db_update_cb(index.row())
 
 class StyledTable(QTableWidget):
-    def __init__(self, columns, column_widths=None, parent=None, editable=False, db_update_cb=None):
+    def __init__(self, columns, column_widths=None, parent=None, editable=False, db_update_cb=None, stretch_last=True):
         super().__init__(parent)
         self.setColumnCount(len(columns))
         self.setHorizontalHeaderLabels(columns)
         self.verticalHeader().setVisible(False)
         self.setAlternatingRowColors(True)
-        self.horizontalHeader().setStretchLastSection(True)
+        self.horizontalHeader().setStretchLastSection(stretch_last)
+        self.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         if column_widths:
             for i, w in enumerate(column_widths):
+                if stretch_last and i == len(columns) - 1:
+                    continue
                 self.setColumnWidth(i, w)
         if editable:
             self.delegate = WorkerDelegate(self, db_update_cb)
@@ -355,12 +374,15 @@ class StyledTable(QTableWidget):
         else:
             self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
 
-    def insert_rows(self, rows, tags=None):
+    def insert_rows(self, rows, tags=None, checkable_col=None):
         self.setRowCount(0)
         self.setRowCount(len(rows))
         for r_idx, row in enumerate(rows):
             for c_idx, val in enumerate(row):
                 item = QTableWidgetItem(str(val))
+                if checkable_col is not None and c_idx == checkable_col:
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(Qt.CheckState.Unchecked)
                 if tags and r_idx < len(tags):
                     tag = tags[r_idx]
                     if tag == "skilled": item.setForeground(QColor("#80CBC4"))
@@ -702,7 +724,7 @@ class PayrollApp(QMainWindow):
                 for r in results:
                     unit_totals[r.unit] = unit_totals.get(r.unit, 0) + r.net_pay
                 
-                max_val = max(unit_totals.values()) if unit_totals else 1
+                total_val = sum(unit_totals.values()) if unit_totals else 1
                 for un, total in sorted(unit_totals.items(), key=lambda x: -x[1]):
                     r_lay = QHBoxLayout()
                     r_lay.addWidget(QLabel(un or "Unassigned"), 1)
@@ -713,12 +735,13 @@ class PayrollApp(QMainWindow):
                     bar = QFrame()
                     bar.setStyleSheet(f"background-color: {ACCENT}; border-radius: 4px;")
                     bar.setFixedHeight(12)
-                    pct = max(1, int((total / max_val) * 100))
+                    pct_val = (total / total_val) * 100
+                    pct = max(1, int(pct_val))
                     bar_l.addWidget(bar, pct)
                     bar_l.addStretch(100 - pct)
                     
                     r_lay.addWidget(bar_container, 4)
-                    r_lay.addWidget(QLabel(fmt_inr(total)), 1)
+                    r_lay.addWidget(QLabel(f"{fmt_inr(total)} ({pct_val:.1f}%)"), 1)
                     chart_l.addLayout(r_lay)
                 
                 content_layout.addWidget(chart_w)
@@ -818,7 +841,7 @@ class PayrollApp(QMainWindow):
         cl.addStretch()
         layout.addWidget(ctrl)
         
-        table = StyledTable(("ID","Name","Unit","Skill","Designation","Days","OT Hrs","DA","HRA","CCA","Bonus","Arrears","Adv Repay"), [60,140,80,80,120,50,60,60,60,60,60,70,80], editable=True)
+        table = StyledTable(("ID","Name","Unit","Skill","Designation","Days","OT Hrs","DA","HRA","CCA","Bonus","Arrears","Adv Repay"), [60,140,80,80,120,50,60,60,60,60,60,70,80], editable=True, stretch_last=True)
         layout.addWidget(table, 1)
         
         self._att_workers = []
@@ -950,60 +973,85 @@ class PayrollApp(QMainWindow):
         tl.addWidget(fc)
         
         def _db_cb(row):
-            wid = table.item(row, 0).text()
+            wid = table.item(row, 1).text()
             w_obj = get_worker_by_id(wid)
-            name = table.item(row, 1).text().strip()
+            name = table.item(row, 2).text().strip()
             if not name: return
-            bname = table.item(row, 5).text().strip()
+            bname = table.item(row, 6).text().strip()
             if bname.startswith("(No"): bname = ""
             upsert_worker(Worker(
-                worker_id=wid, name=name, unit=table.item(row, 2).text().strip(),
-                skill_category=table.item(row, 3).text().strip(),
-                designation=table.item(row, 4).text().strip(),
-                bank_name=bname, bank_account=table.item(row, 6).text().strip(),
-                ifsc_code=table.item(row, 7).text().strip(),
-                uan_number=table.item(row, 8).text().strip(),
-                esic_number=table.item(row, 9).text().strip(),
+                worker_id=wid, name=name, unit=table.item(row, 3).text().strip(),
+                skill_category=table.item(row, 4).text().strip(),
+                designation=table.item(row, 5).text().strip(),
+                bank_name=bname, bank_account=table.item(row, 7).text().strip(),
+                ifsc_code=table.item(row, 8).text().strip(),
+                uan_number=table.item(row, 9).text().strip(),
+                esic_number=table.item(row, 10).text().strip(),
                 joining_date=w_obj.joining_date if w_obj else "",
                 active=w_obj.active if w_obj else True))
             self.set_message(f"✅ {wid} auto-saved!", SUCCESS)
 
-        cols = ("ID", "Name", "Unit", "Skill", "Designation", "Bank", "A/C", "IFSC", "UAN", "ESIC", "Status")
-        widths = [55, 140, 80, 80, 90, 100, 110, 95, 85, 75, 70]
-        table = StyledTable(cols, widths, editable=True, db_update_cb=_db_cb)
+        cols = ("Sel", "ID", "Name", "Unit", "Skill", "Designation", "Bank", "A/C", "IFSC", "UAN", "ESIC", "Status")
+        widths = [30, 55, 140, 80, 80, 90, 100, 110, 95, 85, 75, 70]
+        table = StyledTable(cols, widths, editable=True, db_update_cb=_db_cb, stretch_last=True)
         tl.addWidget(table, 1)
         
         act_bar = QFrame(); act_bar.setStyleSheet("background-color: #0D2A4E; border-radius: 8px;"); act_bar.setFixedHeight(42)
         abl = QHBoxLayout(act_bar)
-        lbl_ab = QLabel(""); lbl_ab.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;"); abl.addWidget(lbl_ab); abl.addStretch()
+        lbl_ab = QLabel("Bulk Actions (Use checkboxes or Shift+Click rows):"); lbl_ab.setStyleSheet(f"color: {TEXT_SECONDARY}; font-weight: bold;"); abl.addWidget(lbl_ab); abl.addStretch()
         
-        def tgl():
-            row = table.currentRow()
-            if row < 0: return
-            wid = table.item(row, 0).text()
-            w = get_worker_by_id(wid)
-            if w.active: deactivate_worker(wid)
-            else: reactivate_worker(wid)
-            refresh()
-        def del_w():
-            row = table.currentRow()
-            if row < 0: return
-            wid = table.item(row, 0).text()
-            if QMessageBox.question(self, "Delete", f"Delete {wid}?") == QMessageBox.StandardButton.Yes:
-                delete_worker(wid); refresh()
+        def _sync_checkboxes():
+            table.blockSignals(True)
+            sel_rows = set(r.row() for r in table.selectionModel().selectedRows())
+            for i in range(table.rowCount()):
+                item = table.item(i, 0)
+                if item:
+                    item.setCheckState(Qt.CheckState.Checked if i in sel_rows else Qt.CheckState.Unchecked)
+            table.blockSignals(False)
+        table.itemSelectionChanged.connect(_sync_checkboxes)
+
+        def _item_changed(item):
+            if item.column() == 0:
+                table.blockSignals(True)
+                from PyQt6.QtCore import QItemSelectionModel
+                idx = table.model().index(item.row(), 0)
+                if item.checkState() == Qt.CheckState.Checked:
+                    table.selectionModel().select(idx, QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+                else:
+                    table.selectionModel().select(idx, QItemSelectionModel.SelectionFlag.Deselect | QItemSelectionModel.SelectionFlag.Rows)
+                table.blockSignals(False)
+        table.itemChanged.connect(_item_changed)
+        
+        def get_selected_wids():
+            wids = set()
+            for i in range(table.rowCount()):
+                if table.item(i, 0).checkState() == Qt.CheckState.Checked:
+                    wids.add(table.item(i, 1).text())
+            for r in table.selectionModel().selectedRows():
+                wids.add(table.item(r.row(), 1).text())
+            return list(wids)
+
+        def bulk_toggle():
+            wids = get_selected_wids()
+            if wids and QMessageBox.question(self, "Bulk Toggle", f"Toggle status for {len(wids)} workers?") == QMessageBox.StandardButton.Yes:
+                for wid in wids:
+                    w = get_worker_by_id(wid)
+                    if w.active: deactivate_worker(wid)
+                    else: reactivate_worker(wid)
+                refresh()
+                self.set_message(f"✅ Toggled {len(wids)} workers", SUCCESS)
                 
-        b_tgl = QPushButton("⏸ Toggle"); b_tgl.setStyleSheet(f"background-color: {WARNING_CLR};"); b_tgl.clicked.connect(tgl); abl.addWidget(b_tgl)
-        b_del = QPushButton("🗑️ Delete"); b_del.setStyleSheet(f"background-color: {DANGER};"); b_del.clicked.connect(del_w); abl.addWidget(b_del)
-        act_bar.setVisible(False)
+        def bulk_del():
+            wids = get_selected_wids()
+            if wids and QMessageBox.question(self, "Bulk Delete", f"Permanently delete {len(wids)} workers?") == QMessageBox.StandardButton.Yes:
+                for wid in wids: delete_worker(wid)
+                refresh()
+                self.set_message(f"✅ Deleted {len(wids)} workers", SUCCESS)
+                
+        b_tgl = QPushButton("⏸ Bulk Toggle"); b_tgl.setStyleSheet(f"background-color: {WARNING_CLR};"); b_tgl.clicked.connect(bulk_toggle); abl.addWidget(b_tgl)
+        b_del = QPushButton("🗑️ Bulk Delete"); b_del.setStyleSheet(f"background-color: {DANGER};"); b_del.clicked.connect(bulk_del); abl.addWidget(b_del)
+        act_bar.setVisible(True)
         tl.addWidget(act_bar)
-        
-        def row_sel():
-            row = table.currentRow()
-            if row >= 0:
-                act_bar.setVisible(True)
-                lbl_ab.setText(f"✏️ {table.item(row, 0).text()} — {table.item(row, 1).text()}")
-            else: act_bar.setVisible(False)
-        table.itemSelectionChanged.connect(row_sel)
 
         # Add Worker
         form = QFrame(); form.setObjectName("card")
@@ -1054,15 +1102,15 @@ class PayrollApp(QMainWindow):
             tags = []
             rows = []
             for w in workers:
-                rows.append([w.worker_id, w.name, w.unit, w.skill_category,
+                rows.append(["", w.worker_id, w.name, w.unit, w.skill_category,
                              w.designation, w.bank_name, w.bank_account, w.ifsc_code,
                              w.uan_number, w.esic_number, "● Active" if w.active else "○ Inactive"])
                 if not w.active: tags.append("inactive")
                 elif w.skill_category == "Skilled": tags.append("skilled")
                 elif "Semi" in w.skill_category: tags.append("semi")
                 else: tags.append("unskilled")
-            table.insert_rows(rows, tags)
-            act_bar.setVisible(False)
+            table.insert_rows(rows, tags, checkable_col=0)
+            act_bar.setVisible(True)
 
         u_cb.currentTextChanged.connect(refresh)
         s_ent.textChanged.connect(refresh)
@@ -1303,7 +1351,6 @@ class PayrollApp(QMainWindow):
                         self._pdf_thread.start()
                 
                 bz = QPushButton("📦 Download All as ZIP"); bz.clicked.connect(gen_all); content_layout.addWidget(bz)
-                
 
                 
                 sc = QHBoxLayout()
@@ -1351,19 +1398,16 @@ class PayrollApp(QMainWindow):
         gl.addLayout(r2)
         e_wd = QLineEdit(str(cfg.working_days)); e_wd.setFixedWidth(80)
         v5 = QVBoxLayout(); v5.addWidget(QLabel("Working Days / Month")); v5.addWidget(e_wd); gl.addLayout(v5)
+        cfl.addLayout(gl)
+        
         cfl.addWidget(QLabel("⚖️ Statutory Rates", styleSheet="font-size: 15px; font-weight: bold; margin-top: 10px;"))
+        gl2 = QVBoxLayout()
         r3 = QHBoxLayout()
         e_epf = QLineEdit(str(cfg.epf_rate)); v6 = QVBoxLayout(); v6.addWidget(QLabel("EPF Rate (%)")); v6.addWidget(e_epf); r3.addLayout(v6)
         e_esi = QLineEdit(str(cfg.esi_rate)); v7 = QVBoxLayout(); v7.addWidget(QLabel("ESI Rate (%)")); v7.addWidget(e_esi); r3.addLayout(v7)
         e_esic = QLineEdit(str(cfg.esi_ceiling)); v8 = QVBoxLayout(); v8.addWidget(QLabel("ESI Ceiling (₹)")); v8.addWidget(e_esic); r3.addLayout(v8)
-        gl.addLayout(r3)
-        
-        cfl.addWidget(QLabel("📧 Email Automation", styleSheet="font-size: 15px; font-weight: bold; margin-top: 10px;"))
-        r4 = QHBoxLayout()
-        e_targ = QLineEdit(cfg.target_email); e_targ.setPlaceholderText("Recipient email for automated slips..."); v9 = QVBoxLayout(); v9.addWidget(QLabel("Target Email Address")); v9.addWidget(e_targ); r4.addLayout(v9)
-        gl.addLayout(r4)
-        
-        cfl.addLayout(gl)
+        gl2.addLayout(r3)
+        cfl.addLayout(gl2)
         
         bs = QPushButton("💾 Save Settings"); bs.setStyleSheet(f"background-color: {SUCCESS}; height: 35px;")
         def sv():
@@ -1373,10 +1417,9 @@ class PayrollApp(QMainWindow):
                 esi = float(e_esi.text())
                 esic = float(e_esic.text())
             except: return
-            save_config(CompanyConfig(e_cn.text(), e_a1.text(), e_a2.text(), e_ph.text(), e_em.text(), wd, epf, esi, esic, e_targ.text()))
+            save_config(CompanyConfig(e_cn.text(), e_a1.text(), e_a2.text(), e_ph.text(), e_em.text(), wd, epf, esi, esic, ""))
             self.set_message("✅ Settings saved!", SUCCESS)
         bs.clicked.connect(sv); cfl.addWidget(bs)
-        cwl.addWidget(cf)
 
         # Bank Management Section
         bf = QFrame(); bf.setObjectName("card")
@@ -1430,14 +1473,21 @@ class PayrollApp(QMainWindow):
         btn_b_add.clicked.connect(add_bank_action)
         refresh_banks()
         
-        cwl.addWidget(bf, 1)
+        tabs = QTabWidget()
+        tabs.addTab(cf, "🏢 General Settings")
+        tabs.addTab(bf, "🏦 Bank Management")
+        cwl.addWidget(tabs, 1)
 
     def _show_audit_logs(self):
-        from PyQt6.QtWidgets import QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QVBoxLayout
-        from database import get_payroll_runs
+        from PyQt6.QtWidgets import QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QVBoxLayout, QPushButton, QHBoxLayout, QWidget, QMessageBox, QFileDialog
+        from database import get_payroll_runs, get_payroll_run
+        import json
+        from pdf_generator import generate_bulk_pdfs
+        from schema import PayrollResult
+        
         dlg = QDialog(self)
         dlg.setWindowTitle("Payroll Audit Logs / History")
-        dlg.resize(700, 400)
+        dlg.resize(850, 450)
         lay = QVBoxLayout(dlg)
         
         runs = get_payroll_runs()
@@ -1446,9 +1496,15 @@ class PayrollApp(QMainWindow):
             dlg.exec()
             return
             
-        table = QTableWidget(len(runs), 5)
-        table.setHorizontalHeaderLabels(["ID", "Month", "Run Date", "Workers", "Total Net Pay"])
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table = QTableWidget(len(runs), 6)
+        table.setHorizontalHeaderLabels(["ID", "Month", "Run Date", "Workers", "Total Net Pay", "Actions"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        table.setColumnWidth(0, 50)
+        table.setColumnWidth(1, 100)
+        table.setColumnWidth(2, 120)
+        table.setColumnWidth(3, 80)
+        table.setColumnWidth(4, 150)
+        table.horizontalHeader().setStretchLastSection(True)
         
         for i, r in enumerate(runs):
             table.setItem(i, 0, QTableWidgetItem(str(r["id"])))
@@ -1456,6 +1512,30 @@ class PayrollApp(QMainWindow):
             table.setItem(i, 2, QTableWidgetItem(r["run_date"].split("T")[0]))
             table.setItem(i, 3, QTableWidgetItem(str(r["worker_count"])))
             table.setItem(i, 4, QTableWidgetItem(fmt_inr(r["total_net"])))
+            
+            w = QWidget()
+            wl = QHBoxLayout(w)
+            wl.setContentsMargins(4, 2, 4, 2)
+            
+            btn_view = QPushButton("📦 Re-download ZIP")
+            btn_view.setStyleSheet("background-color: #3B82F6; color: white; padding: 4px; border-radius: 4px;")
+            
+            def view_run(run_id=r["id"]):
+                run_data = get_payroll_run(run_id)
+                if not run_data: return
+                od = QFileDialog.getExistingDirectory(dlg, "Output Folder for Re-downloaded ZIP")
+                if not od: return
+                try:
+                    res_dicts = json.loads(run_data["results_json"])
+                    results = [PayrollResult(**d) for d in res_dicts]
+                    generate_bulk_pdfs(results, get_config(), od, zip_output=True, zip_only=True)
+                    QMessageBox.information(dlg, "Success", f"ZIP successfully re-generated from the snapshot into:\n{od}")
+                except Exception as e:
+                    QMessageBox.warning(dlg, "Error", f"Failed to restore: {e}")
+                    
+            btn_view.clicked.connect(view_run)
+            wl.addWidget(btn_view)
+            table.setCellWidget(i, 5, w)
             
         lay.addWidget(table)
         dlg.exec()
