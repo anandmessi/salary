@@ -1224,7 +1224,60 @@ class PayrollApp(QMainWindow):
             self.set_message("✅ Settings saved!", SUCCESS)
         bs.clicked.connect(sv); cfl.addWidget(bs)
         cwl.addWidget(cf)
-        cwl.addStretch()
+
+        # Bank Management Section
+        bf = QFrame(); bf.setObjectName("card")
+        bfl = QVBoxLayout(bf); bfl.setContentsMargins(20, 16, 20, 16)
+        bfl.addWidget(QLabel("🏦 Bank Management", styleSheet="font-size: 15px; font-weight: bold;"))
+        
+        add_b_lay = QHBoxLayout()
+        e_b_new = QLineEdit(); e_b_new.setPlaceholderText("New Bank name..."); add_b_lay.addWidget(e_b_new)
+        btn_b_add = QPushButton("➕ Add Bank"); btn_b_add.setStyleSheet(f"background-color: {SUCCESS};")
+        add_b_lay.addWidget(btn_b_add)
+        bfl.addLayout(add_b_lay)
+        
+        bank_list_w = QWidget()
+        bank_list_lay = QVBoxLayout(bank_list_w)
+        bank_list_lay.setContentsMargins(0, 10, 0, 0)
+        
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(bank_list_w)
+        bfl.addWidget(scroll, 1)
+        
+        def refresh_banks():
+            while bank_list_lay.count():
+                it = bank_list_lay.takeAt(0)
+                if it.widget(): it.widget().deleteLater()
+            banks = get_all_banks()
+            for b in banks:
+                b_row = QFrame()
+                b_row_lay = QHBoxLayout(b_row); b_row_lay.setContentsMargins(0, 4, 0, 4)
+                b_row_lay.addWidget(QLabel(f"🏦 {b}", styleSheet="font-weight: bold;"))
+                b_row_lay.addStretch()
+                
+                def ren(bn=b):
+                    nn, ok = QInputDialog.getText(self, "Rename Bank", f"Rename '{bn}' to:")
+                    if ok and nn.strip(): update_bank(bn, nn.strip()); refresh_banks()
+                def rem(bn=b):
+                    if QMessageBox.question(self, "Delete Bank", f"Delete '{bn}'?") == QMessageBox.StandardButton.Yes:
+                        delete_bank(bn); refresh_banks()
+                br = QPushButton("✏️ Rename"); br.clicked.connect(ren); b_row_lay.addWidget(br)
+                bd = QPushButton("🗑️"); bd.setStyleSheet(f"background-color: {DANGER};"); bd.clicked.connect(rem); b_row_lay.addWidget(bd)
+                bank_list_lay.addWidget(b_row)
+            bank_list_lay.addStretch()
+            
+        def add_bank_action():
+            n = e_b_new.text().strip()
+            if n:
+                try: add_bank(n); e_b_new.clear(); refresh_banks()
+                except Exception as e: QMessageBox.warning(self, "Error", str(e))
+                
+        btn_b_add.clicked.connect(add_bank_action)
+        refresh_banks()
+        
+        cwl.addWidget(bf, 1)
 
 def _bank_names():
     bs = get_all_banks()
