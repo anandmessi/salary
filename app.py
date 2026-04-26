@@ -616,7 +616,7 @@ class PayrollApp(QMainWindow):
                     if it.widget(): it.widget().deleteLater()
                     
                 if unit != "All": workers = [w for w in workers if w.unit == unit]
-                results, warnings = calculate_payroll(workers, sw, att, month)
+                results, warnings = calculate_payroll(workers, sw, att, month, get_config())
                 
                 if warnings:
                     wf = QFrame(); wf.setStyleSheet("background-color: #3D2F00; border-radius: 8px;")
@@ -787,7 +787,13 @@ class PayrollApp(QMainWindow):
             fp, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV (*.csv)")
             if fp:
                 res = import_attendance_from_csv(fp, m_cb.currentText())
-                self.set_message(f"✅ Imported {res['imported']} records.", SUCCESS)
+                if res["errors"]:
+                    err_path = os.path.join(os.path.dirname(fp), "import_errors.txt")
+                    with open(err_path, "w") as f:
+                        f.write("\n".join(res["errors"]))
+                    QMessageBox.warning(self, "Import Errors", f"Imported {res['imported']} records.\nEncountered {len(res['errors'])} errors.\n\nDetails saved to: {err_path}")
+                else:
+                    self.set_message(f"✅ Imported {res['imported']} records.", SUCCESS)
                 self._navigate("attendance")
         b2 = QPushButton("📁 Import CSV")
         b2.clicked.connect(imp)
@@ -993,7 +999,13 @@ class PayrollApp(QMainWindow):
             fp, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV (*.csv)")
             if fp:
                 res = import_workers_from_csv(fp)
-                self.set_message(f"✅ Imported {res['imported']} workers.", SUCCESS)
+                if res["errors"]:
+                    err_path = os.path.join(os.path.dirname(fp), "import_errors.txt")
+                    with open(err_path, "w") as f:
+                        f.write("\n".join(res["errors"]))
+                    QMessageBox.warning(self, "Import Errors", f"Imported {res['imported']} workers.\nEncountered {len(res['errors'])} errors.\n\nDetails saved to: {err_path}")
+                else:
+                    self.set_message(f"✅ Imported {res['imported']} workers.", SUCCESS)
                 self._navigate("workers")
                 
         b2 = QPushButton("📁 Import CSV")
@@ -1141,7 +1153,7 @@ class PayrollApp(QMainWindow):
                     it = content_layout.takeAt(0)
                     if it.widget(): it.widget().deleteLater()
                 if unit != "All": workers = [w for w in workers if w.unit == unit]
-                results, warnings = calculate_payroll(workers, sw, att, month)
+                results, warnings = calculate_payroll(workers, sw, att, month, get_config())
                 
                 if not results:
                     content_layout.addWidget(QLabel("No payroll data."))
@@ -1168,6 +1180,40 @@ class PayrollApp(QMainWindow):
                         self._pdf_thread.start()
                 
                 bz = QPushButton("📦 Download All as ZIP"); bz.clicked.connect(gen_all); content_layout.addWidget(bz)
+                
+                def email_all():
+                    cfg = get_config()
+                    if not cfg.target_email:
+                        QMessageBox.warning(self, "No Target Email", "Please configure an automation target email in the Settings tab first.")
+                        return
+                    self.set_message("⏳ Generating and Emailing...", ACCENT)
+                    def do_email():
+                        td = tempfile.mkdtemp()
+                        gen = generate_bulk_pdfs(results, cfg, td, zip_output=True, zip_only=True)
+                        zip_path = gen.get("zip_path")
+                        if zip_path:
+                            try:
+                                import smtplib
+                                from email.message import EmailMessage
+                                msg = EmailMessage()
+                                msg['Subject'] = f'Salary Slips for {month}'
+                                msg['From'] = cfg.email or "payroll@localhost"
+                                msg['To'] = cfg.target_email
+                                msg.set_content(f'Attached are the generated salary slips for {month}.')
+                                with open(zip_path, 'rb') as f:
+                                    msg.add_attachment(f.read(), maintype='application', subtype='zip', filename=os.path.basename(zip_path))
+                                with smtplib.SMTP('localhost', 25) as s: # Default local relay
+                                    s.send_message(msg)
+                                return f"Email successfully sent to {cfg.target_email}"
+                            except Exception as e:
+                                return f"Slips generated, but SMTP failed: {e}"
+                        return "No slips generated"
+                        
+                    self._pdf_thread = FetchThread(do_email)
+                    self._pdf_thread.result_ready.connect(lambda msg: self.set_message(f"✅ {msg}" if "failed" not in msg else f"⚠️ {msg}", SUCCESS if "failed" not in msg else WARNING_CLR))
+                    self._pdf_thread.start()
+                    
+                be = QPushButton("📧 Email All Slips to Target"); be.setStyleSheet("background-color: #3B82F6;"); be.clicked.connect(email_all); content_layout.addWidget(be)
                 
                 sc = QHBoxLayout()
                 sel_w = QComboBox()
@@ -1214,13 +1260,29 @@ class PayrollApp(QMainWindow):
         gl.addLayout(r2)
         e_wd = QLineEdit(str(cfg.working_days)); e_wd.setFixedWidth(80)
         v5 = QVBoxLayout(); v5.addWidget(QLabel("Working Days / Month")); v5.addWidget(e_wd); gl.addLayout(v5)
+        cfl.addWidget(QLabel("⚖️ Statutory Rates", styleSheet="font-size: 15px; font-weight: bold; margin-top: 10px;"))
+        r3 = QHBoxLayout()
+        e_epf = QLineEdit(str(cfg.epf_rate)); v6 = QVBoxLayout(); v6.addWidget(QLabel("EPF Rate (%)")); v6.addWidget(e_epf); r3.addLayout(v6)
+        e_esi = QLineEdit(str(cfg.esi_rate)); v7 = QVBoxLayout(); v7.addWidget(QLabel("ESI Rate (%)")); v7.addWidget(e_esi); r3.addLayout(v7)
+        e_esic = QLineEdit(str(cfg.esi_ceiling)); v8 = QVBoxLayout(); v8.addWidget(QLabel("ESI Ceiling (₹)")); v8.addWidget(e_esic); r3.addLayout(v8)
+        gl.addLayout(r3)
+        
+        cfl.addWidget(QLabel("📧 Email Automation", styleSheet="font-size: 15px; font-weight: bold; margin-top: 10px;"))
+        r4 = QHBoxLayout()
+        e_targ = QLineEdit(cfg.target_email); e_targ.setPlaceholderText("Recipient email for automated slips..."); v9 = QVBoxLayout(); v9.addWidget(QLabel("Target Email Address")); v9.addWidget(e_targ); r4.addLayout(v9)
+        gl.addLayout(r4)
+        
         cfl.addLayout(gl)
         
         bs = QPushButton("💾 Save Settings"); bs.setStyleSheet(f"background-color: {SUCCESS}; height: 35px;")
         def sv():
-            try: wd = int(e_wd.text())
+            try:
+                wd = int(e_wd.text())
+                epf = float(e_epf.text())
+                esi = float(e_esi.text())
+                esic = float(e_esic.text())
             except: return
-            save_config(CompanyConfig(e_cn.text(), e_a1.text(), e_a2.text(), e_ph.text(), e_em.text(), wd))
+            save_config(CompanyConfig(e_cn.text(), e_a1.text(), e_a2.text(), e_ph.text(), e_em.text(), wd, epf, esi, esic, e_targ.text()))
             self.set_message("✅ Settings saved!", SUCCESS)
         bs.clicked.connect(sv); cfl.addWidget(bs)
         cwl.addWidget(cf)

@@ -227,11 +227,26 @@ class CompanyConfig:
     phone         : str = ""
     email         : str = ""
     working_days  : int = 26
+    
+    # Statutory Settings
+    epf_rate      : float = 12.0
+    esi_rate      : float = 0.75
+    esi_ceiling   : float = 21000.0
+    
+    # Email Automation Target
+    target_email  : str = ""
 
     def to_dict(self): return asdict(self)
 
     @staticmethod
-    def from_dict(d): return CompanyConfig(**d)
+    def from_dict(d):
+        d = dict(d)
+        defaults = dict(
+            epf_rate=12.0, esi_rate=0.75, esi_ceiling=21000.0, target_email=""
+        )
+        for k, v in defaults.items():
+            d.setdefault(k, v)
+        return CompanyConfig(**{k: d[k] for k in CompanyConfig.__dataclass_fields__ if k in d})
 
     def to_json(self): return json.dumps(self.to_dict())
 

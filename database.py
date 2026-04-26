@@ -99,6 +99,19 @@ CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 def init_db(db_path=DB_PATH, seed=True):
     with get_conn(db_path) as conn:
         conn.executescript(DDL)
+        
+        # --- MIGRATIONS ---
+        user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        
+        # Migration 1: Adding a future column as an example
+        if user_version < 1:
+            try:
+                conn.execute("ALTER TABLE workers ADD COLUMN phone_number TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass  # Ignore if it already exists
+            conn.execute("PRAGMA user_version = 1")
+        # ------------------
+        
         # Seed skill_wages with all categories (0 wage = user must set)
         if seed:
             for cat in SKILL_CATEGORIES:

@@ -15,13 +15,7 @@ import datetime
 import logging
 from typing import List, Dict, Tuple
 
-from schema import AttendanceRecord, SkillWage, Worker, PayrollResult
-
-logger = logging.getLogger(__name__)
-
-ESI_GROSS_CEILING = 21_000.0
-ESI_EMP_RATE      = 0.0075
-PF_EMP_RATE       = 0.12
+from schema import AttendanceRecord, SkillWage, Worker, PayrollResult, CompanyConfig
 
 
 def _period_label(month: str) -> str:
@@ -40,6 +34,7 @@ def calculate_single(
     worker     : Worker,
     skill_wage : SkillWage,
     att        : AttendanceRecord,
+    config     : CompanyConfig,
 ) -> PayrollResult:
     # ── Earnings ────────────────────────────────────────────────────────
     basic = att.basic_wages if att.basic_wages > 0 \
@@ -60,13 +55,13 @@ def calculate_single(
 
     # EPF
     epf = round(att.epf_override, 2) if att.epf_override > 0 \
-          else round(pf_esi_basis * PF_EMP_RATE, 2)
+          else round(pf_esi_basis * (config.epf_rate / 100.0), 2)
 
     # ESI
     if att.esi_override > 0:
         esi = round(att.esi_override, 2)
-    elif gross <= ESI_GROSS_CEILING:
-        esi = round(pf_esi_basis * ESI_EMP_RATE, 2)
+    elif gross <= config.esi_ceiling:
+        esi = round(pf_esi_basis * (config.esi_rate / 100.0), 2)
     else:
         esi = 0.0
 
@@ -125,6 +120,7 @@ def calculate_payroll(
     skill_wages : Dict[str, SkillWage],
     attendance  : List[AttendanceRecord],
     month       : str,
+    config      : CompanyConfig,
 ) -> Tuple[List[PayrollResult], List[str]]:
     results  = []
     warnings = []
@@ -141,7 +137,7 @@ def calculate_payroll(
             warnings.append(f"No wage rate for skill '{w.skill_category}' — {w.name}.")
             continue
         try:
-            results.append(calculate_single(w, sw, att))
+            results.append(calculate_single(w, sw, att, config))
         except Exception as e:
             warnings.append(f"Error for {w.name}: {e}")
 
