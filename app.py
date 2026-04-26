@@ -578,6 +578,51 @@ class PayrollApp(QMainWindow):
         cl.addWidget(QLabel("<b>Unit:</b>"))
         u_cb = QComboBox(); u_cb.addItems(_unit_filter_list()); u_cb.setFixedWidth(140); cl.addWidget(u_cb)
         cl.addStretch()
+        exp_btn = QPushButton("📤 Export Yearly Stats")
+        exp_btn.setStyleSheet(f"background-color: {SURFACE_3};")
+        def export_yearly():
+            cur_year = m_cb.currentText()[:4] if m_cb.currentText() else str(datetime.datetime.now().year)
+            year, ok = QInputDialog.getText(self, "Export Yearly Stats", "Enter Year (YYYY):", text=cur_year)
+            if not ok or not year.strip(): return
+            year = year.strip()
+            
+            fp, _ = QFileDialog.getSaveFileName(self, "Save Yearly Stats", f"Yearly_Stats_{year}.csv", "CSV (*.csv)")
+            if not fp: return
+            
+            self.set_message("⏳ Generating yearly stats...", ACCENT)
+            
+            def do_export():
+                months = [m for m in get_months_with_data() if m.startswith(year)]
+                months.sort()
+                if not months: return f"No data found for year {year}"
+                
+                cfg = get_config()
+                sw = get_skill_wages_dict()
+                
+                rows = []
+                rows.append(["Month", "Total Workers", "Total Gross", "Total EPF", "Total ESI", "Total Net Pay"])
+                
+                for m in months:
+                    workers, att_dict = get_workers_and_attendance(m)
+                    results, _ = calculate_payroll(workers, sw, list(att_dict.values()), m, cfg)
+                    s = payroll_summary(results)
+                    rows.append([m, str(s["total_workers"]), str(s["total_gross"]), str(s["total_epf"]), str(s["total_esi"]), str(s["total_net"])])
+                
+                import csv
+                with open(fp, "w", newline="", encoding="utf-8-sig") as f:
+                    writer = csv.writer(f)
+                    writer.writerows(rows)
+                return f"Saved yearly stats to {fp}"
+            
+            try:
+                msg = do_export()
+                self.set_message(f"✅ {msg}" if "Saved" in msg else f"⚠️ {msg}", SUCCESS if "Saved" in msg else WARNING_CLR)
+            except Exception as e:
+                self.set_message(f"⚠️ Failed: {e}", WARNING_CLR)
+                
+        exp_btn.clicked.connect(export_yearly)
+        cl.addWidget(exp_btn)
+        
         ref_btn = QPushButton("🔄 Refresh")
         ref_btn.setStyleSheet(f"background-color: {SURFACE_3};")
         cl.addWidget(ref_btn)
@@ -632,6 +677,56 @@ class PayrollApp(QMainWindow):
                     return
                 
                 s = payroll_summary(results)
+                
+                chart_w = QFrame(); chart_w.setObjectName("card")
+                chart_l = QVBoxLayout(chart_w)
+                chart_l.addWidget(QLabel("Unit-wise Net Pay Breakdown", styleSheet="font-size: 14px; font-weight: bold; color: #7F9DB9;"))
+                
+                unit_totals = {}
+                for r in results:
+                    unit_totals[r.unit] = unit_totals.get(r.unit, 0) + r.net_pay
+                
+                max_val = max(unit_totals.values()) if unit_totals else 1
+                for un, total in sorted(unit_totals.items(), key=lambda x: -x[1]):
+                    r_lay = QHBoxLayout()
+                    r_lay.addWidget(QLabel(un or "Unassigned"), 1)
+                    
+                    bar_container = QWidget()
+                    bar_container.setMinimumWidth(300)
+                    bar_l = QHBoxLayout(bar_container); bar_l.setContentsMargins(0,0,0,0)
+                    bar = QFrame()
+                    bar.setStyleSheet(f"background-color: {ACCENT}; border-radius: 4px;")
+                    bar.setFixedHeight(12)
+                    pct = max(1, int((total / max_val) * 100))
+                    bar_l.addWidget(bar, pct)
+                    bar_l.addStretch(100 - pct)
+                    
+                    r_lay.addWidget(bar_container, 4)
+                    r_lay.addWidget(QLabel(fmt_inr(total)), 1)
+                    chart_l.addLayout(r_lay)
+                
+                content_layout.addWidget(chart_w)
+
+                snap_lay = QHBoxLayout()
+                snap_btn = QPushButton("💾 Snapshot / Save Payroll Run")
+                snap_btn.setStyleSheet(f"background-color: {SUCCESS}; height: 32px; font-weight: bold;")
+                def save_snapshot():
+                    import json, datetime
+                    from database import save_payroll_run
+                    rj = json.dumps([r.to_dict() for r in results])
+                    save_payroll_run(month, datetime.datetime.now().isoformat(), s["total_gross"], s["total_net"], s["total_workers"], rj)
+                    self.set_message("✅ Payroll run snapshot saved!", SUCCESS)
+                snap_btn.clicked.connect(save_snapshot)
+                
+                hist_btn = QPushButton("📚 View Audit Logs")
+                hist_btn.setStyleSheet("height: 32px;")
+                hist_btn.clicked.connect(self._show_audit_logs)
+                
+                snap_lay.addWidget(hist_btn)
+                snap_lay.addStretch()
+                snap_lay.addWidget(snap_btn)
+                content_layout.addLayout(snap_lay)
+
                 cards = QWidget()
                 cl = QHBoxLayout(cards)
                 cl.setContentsMargins(0,0,0,0)
@@ -707,7 +802,7 @@ class PayrollApp(QMainWindow):
         cl.addStretch()
         layout.addWidget(ctrl)
         
-        table = StyledTable(("ID","Name","Unit","Skill","Designation","Days","OT Hours"), [60,140,80,80,120,60,80], editable=True)
+        table = StyledTable(("ID","Name","Unit","Skill","Designation","Days","OT Hrs","DA","HRA","CCA","Bonus","Arrears","Adv Repay"), [60,140,80,80,120,50,60,60,60,60,60,70,80], editable=True)
         layout.addWidget(table, 1)
         
         self._att_workers = []
@@ -723,6 +818,18 @@ class PayrollApp(QMainWindow):
                 except: att.days_present = 0.0
                 try: att.overtime_hours = float(table.item(row, 6).text())
                 except: att.overtime_hours = 0.0
+                try: att.da = float(table.item(row, 7).text())
+                except: att.da = 0.0
+                try: att.hra = float(table.item(row, 8).text())
+                except: att.hra = 0.0
+                try: att.cca = float(table.item(row, 9).text())
+                except: att.cca = 0.0
+                try: att.bonus = float(table.item(row, 10).text())
+                except: att.bonus = 0.0
+                try: att.arrears = float(table.item(row, 11).text())
+                except: att.arrears = 0.0
+                try: att.advance_repayment = float(table.item(row, 12).text())
+                except: att.advance_repayment = 0.0
                 records.append(att)
             bulk_upsert_attendance(records)
             self.set_message(f"✅ Saved {len(records)} records for {month}", SUCCESS)
@@ -742,7 +849,7 @@ class PayrollApp(QMainWindow):
             table.setRowCount(len(workers))
             for i, w in enumerate(workers):
                 att = existing.get(w.worker_id, AttendanceRecord(w.worker_id, m_cb.currentText()))
-                for j, v in enumerate([w.worker_id, w.name, w.unit, w.skill_category, w.designation, str(att.days_present), str(att.overtime_hours)]):
+                for j, v in enumerate([w.worker_id, w.name, w.unit, w.skill_category, w.designation, str(att.days_present), str(att.overtime_hours), str(att.da), str(att.hra), str(att.cca), str(att.bonus), str(att.arrears), str(att.advance_repayment)]):
                     it = QTableWidgetItem(v)
                     if j < 5: it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     table.setItem(i, j, it)
@@ -1340,6 +1447,34 @@ class PayrollApp(QMainWindow):
         refresh_banks()
         
         cwl.addWidget(bf, 1)
+
+    def _show_audit_logs(self):
+        from PyQt6.QtWidgets import QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QVBoxLayout
+        from database import get_payroll_runs
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Payroll Audit Logs / History")
+        dlg.resize(700, 400)
+        lay = QVBoxLayout(dlg)
+        
+        runs = get_payroll_runs()
+        if not runs:
+            lay.addWidget(QLabel("No payroll runs saved yet."))
+            dlg.exec()
+            return
+            
+        table = QTableWidget(len(runs), 5)
+        table.setHorizontalHeaderLabels(["ID", "Month", "Run Date", "Workers", "Total Net Pay"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        
+        for i, r in enumerate(runs):
+            table.setItem(i, 0, QTableWidgetItem(str(r["id"])))
+            table.setItem(i, 1, QTableWidgetItem(r["month"]))
+            table.setItem(i, 2, QTableWidgetItem(r["run_date"].split("T")[0]))
+            table.setItem(i, 3, QTableWidgetItem(str(r["worker_count"])))
+            table.setItem(i, 4, QTableWidgetItem(fmt_inr(r["total_net"])))
+            
+        lay.addWidget(table)
+        dlg.exec()
 
 def _bank_names():
     bs = get_all_banks()

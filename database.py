@@ -92,6 +92,16 @@ CREATE TABLE IF NOT EXISTS attendance (
     FOREIGN KEY (worker_id) REFERENCES workers(worker_id)
 );
 
+CREATE TABLE IF NOT EXISTS payroll_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    month TEXT NOT NULL,
+    run_date TEXT NOT NULL,
+    total_gross REAL NOT NULL,
+    total_net REAL NOT NULL,
+    worker_count INTEGER NOT NULL,
+    results_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
@@ -468,3 +478,23 @@ def save_config(cfg: CompanyConfig, db_path=DB_PATH):
         conn.execute("INSERT INTO config VALUES('company',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                      (cfg.to_json(),))
     cache.invalidate(f"config:{db_path}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#   PAYROLL RUNS (History / Audit Log)
+# ══════════════════════════════════════════════════════════════════════════════
+def save_payroll_run(month: str, run_date: str, total_gross: float, total_net: float, worker_count: int, results_json: str, db_path=DB_PATH):
+    with get_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO payroll_runs(month, run_date, total_gross, total_net, worker_count, results_json) VALUES(?,?,?,?,?,?)",
+            (month, run_date, total_gross, total_net, worker_count, results_json)
+        )
+
+def get_payroll_runs(db_path=DB_PATH):
+    with get_conn(db_path) as conn:
+        rows = conn.execute("SELECT id, month, run_date, total_gross, total_net, worker_count FROM payroll_runs ORDER BY id DESC").fetchall()
+    return [dict(r) for r in rows]
+
+def get_payroll_run(run_id: int, db_path=DB_PATH):
+    with get_conn(db_path) as conn:
+        row = conn.execute("SELECT * FROM payroll_runs WHERE id=?", (run_id,)).fetchone()
+    return dict(row) if row else None
