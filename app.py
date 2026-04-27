@@ -306,6 +306,70 @@ class MetricCard(QFrame):
         inner.addWidget(lbl)
         layout.addLayout(inner)
 
+class PieChartWidget(QWidget):
+    """Custom pie chart drawn with QPainter — no external libs needed."""
+    PIE_COLORS = ["#3B82F6","#22C55E","#F59E0B","#EF4444","#A78BFA","#38BDF8","#FB923C","#34D399"]
+
+    def __init__(self, data: dict, parent=None):
+        """data: {label: value}"""
+        super().__init__(parent)
+        self.data = data
+        self.setMinimumHeight(220)
+
+    def paintEvent(self, event):
+        from PyQt6.QtGui import QPainter, QColor, QPen, QFont
+        from PyQt6.QtCore import QRectF, Qt
+        import math
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        total = sum(self.data.values()) or 1
+        items = [(k, v) for k, v in self.data.items()]
+        items.sort(key=lambda x: -x[1])
+
+        w, h = self.width(), self.height()
+        legend_w = max(200, w // 3)
+        pie_size = min(h - 20, w - legend_w - 20)
+        pie_rect = QRectF((w - legend_w - pie_size) / 2, (h - pie_size) / 2, pie_size, pie_size)
+
+        angle = 90 * 16  # start at top
+        for i, (label, val) in enumerate(items):
+            span = int(round((val / total) * 360 * 16))
+            color = QColor(self.PIE_COLORS[i % len(self.PIE_COLORS)])
+            painter.setBrush(color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPie(pie_rect, angle, span)
+            angle += span
+
+        # Draw inner circle for donut effect
+        inner_r = pie_size * 0.38
+        cx, cy = pie_rect.center().x(), pie_rect.center().y()
+        painter.setBrush(QColor("#23234A"))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(QRectF(cx - inner_r, cy - inner_r, inner_r * 2, inner_r * 2))
+
+        # Center label
+        painter.setPen(QColor("#F1F5FF"))
+        fnt = QFont("Segoe UI", 9, QFont.Weight.Bold)
+        painter.setFont(fnt)
+        painter.drawText(pie_rect, Qt.AlignmentFlag.AlignCenter, f"{len(items)}\nUnits")
+
+        # Legend
+        lx = int(w - legend_w + 10)
+        ly = int((h - len(items) * 26) / 2)
+        fnt2 = QFont("Segoe UI", 8)
+        painter.setFont(fnt2)
+        for i, (label, val) in enumerate(items):
+            color = QColor(self.PIE_COLORS[i % len(self.PIE_COLORS)])
+            painter.setBrush(color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(lx, ly + i * 26, 12, 12, 3, 3)
+            painter.setPen(QColor("#F1F5FF"))
+            pct = (val / total) * 100
+            disp = label if label else "Unassigned"
+            painter.drawText(lx + 18, ly + i * 26 + 11, f"{disp}  {pct:.1f}%")
+        painter.end()
+
 class SidebarButton(QPushButton):
     def __init__(self, text, icon, key, parent=None):
         super().__init__(f"  {icon}   {text}", parent)
@@ -343,6 +407,9 @@ class WorkerDelegate(QStyledItemDelegate):
         else:
             editor.setText(str(val))
             
+    def updateEditorGeometry(self, editor, option, index):
+        editor.setGeometry(option.rect)
+
     def setModelData(self, editor, model, index):
         if isinstance(editor, QComboBox):
             val = editor.currentText()
@@ -489,6 +556,7 @@ class PayrollApp(QMainWindow):
             ("Workers",        "👷", "workers"),
             ("Units",          "🏢", "units"),
             ("Wage Rates",     "💰", "wages"),
+            ("Payroll",        "🧾", "payroll"),
             ("Generate Slips", "📄", "slips"),
             ("Settings",       "⚙️",  "settings"),
         ]
@@ -590,6 +658,7 @@ class PayrollApp(QMainWindow):
         {"dashboard": self._page_dashboard, "attendance": self._page_attendance,
          "workers": self._page_workers, "units": self._page_units,
          "wages": self._page_wages, "slips": self._page_slips,
+         "payroll": self._page_payroll,
          "settings": self._page_settings}.get(key, lambda l: None)(self.page_layout)
          
         self.set_message(f"Viewing: {key.replace('_',' ').title()}")
@@ -716,36 +785,20 @@ class PayrollApp(QMainWindow):
                 
                 s = payroll_summary(results)
                 
-                chart_w = QFrame(); chart_w.setObjectName("card")
-                chart_l = QVBoxLayout(chart_w)
-                chart_l.addWidget(QLabel("Unit-wise Net Pay Breakdown", styleSheet="font-size: 14px; font-weight: bold; color: #7F9DB9;"))
-                
+                # ── Pie chart: unit-wise net pay ───────────────────────────
                 unit_totals = {}
                 for r in results:
-                    unit_totals[r.unit] = unit_totals.get(r.unit, 0) + r.net_pay
-                
-                total_val = sum(unit_totals.values()) if unit_totals else 1
-                for un, total in sorted(unit_totals.items(), key=lambda x: -x[1]):
-                    r_lay = QHBoxLayout()
-                    r_lay.addWidget(QLabel(un or "Unassigned"), 1)
-                    
-                    bar_container = QWidget()
-                    bar_container.setMinimumWidth(300)
-                    bar_l = QHBoxLayout(bar_container); bar_l.setContentsMargins(0,0,0,0)
-                    bar = QFrame()
-                    bar.setStyleSheet(f"background-color: {ACCENT}; border-radius: 4px;")
-                    bar.setFixedHeight(12)
-                    pct_val = (total / total_val) * 100
-                    pct = max(1, int(pct_val))
-                    bar_l.addWidget(bar, pct)
-                    bar_l.addStretch(100 - pct)
-                    
-                    r_lay.addWidget(bar_container, 4)
-                    r_lay.addWidget(QLabel(f"{fmt_inr(total)} ({pct_val:.1f}%)"), 1)
-                    chart_l.addLayout(r_lay)
-                
+                    unit_totals[r.unit or "Unassigned"] = unit_totals.get(r.unit or "Unassigned", 0) + r.net_pay
+
+                chart_w = QFrame(); chart_w.setObjectName("card")
+                chart_l = QVBoxLayout(chart_w)
+                chart_l.setContentsMargins(16, 12, 16, 12)
+                chart_l.addWidget(QLabel("🥧  Unit-wise Net Pay", styleSheet="font-size: 14px; font-weight: bold; color: #7F9DB9;"))
+                pie = PieChartWidget(unit_totals)
+                chart_l.addWidget(pie)
                 content_layout.addWidget(chart_w)
 
+                # ── Action buttons row ─────────────────────────────────────
                 snap_lay = QHBoxLayout()
                 snap_btn = QPushButton("💾 Snapshot / Save Payroll Run")
                 snap_btn.setStyleSheet(f"background-color: {SUCCESS}; height: 32px; font-weight: bold;")
@@ -756,53 +809,57 @@ class PayrollApp(QMainWindow):
                     save_payroll_run(month, datetime.datetime.now().isoformat(), s["total_gross"], s["total_net"], s["total_workers"], rj)
                     self.set_message("✅ Payroll run snapshot saved!", SUCCESS)
                 snap_btn.clicked.connect(save_snapshot)
-                
+
                 hist_btn = QPushButton("📚 View Audit Logs")
                 hist_btn.setStyleSheet("height: 32px;")
                 hist_btn.clicked.connect(self._show_audit_logs)
-                
+
+                pr_btn = QPushButton("🧾 Open Payroll Breakdown")
+                pr_btn.setStyleSheet(f"background-color: {SURFACE_3}; height: 32px;")
+                pr_btn.clicked.connect(lambda: self._navigate("payroll"))
+
                 snap_lay.addWidget(hist_btn)
+                snap_lay.addWidget(pr_btn)
                 snap_lay.addStretch()
                 snap_lay.addWidget(snap_btn)
                 content_layout.addLayout(snap_lay)
 
+                # ── Primary KPI cards ──────────────────────────────────────
                 cards = QWidget()
                 cl = QHBoxLayout(cards)
-                cl.setContentsMargins(0,0,0,0)
+                cl.setContentsMargins(0, 0, 0, 0)
                 cl.addWidget(MetricCard("Workers", s["total_workers"], ACCENT, "👷"))
                 cl.addWidget(MetricCard("Total Gross", fmt_inr(s["total_gross"]), "#26A69A", "💰"))
                 cl.addWidget(MetricCard("Total EPF", fmt_inr(s["total_epf"]), WARNING_CLR, "🏦"))
                 cl.addWidget(MetricCard("Total ESI", fmt_inr(s["total_esi"]), "#AB47BC", "🏥"))
                 cl.addWidget(MetricCard("Total Net Pay", fmt_inr(s["total_net"]), SUCCESS, "✅"))
                 content_layout.addWidget(cards)
-                
-                _section_label(content_layout, "Payroll Breakdown")
-                cols = ("ID","Name","Unit","Skill","Designation","Days","Gross (₹)","EPF (₹)","ESI (₹)","Net Pay (₹)")
-                widths = [60,130,90,80,120,45,100,80,75,110]
-                table = StyledTable(cols, widths)
-                table.insert_rows([(r.worker_id, r.worker_name, r.unit, r.skill_category,
-                                    r.profile_title, r.days_present, fmt_inr(r.gross),
-                                    fmt_inr(r.epf_deduction), fmt_inr(r.esi_deduction),
-                                    fmt_inr(r.net_pay)) for r in results])
-                content_layout.addWidget(table, 1)
-                
-                exp_btn = QPushButton("⬇️ Export CSV")
-                exp_btn.setFixedWidth(120)
-                def exp():
-                    import csv
-                    path, _ = QFileDialog.getSaveFileName(self, "Save CSV", f"Payroll_{month}.csv", "CSV (*.csv)")
-                    if path:
-                        try:
-                            with open(path, "w", newline="", encoding="utf-8-sig") as f:
-                                writer = csv.writer(f)
-                                writer.writerow(["Emp name", "Total Sal", "IFSC Code", "Account Number"])
-                                for r in results:
-                                    writer.writerow([r.worker_name, round(r.net_pay, 2), r.ifsc_code, r.bank_account])
-                            self.set_message(f"✅ CSV → {path}", SUCCESS)
-                        except Exception as e:
-                            self.set_message(f"⚠️ Export error: {e}", DANGER)
-                exp_btn.clicked.connect(exp)
-                content_layout.addWidget(exp_btn)
+
+                # ── Secondary stats row ────────────────────────────────────
+                avg_net = s["total_net"] / max(s["total_workers"], 1)
+                top_r = max(results, key=lambda r: r.net_pay, default=None)
+                zero_pay = sum(1 for r in results if r.net_pay <= 0)
+                total_ded = s["total_epf"] + s["total_esi"]
+                ded_pct = (total_ded / max(s["total_gross"], 1)) * 100
+                skilled_c   = sum(1 for r in results if r.skill_category == "Skilled")
+                semi_c      = sum(1 for r in results if r.skill_category == "Semi-Skilled")
+                unskilled_c = sum(1 for r in results if r.skill_category == "Unskilled")
+
+                stats2 = QWidget()
+                s2l = QHBoxLayout(stats2); s2l.setContentsMargins(0, 0, 0, 0)
+                s2l.addWidget(MetricCard("Avg Net Pay", fmt_inr(avg_net), "#38BDF8", "📈"))
+                s2l.addWidget(MetricCard("Top Earner", top_r.worker_name.split()[0] if top_r else "—", "#A78BFA", "🏆"))
+                s2l.addWidget(MetricCard("Zero-Pay Workers", zero_pay, DANGER, "⚠️"))
+                s2l.addWidget(MetricCard("Deduction %", f"{ded_pct:.1f}%", WARNING_CLR, "🔻"))
+                content_layout.addWidget(stats2)
+
+                stats3 = QWidget()
+                s3l = QHBoxLayout(stats3); s3l.setContentsMargins(0, 0, 0, 0)
+                s3l.addWidget(MetricCard("Skilled", skilled_c, "#22C55E", "🎓"))
+                s3l.addWidget(MetricCard("Semi-Skilled", semi_c, "#F59E0B", "🔧"))
+                s3l.addWidget(MetricCard("Unskilled", unskilled_c, "#94A3C4", "👤"))
+                s3l.addWidget(MetricCard("Active Units", len(unit_totals), "#FB923C", "🏢"))
+                content_layout.addWidget(stats3)
                 
             self._async_load(_fetch, _render)
             
@@ -837,7 +894,6 @@ class PayrollApp(QMainWindow):
         u_cb = QComboBox(); u_cb.addItems(_unit_filter_list()); u_cb.setFixedWidth(140); cl.addWidget(u_cb)
         cl.addSpacing(20)
         s_ent = QLineEdit(); s_ent.setPlaceholderText("Search Name/ID..."); s_ent.setFixedWidth(140); cl.addWidget(s_ent)
-        cl.addWidget(QLabel(f"(Max days: {config.working_days})", styleSheet=f"color: {TEXT_MUTED};"))
         cl.addStretch()
         layout.addWidget(ctrl)
         
@@ -1396,8 +1452,6 @@ class PayrollApp(QMainWindow):
         v3 = QVBoxLayout(); v3.addWidget(QLabel("Phone")); v3.addWidget(e_ph); r2.addLayout(v3)
         v4 = QVBoxLayout(); v4.addWidget(QLabel("Email")); v4.addWidget(e_em); r2.addLayout(v4)
         gl.addLayout(r2)
-        e_wd = QLineEdit(str(cfg.working_days)); e_wd.setFixedWidth(80)
-        v5 = QVBoxLayout(); v5.addWidget(QLabel("Working Days / Month")); v5.addWidget(e_wd); gl.addLayout(v5)
         cfl.addLayout(gl)
         
         cfl.addWidget(QLabel("⚖️ Statutory Rates", styleSheet="font-size: 15px; font-weight: bold; margin-top: 10px;"))
@@ -1412,12 +1466,11 @@ class PayrollApp(QMainWindow):
         bs = QPushButton("💾 Save Settings"); bs.setStyleSheet(f"background-color: {SUCCESS}; height: 35px;")
         def sv():
             try:
-                wd = int(e_wd.text())
                 epf = float(e_epf.text())
                 esi = float(e_esi.text())
                 esic = float(e_esic.text())
             except: return
-            save_config(CompanyConfig(e_cn.text(), e_a1.text(), e_a2.text(), e_ph.text(), e_em.text(), wd, epf, esi, esic, ""))
+            save_config(CompanyConfig(e_cn.text(), e_a1.text(), e_a2.text(), e_ph.text(), e_em.text(), 26, epf, esi, esic, ""))
             self.set_message("✅ Settings saved!", SUCCESS)
         bs.clicked.connect(sv); cfl.addWidget(bs)
 
@@ -1477,6 +1530,106 @@ class PayrollApp(QMainWindow):
         tabs.addTab(cf, "🏢 General Settings")
         tabs.addTab(bf, "🏦 Bank Management")
         cwl.addWidget(tabs, 1)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #   PAYROLL BREAKDOWN PAGE
+    # ══════════════════════════════════════════════════════════════════════
+    def _page_payroll(self, layout):
+        _page_header(layout, "🧾  Payroll Breakdown", "Detailed per-employee payroll calculations for the selected period")
+
+        ctrl = QFrame(); ctrl.setObjectName("surface2")
+        cl = QHBoxLayout(ctrl); cl.setContentsMargins(16, 10, 16, 10)
+        cl.addWidget(QLabel("<b>Month:</b>"))
+        m_cb = QComboBox(); m_cb.addItems(month_options()); m_cb.setFixedWidth(140); cl.addWidget(m_cb)
+        cl.addSpacing(20)
+        cl.addWidget(QLabel("<b>Unit:</b>"))
+        u_cb = QComboBox(); u_cb.addItems(_unit_filter_list()); u_cb.setFixedWidth(140); cl.addWidget(u_cb)
+        cl.addSpacing(20)
+        s_ent = QLineEdit(); s_ent.setPlaceholderText("Search Name / ID…"); s_ent.setFixedWidth(160); cl.addWidget(s_ent)
+        cl.addStretch()
+        ref_btn = QPushButton("🔄 Refresh"); ref_btn.setStyleSheet(f"background-color: {SURFACE_3};"); cl.addWidget(ref_btn)
+
+        cw = QWidget(); cwl = QHBoxLayout(cw); cwl.setContentsMargins(28, 4, 28, 4); cwl.addWidget(ctrl)
+        layout.addWidget(cw)
+
+        # Summary banner
+        summary_bar = QFrame(); summary_bar.setObjectName("surface2")
+        sbl = QHBoxLayout(summary_bar); sbl.setContentsMargins(28, 6, 28, 6)
+        self._pr_lbl_workers = QLabel("Workers: —"); self._pr_lbl_workers.setStyleSheet(f"color:{TEXT_SECONDARY}; font-size:11px;")
+        self._pr_lbl_gross   = QLabel("Gross: —");   self._pr_lbl_gross.setStyleSheet(f"color:{TEXT_SECONDARY}; font-size:11px;")
+        self._pr_lbl_net     = QLabel("Net: —");     self._pr_lbl_net.setStyleSheet(f"color:{SUCCESS}; font-size:11px; font-weight:bold;")
+        for lbl in (self._pr_lbl_workers, self._pr_lbl_gross, self._pr_lbl_net):
+            sbl.addWidget(lbl)
+        sbl.addStretch()
+        layout.addWidget(summary_bar)
+
+        cols = ("ID","Name","Unit","Skill","Designation","Days","Gross (₹)","EPF (₹)","ESI (₹)","Net Pay (₹)")
+        widths = [60,140,90,80,130,45,100,80,75,110]
+        table = StyledTable(cols, widths)
+        cw2 = QWidget(); cw2l = QVBoxLayout(cw2); cw2l.setContentsMargins(28, 0, 28, 4); cw2l.addWidget(table, 1)
+        layout.addWidget(cw2, 1)
+
+        btn_row = QWidget(); brl = QHBoxLayout(btn_row); brl.setContentsMargins(28, 0, 28, 14)
+        exp_btn = QPushButton("⬇️ Export CSV"); exp_btn.setFixedWidth(130)
+        brl.addWidget(exp_btn); brl.addStretch()
+        layout.addWidget(btn_row)
+
+        _results_cache = []
+
+        def refresh():
+            sync_combo(m_cb, month_options())
+            sync_combo(u_cb, _unit_filter_list())
+            month = m_cb.currentText()
+            unit  = u_cb.currentText()
+            q     = s_ent.text().strip().lower()
+            self._pr_lbl_workers.setText("Workers: ⏳"); self._pr_lbl_gross.setText(""); self._pr_lbl_net.setText("")
+
+            def _fetch():
+                workers, att_dict = get_workers_and_attendance(month)
+                sw = get_skill_wages_dict()
+                return workers, sw, list(att_dict.values()), month, unit, q
+
+            def _render(data):
+                workers, sw, att, month, unit, q = data
+                nonlocal _results_cache
+                if unit != "All": workers = [w for w in workers if w.unit == unit]
+                results, _ = calculate_payroll(workers, sw, att, month, get_config())
+                if q:
+                    results = [r for r in results if q in r.worker_name.lower() or q in r.worker_id.lower()]
+                _results_cache = results
+                s = payroll_summary(results)
+                self._pr_lbl_workers.setText(f"  👷 Workers: {s['total_workers']}")
+                self._pr_lbl_gross.setText(f"   💰 Gross: {fmt_inr(s['total_gross'])}")
+                self._pr_lbl_net.setText(f"   ✅ Net Pay: {fmt_inr(s['total_net'])}")
+                table.insert_rows([
+                    (r.worker_id, r.worker_name, r.unit, r.skill_category,
+                     r.profile_title, r.days_present, fmt_inr(r.gross),
+                     fmt_inr(r.epf_deduction), fmt_inr(r.esi_deduction),
+                     fmt_inr(r.net_pay)) for r in results
+                ])
+
+            self._async_load(_fetch, _render)
+
+        def exp():
+            month = m_cb.currentText()
+            path, _ = QFileDialog.getSaveFileName(self, "Save CSV", f"Payroll_{month}.csv", "CSV (*.csv)")
+            if path:
+                try:
+                    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(["Emp name", "Total Sal", "IFSC Code", "Account Number"])
+                        for r in _results_cache:
+                            writer.writerow([r.worker_name, round(r.net_pay, 2), r.ifsc_code, r.bank_account])
+                    self.set_message(f"✅ CSV → {path}", SUCCESS)
+                except Exception as e:
+                    self.set_message(f"⚠️ Export error: {e}", DANGER)
+
+        exp_btn.clicked.connect(exp)
+        m_cb.currentTextChanged.connect(refresh)
+        u_cb.currentTextChanged.connect(refresh)
+        s_ent.textChanged.connect(refresh)
+        ref_btn.clicked.connect(refresh)
+        refresh()
 
     def _show_audit_logs(self):
         from PyQt6.QtWidgets import QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QVBoxLayout, QPushButton, QHBoxLayout, QWidget, QMessageBox, QFileDialog
