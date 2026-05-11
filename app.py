@@ -394,18 +394,28 @@ class WorkerDelegate(QStyledItemDelegate):
             return None
         if col_name in ("Unit", "Skill", "Bank"):
             cb = QComboBox(parent)
+            cb.setStyleSheet(
+                f"background-color: {SURFACE_3}; color: {TEXT_PRIMARY}; "
+                f"border: 1px solid {ACCENT}; border-radius: 3px;"
+            )
             if col_name == "Unit": cb.addItems(_unit_list())
             elif col_name == "Skill": cb.addItems(SKILL_CATEGORIES)
             elif col_name == "Bank": cb.addItems(get_all_banks() or ["(No banks — add in Settings)"])
             return cb
-        return QLineEdit(parent)
-        
+        editor = QLineEdit(parent)
+        editor.setStyleSheet(
+            f"background-color: {SURFACE_3}; color: {TEXT_PRIMARY}; "
+            f"border: 1px solid {ACCENT}; border-radius: 3px; padding: 0px 4px;"
+        )
+        return editor
+
     def setEditorData(self, editor, index):
         val = index.model().data(index, Qt.ItemDataRole.EditRole)
         if isinstance(editor, QComboBox):
             editor.setCurrentText(str(val))
         else:
             editor.setText(str(val))
+            editor.selectAll()
             
     def updateEditorGeometry(self, editor, option, index):
         editor.setGeometry(option.rect)
@@ -1390,8 +1400,10 @@ class PayrollApp(QMainWindow):
                 table = StyledTable(("ID","Name","Unit","Skill","Designation","Net Pay (₹)"), [70,150,100,80,130,120])
                 table.insert_rows([(r.worker_id, r.worker_name, r.unit, r.skill_category,
                                     r.profile_title, fmt_inr(r.net_pay)) for r in results])
+                # Make rows single-click selectable
+                table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
                 content_layout.addWidget(table, 1)
-                
+
                 def gen_all():
                     path, _ = QFileDialog.getSaveFileName(self, "Save ZIP", f"SalarySlips_{month}.zip", "ZIP (*.zip)")
                     if path:
@@ -1405,14 +1417,34 @@ class PayrollApp(QMainWindow):
                         self._pdf_thread = FetchThread(do)
                         self._pdf_thread.result_ready.connect(lambda _: self.set_message("✅ Done", SUCCESS))
                         self._pdf_thread.start()
-                
-                bz = QPushButton("📦 Download All as ZIP"); bz.clicked.connect(gen_all); content_layout.addWidget(bz)
 
-                
-                sc = QHBoxLayout()
+                bz = QPushButton("📦 Download All as ZIP")
+                bz.clicked.connect(gen_all)
+                content_layout.addWidget(bz)
+
+                # ── Single slip bar ────────────────────────────────────────
+                sc_frame = QFrame()
+                sc_frame.setStyleSheet(
+                    f"background-color: {SURFACE_2}; border-radius: 8px; "
+                    f"border: 1px solid {CARD_BORDER};"
+                )
+                sc = QHBoxLayout(sc_frame)
+                sc.setContentsMargins(12, 8, 12, 8)
+                sc.setSpacing(10)
+
+                sel_icon = QLabel("👤")
+                sel_icon.setStyleSheet("font-size: 18px; background: transparent; border: none;")
+                sc.addWidget(sel_icon)
+
                 sel_w = QComboBox()
                 sel_w.addItems([f"{r.worker_id} — {r.worker_name}" for r in results])
-                sc.addWidget(sel_w)
+                sel_w.setMinimumWidth(260)
+                sel_w.setStyleSheet(
+                    f"background-color: {SURFACE_3}; color: {TEXT_PRIMARY}; "
+                    f"border: 1px solid {ACCENT}; border-radius: 5px; padding: 5px 8px;"
+                )
+                sc.addWidget(sel_w, 1)
+
                 def gen_s():
                     wid = sel_w.currentText().split(" — ")[0]
                     r = next((r for r in results if r.worker_id == wid), None)
@@ -1421,9 +1453,37 @@ class PayrollApp(QMainWindow):
                         if od:
                             p = generate_slip_pdf(r, get_config(), od)
                             self.set_message(f"✅ Saved: {p}", SUCCESS)
-                bs = QPushButton("👁️ Generate Single"); bs.setStyleSheet(f"background-color: {SUCCESS};"); bs.clicked.connect(gen_s)
+
+                bs = QPushButton("📄 Generate Single")
+                bs.setStyleSheet(
+                    f"background-color: {SUCCESS}; color: white; "
+                    f"font-weight: bold; padding: 8px 18px; border-radius: 6px; border: none;"
+                )
+                bs.setMinimumWidth(160)
+                bs.clicked.connect(gen_s)
                 sc.addWidget(bs)
-                content_layout.addLayout(sc)
+
+                content_layout.addWidget(sc_frame)
+
+                # ── Wire table row click → combobox selection ──────────────
+                result_map = {r.worker_id: f"{r.worker_id} — {r.worker_name}" for r in results}
+
+                def _on_row_selected():
+                    rows = table.selectionModel().selectedRows()
+                    if not rows:
+                        return
+                    row = rows[0].row()
+                    wid_item = table.item(row, 0)
+                    if not wid_item:
+                        return
+                    wid = wid_item.text()
+                    label = result_map.get(wid, "")
+                    if label:
+                        sel_w.blockSignals(True)
+                        sel_w.setCurrentText(label)
+                        sel_w.blockSignals(False)
+
+                table.itemSelectionChanged.connect(_on_row_selected)
                 
             self._async_load(_fetch, _render)
             
