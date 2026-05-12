@@ -1317,14 +1317,14 @@ class PayrollApp(QMainWindow):
             cf = QFrame(); cf.setObjectName("card")
             cfl = QHBoxLayout(cf); cfl.setContentsMargins(22, 18, 22, 18)
             vi = QVBoxLayout()
-            vi.addWidget(QLabel(cat, styleSheet=f"font-size: 15px; font-weight: bold; color: {ACCENT};"))
-            vi.addWidget(QLabel("Skill Category", styleSheet=f"font-size: 10px; color: {TEXT_MUTED};"))
+            vi.addWidget(QLabel(cat, styleSheet="font-size: 15px; font-weight: bold; color: white;"))
+            vi.addWidget(QLabel("Skill Category", styleSheet="font-size: 10px; color: white;"))
             cfl.addLayout(vi); cfl.addStretch()
             
-            vd = QVBoxLayout(); vd.addWidget(QLabel("Daily Wage (₹)", styleSheet=f"font-size: 10px; color: {TEXT_SECONDARY};"))
+            vd = QVBoxLayout(); vd.addWidget(QLabel("Daily Wage (₹)", styleSheet="font-size: 10px; color: white;"))
             ed = QLineEdit(str(sw.daily_wage)); ed.setFixedWidth(110); vd.addWidget(ed); cfl.addLayout(vd)
             
-            vo = QVBoxLayout(); vo.addWidget(QLabel("OT Rate (₹/hr)", styleSheet=f"font-size: 10px; color: {TEXT_SECONDARY};"))
+            vo = QVBoxLayout(); vo.addWidget(QLabel("OT Rate (₹/hr)", styleSheet="font-size: 10px; color: white;"))
             eo = QLineEdit(str(sw.ot_rate)); eo.setFixedWidth(110); vo.addWidget(eo); cfl.addLayout(vo)
             
             entries[cat] = {"dw": ed, "ot": eo}

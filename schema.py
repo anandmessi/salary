@@ -17,6 +17,10 @@ SKILL_CATEGORIES = [
     "Skilled",
     "Semi-Skilled",
     "Unskilled",
+    "Unskilled Ladies",
+    "Grass Cutting",
+    "Skilled Data Entry",
+    "Highly Skilled",
 ]
 
 
