@@ -6,7 +6,8 @@ Wages determined by SKILL CATEGORY:
   - Basic = days_present × daily_wage (from skill category).
 
 Deductions:
-  EPF = 12% of (Basic + DA)
+  EPF = 12% of (Basic + DA)  if (Basic + DA) < ₹15,000
+        ₹1,800 flat          if (Basic + DA) ≥ ₹15,000
   ESI = 0.75% of (Basic + DA) if gross ≤ ₹21,000
 """
 
@@ -53,9 +54,13 @@ def calculate_single(
     # ── PF/ESI basis = Basic + DA ───────────────────────────────────────
     pf_esi_basis = round(basic + att.da, 2)
 
-    # EPF
-    epf = round(att.epf_override, 2) if att.epf_override > 0 \
-          else round(pf_esi_basis * (config.epf_rate / 100.0), 2)
+    # EPF — 12% if PF basis < ₹15,000; flat ₹1,800 if ₹15,000 or above
+    if att.epf_override > 0:
+        epf = round(att.epf_override, 2)
+    elif pf_esi_basis < 15_000:
+        epf = round(pf_esi_basis * (config.epf_rate / 100.0), 2)
+    else:
+        epf = 1800.0
 
     # ESI
     if att.esi_override > 0:
