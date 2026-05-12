@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS attendance (
     maternity_benefit REAL DEFAULT 0, leave_wages REAL DEFAULT 0,
     bonus             REAL DEFAULT 0, other_allowances REAL DEFAULT 0,
     epf_override      REAL DEFAULT 0, esi_override REAL DEFAULT 0,
+    esi_applicable    INTEGER DEFAULT 1,
     welfare_fund      REAL DEFAULT 0, tds REAL DEFAULT 0,
     profession_tax    REAL DEFAULT 0, advance_repayment REAL DEFAULT 0,
     fine              REAL DEFAULT 0, loss_damages REAL DEFAULT 0,
@@ -129,6 +130,14 @@ def init_db(db_path=DB_PATH, seed=True):
             except sqlite3.OperationalError:
                 pass  # Ignore if it already exists
             conn.execute("PRAGMA user_version = 1")
+
+        # Migration 2: ESI toggle per attendance record
+        if user_version < 2:
+            try:
+                conn.execute("ALTER TABLE attendance ADD COLUMN esi_applicable INTEGER DEFAULT 1")
+            except sqlite3.OperationalError:
+                pass
+            conn.execute("PRAGMA user_version = 2")
         # ------------------
         
         # Seed skill_wages with all categories (0 wage = user must set)
@@ -378,7 +387,7 @@ _ATT_COLS = ("worker_id","month","days_present",
              "basic_wages","da","hra","cca","overtime_hours","arrears",
              "advances_pay","nfh_wages","maternity_benefit","leave_wages",
              "bonus","other_allowances",
-             "epf_override","esi_override","welfare_fund","tds",
+             "epf_override","esi_override","esi_applicable","welfare_fund","tds",
              "profession_tax","advance_repayment","fine","loss_damages","other_deductions")
 
 def get_attendance(month, db_path=DB_PATH):

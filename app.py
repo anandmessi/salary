@@ -907,7 +907,11 @@ class PayrollApp(QMainWindow):
         cl.addStretch()
         layout.addWidget(ctrl)
         
-        table = StyledTable(("ID","Name","Unit","Skill","Designation","Days","OT Hrs","DA","HRA","CCA","Bonus","Arrears","Adv Repay"), [60,140,80,80,120,50,60,60,60,60,60,70,80], editable=True, stretch_last=True)
+        table = StyledTable(
+            ("ID","Name","Unit","Skill","Designation","Days","OT Hrs","DA","HRA","CCA","Bonus","Arrears","Adv Repay","ESI"),
+            [60,140,80,80,120,50,60,60,60,60,60,70,80,50],
+            editable=True, stretch_last=True
+        )
         layout.addWidget(table, 1)
         
         self._att_workers = []
@@ -935,6 +939,9 @@ class PayrollApp(QMainWindow):
                 except: att.arrears = 0.0
                 try: att.advance_repayment = float(table.item(row, 12).text())
                 except: att.advance_repayment = 0.0
+                # ESI toggle (col 13) — checkbox
+                esi_item = table.item(row, 13)
+                att.esi_applicable = (esi_item is not None and esi_item.checkState() == Qt.CheckState.Checked)
                 records.append(att)
             bulk_upsert_attendance(records)
             self.set_message(f"✅ Saved {len(records)} records for {month}", SUCCESS)
@@ -954,10 +961,19 @@ class PayrollApp(QMainWindow):
             table.setRowCount(len(workers))
             for i, w in enumerate(workers):
                 att = existing.get(w.worker_id, AttendanceRecord(w.worker_id, m_cb.currentText()))
-                for j, v in enumerate([w.worker_id, w.name, w.unit, w.skill_category, w.designation, str(att.days_present), str(att.overtime_hours), str(att.da), str(att.hra), str(att.cca), str(att.bonus), str(att.arrears), str(att.advance_repayment)]):
+                for j, v in enumerate([w.worker_id, w.name, w.unit, w.skill_category, w.designation,
+                                       str(att.days_present), str(att.overtime_hours),
+                                       str(att.da), str(att.hra), str(att.cca),
+                                       str(att.bonus), str(att.arrears), str(att.advance_repayment)]):
                     it = QTableWidgetItem(v)
                     if j < 5: it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     table.setItem(i, j, it)
+                # ESI checkbox (col 13)
+                esi_item = QTableWidgetItem()
+                esi_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+                esi_item.setCheckState(Qt.CheckState.Checked if att.esi_applicable else Qt.CheckState.Unchecked)
+                esi_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table.setItem(i, 13, esi_item)
                     
         m_cb.currentTextChanged.connect(refresh)
         u_cb.currentTextChanged.connect(refresh)
@@ -1354,6 +1370,8 @@ class PayrollApp(QMainWindow):
         cl.addSpacing(20)
         cl.addWidget(QLabel("<b>Unit:</b>"))
         u_cb = QComboBox(); u_cb.addItems(_unit_filter_list()); u_cb.setFixedWidth(140); cl.addWidget(u_cb)
+        cl.addSpacing(20)
+        s_ent = QLineEdit(); s_ent.setPlaceholderText("Search Name / ID…"); s_ent.setFixedWidth(170); cl.addWidget(s_ent)
         cl.addStretch()
         ref_btn = QPushButton("🔄 Refresh")
         ref_btn.setStyleSheet(f"background-color: {SURFACE_3};")
@@ -1369,6 +1387,8 @@ class PayrollApp(QMainWindow):
         content_layout.setContentsMargins(28, 0, 28, 20)
         layout.addWidget(content)
         
+        _all_results_cache = []
+
         def refresh():
             sync_combo(m_cb, month_options())
             sync_combo(u_cb, _unit_filter_list())
@@ -1385,21 +1405,27 @@ class PayrollApp(QMainWindow):
                 return workers, sw, list(att_dict.values()), month, unit
                 
             def _render(data):
+                nonlocal _all_results_cache
                 workers, sw, att, month, unit = data
                 while content_layout.count():
                     it = content_layout.takeAt(0)
                     if it.widget(): it.widget().deleteLater()
                 if unit != "All": workers = [w for w in workers if w.unit == unit]
                 results, warnings = calculate_payroll(workers, sw, att, month, get_config())
+                _all_results_cache = results
                 
                 if not results:
                     content_layout.addWidget(QLabel("No payroll data."))
                     return
-                
-                _section_label(content_layout, f"📊 Ready: {len(results)} slip(s)")
+
+                # ── apply search filter if text already present ─────────────
+                q = s_ent.text().strip().lower()
+                filtered = [r for r in results if q in r.worker_name.lower() or q in r.worker_id.lower()] if q else results
+
+                _section_label(content_layout, f"📊 Ready: {len(filtered)} slip(s)")
                 table = StyledTable(("ID","Name","Unit","Skill","Designation","Net Pay (₹)"), [70,150,100,80,130,120])
                 table.insert_rows([(r.worker_id, r.worker_name, r.unit, r.skill_category,
-                                    r.profile_title, fmt_inr(r.net_pay)) for r in results])
+                                    r.profile_title, fmt_inr(r.net_pay)) for r in filtered])
                 # Make rows single-click selectable
                 table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
                 content_layout.addWidget(table, 1)
@@ -1437,7 +1463,7 @@ class PayrollApp(QMainWindow):
                 sc.addWidget(sel_icon)
 
                 sel_w = QComboBox()
-                sel_w.addItems([f"{r.worker_id} — {r.worker_name}" for r in results])
+                sel_w.addItems([f"{r.worker_id} — {r.worker_name}" for r in filtered])
                 sel_w.setMinimumWidth(260)
                 sel_w.setStyleSheet(
                     f"background-color: {SURFACE_3}; color: {TEXT_PRIMARY}; "
@@ -1447,7 +1473,7 @@ class PayrollApp(QMainWindow):
 
                 def gen_s():
                     wid = sel_w.currentText().split(" — ")[0]
-                    r = next((r for r in results if r.worker_id == wid), None)
+                    r = next((r for r in _all_results_cache if r.worker_id == wid), None)
                     if r:
                         od = QFileDialog.getExistingDirectory(self, "Output Folder")
                         if od:
@@ -1486,9 +1512,65 @@ class PayrollApp(QMainWindow):
                 table.itemSelectionChanged.connect(_on_row_selected)
                 
             self._async_load(_fetch, _render)
-            
+
+        def _apply_search():
+            """Filter already-loaded results without re-fetching from DB."""
+            if not _all_results_cache:
+                return
+            q = s_ent.text().strip().lower()
+            filtered = [r for r in _all_results_cache if q in r.worker_name.lower() or q in r.worker_id.lower()] if q else _all_results_cache
+            # Rebuild content area with filtered data
+            while content_layout.count():
+                it = content_layout.takeAt(0)
+                if it.widget(): it.widget().deleteLater()
+            if not filtered:
+                content_layout.addWidget(QLabel("No matching workers."))
+                return
+            _section_label(content_layout, f"📊 Ready: {len(filtered)} slip(s)")
+            tbl = StyledTable(("ID","Name","Unit","Skill","Designation","Net Pay (₹)"), [70,150,100,80,130,120])
+            tbl.insert_rows([(r.worker_id, r.worker_name, r.unit, r.skill_category,
+                              r.profile_title, fmt_inr(r.net_pay)) for r in filtered])
+            tbl.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            content_layout.addWidget(tbl, 1)
+
+            sc_frame2 = QFrame()
+            sc_frame2.setStyleSheet(f"background-color: {SURFACE_2}; border-radius: 8px; border: 1px solid {CARD_BORDER};")
+            sc2 = QHBoxLayout(sc_frame2); sc2.setContentsMargins(12, 8, 12, 8); sc2.setSpacing(10)
+            sc2.addWidget(QLabel("👤", styleSheet="font-size: 18px; background: transparent; border: none;"))
+            sel_w2 = QComboBox()
+            sel_w2.addItems([f"{r.worker_id} — {r.worker_name}" for r in filtered])
+            sel_w2.setMinimumWidth(260)
+            sel_w2.setStyleSheet(f"background-color: {SURFACE_3}; color: {TEXT_PRIMARY}; border: 1px solid {ACCENT}; border-radius: 5px; padding: 5px 8px;")
+            sc2.addWidget(sel_w2, 1)
+            def _gen_s2():
+                wid = sel_w2.currentText().split(" — ")[0]
+                rec = next((r for r in _all_results_cache if r.worker_id == wid), None)
+                if rec:
+                    od = QFileDialog.getExistingDirectory(self, "Output Folder")
+                    if od:
+                        p = generate_slip_pdf(rec, get_config(), od)
+                        self.set_message(f"✅ Saved: {p}", SUCCESS)
+            btn_gen2 = QPushButton("📄 Generate Single")
+            btn_gen2.setStyleSheet(f"background-color: {SUCCESS}; color: white; font-weight: bold; padding: 8px 18px; border-radius: 6px; border: none;")
+            btn_gen2.setMinimumWidth(160)
+            btn_gen2.clicked.connect(_gen_s2)
+            sc2.addWidget(btn_gen2)
+            content_layout.addWidget(sc_frame2)
+
+            result_map2 = {r.worker_id: f"{r.worker_id} — {r.worker_name}" for r in filtered}
+            def _on_row2():
+                rows = tbl.selectionModel().selectedRows()
+                if not rows: return
+                wid_item = tbl.item(rows[0].row(), 0)
+                if wid_item and result_map2.get(wid_item.text()):
+                    sel_w2.blockSignals(True)
+                    sel_w2.setCurrentText(result_map2[wid_item.text()])
+                    sel_w2.blockSignals(False)
+            tbl.itemSelectionChanged.connect(_on_row2)
+
         m_cb.currentTextChanged.connect(refresh)
         u_cb.currentTextChanged.connect(refresh)
+        s_ent.textChanged.connect(_apply_search)
         ref_btn.clicked.connect(refresh)
         refresh()
 

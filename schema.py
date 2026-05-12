@@ -104,6 +104,7 @@ class AttendanceRecord:
     # Manual deduction overrides (0 = let engine calculate)
     epf_override      : float = 0.0
     esi_override      : float = 0.0
+    esi_applicable    : bool  = True   # Toggle: False = no ESI deducted
     welfare_fund      : float = 0.0
     tds               : float = 0.0
     profession_tax    : float = 0.0

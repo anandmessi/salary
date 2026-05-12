@@ -6,9 +6,9 @@ Wages determined by SKILL CATEGORY:
   - Basic = days_present × daily_wage (from skill category).
 
 Deductions:
-  EPF = 12% of (Basic + DA)  if (Basic + DA) < ₹15,000
-        ₹1,800 flat          if (Basic + DA) ≥ ₹15,000
-  ESI = 0.75% of (Basic + DA) if gross ≤ ₹21,000
+  EPF = 12% of Gross  if Gross < ₹15,000
+        ₹1,800 flat   if Gross ≥ ₹15,000
+  ESI = 0.75% of Gross if gross ≤ ₹21,000 (Unskilled exempt)
 """
 
 from __future__ import annotations
@@ -51,8 +51,8 @@ def calculate_single(
         2,
     )
 
-    # ── PF/ESI basis = Basic + DA ───────────────────────────────────────
-    pf_esi_basis = round(basic + att.da, 2)
+    # ── PF/ESI basis = Gross salary ──────────────────────────────────────
+    pf_esi_basis = gross
 
     # EPF — 12% if PF basis < ₹15,000; flat ₹1,800 if ₹15,000 or above
     if att.epf_override > 0:
@@ -65,6 +65,8 @@ def calculate_single(
     # ESI — Unskilled workers are exempt; others apply rate if within ceiling
     if att.esi_override > 0:
         esi = round(att.esi_override, 2)
+    elif not att.esi_applicable:
+        esi = 0.0
     elif worker.skill_category.lower() == "unskilled":
         esi = 0.0
     elif gross <= config.esi_ceiling:
