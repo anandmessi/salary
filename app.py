@@ -895,10 +895,12 @@ class PayrollApp(QMainWindow):
         self._build_att_csv(tc_l)
 
     def _build_att_manual(self, layout):
-        opts = month_options(); config = get_config()
+        from PyQt6.QtWidgets import QCheckBox, QScrollArea
+
+        # ── Control bar ──────────────────────────────────────────────────
         ctrl = QWidget(); cl = QHBoxLayout(ctrl); cl.setContentsMargins(12, 12, 12, 8)
         cl.addWidget(QLabel("<b>Month:</b>"))
-        m_cb = QComboBox(); m_cb.addItems(opts); m_cb.setFixedWidth(140); cl.addWidget(m_cb)
+        m_cb = QComboBox(); m_cb.addItems(month_options()); m_cb.setFixedWidth(140); cl.addWidget(m_cb)
         cl.addSpacing(20)
         cl.addWidget(QLabel("<b>Unit:</b>"))
         u_cb = QComboBox(); u_cb.addItems(_unit_filter_list()); u_cb.setFixedWidth(140); cl.addWidget(u_cb)
@@ -906,47 +908,53 @@ class PayrollApp(QMainWindow):
         s_ent = QLineEdit(); s_ent.setPlaceholderText("Search Name/ID..."); s_ent.setFixedWidth(140); cl.addWidget(s_ent)
         cl.addStretch()
         layout.addWidget(ctrl)
-        
-        table = StyledTable(
-            ("ID","Name","Unit","Skill","Designation","Days","OT Hrs","DA","HRA","CCA","Bonus","Arrears","Adv Repay","ESI"),
-            [60,140,80,80,120,50,60,60,60,60,60,70,80,50],
-            editable=True, stretch_last=True
-        )
-        layout.addWidget(table, 1)
-        
+
+        # ── Scrollable worker list ────────────────────────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        list_widget = QWidget()
+        list_layout = QVBoxLayout(list_widget)
+        list_layout.setSpacing(3)
+        list_layout.setContentsMargins(4, 4, 4, 4)
+        scroll.setWidget(list_widget)
+        layout.addWidget(scroll, 1)
+
         self._att_workers = []
-        
-        def save_all():
-            records = []
-            month = m_cb.currentText()
-            existing_db = {a.worker_id: a for a in get_attendance(month)}
-            for row in range(table.rowCount()):
-                wid = table.item(row, 0).text()
-                att = existing_db.get(wid, AttendanceRecord(wid, month))
-                try: att.days_present = float(table.item(row, 5).text())
-                except: att.days_present = 0.0
-                try: att.overtime_hours = float(table.item(row, 6).text())
-                except: att.overtime_hours = 0.0
-                try: att.da = float(table.item(row, 7).text())
-                except: att.da = 0.0
-                try: att.hra = float(table.item(row, 8).text())
-                except: att.hra = 0.0
-                try: att.cca = float(table.item(row, 9).text())
-                except: att.cca = 0.0
-                try: att.bonus = float(table.item(row, 10).text())
-                except: att.bonus = 0.0
-                try: att.arrears = float(table.item(row, 11).text())
-                except: att.arrears = 0.0
-                try: att.advance_repayment = float(table.item(row, 12).text())
-                except: att.advance_repayment = 0.0
-                # ESI toggle (col 13) — checkbox
-                esi_item = table.item(row, 13)
-                att.esi_applicable = (esi_item is not None and esi_item.checkState() == Qt.CheckState.Checked)
-                records.append(att)
-            bulk_upsert_attendance(records)
-            self.set_message(f"✅ Saved {len(records)} records for {month}", SUCCESS)
-            
+        _row_data = []   # list of dicts keyed by widget references
+
+        # ── Helpers ───────────────────────────────────────────────────────
+        def _le(val, w=58):
+            e = QLineEdit(str(val))
+            e.setFixedWidth(w)
+            e.setStyleSheet(
+                f"background-color: {SURFACE_2}; border: 1px solid {CARD_BORDER}; "
+                f"border-radius: 3px; padding: 2px 4px; color: {TEXT_PRIMARY}; font-size: 11px;"
+            )
+            return e
+
+        def _lbl(text, width=None, muted=True):
+            lb = QLabel(str(text))
+            lb.setStyleSheet(
+                f"color: {TEXT_SECONDARY if muted else TEXT_PRIMARY}; font-size: 11px; "
+                "background: transparent; border: none;"
+            )
+            if width: lb.setFixedWidth(width)
+            return lb
+
+        def _mini_lbl(text):
+            lb = QLabel(text)
+            lb.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 9px; background: transparent; border: none;")
+            return lb
+
+        # ── Build worker rows ─────────────────────────────────────────────
         def refresh():
+            nonlocal _row_data
+            _row_data = []
+            while list_layout.count():
+                it = list_layout.takeAt(0)
+                if it.widget(): it.widget().deleteLater()
+
             sync_combo(m_cb, month_options())
             sync_combo(u_cb, _unit_filter_list())
             workers = get_all_workers()
@@ -954,36 +962,142 @@ class PayrollApp(QMainWindow):
             if unit != "All": workers = [w for w in workers if w.unit == unit]
             q = s_ent.text().strip().lower()
             if q: workers = [w for w in workers if q in w.name.lower() or q in w.worker_id.lower()]
-            
-            existing = {a.worker_id: a for a in get_attendance(m_cb.currentText())}
             self._att_workers = workers
-            table.setRowCount(0)
-            table.setRowCount(len(workers))
-            for i, w in enumerate(workers):
+            existing = {a.worker_id: a for a in get_attendance(m_cb.currentText())}
+
+            for w in workers:
                 att = existing.get(w.worker_id, AttendanceRecord(w.worker_id, m_cb.currentText()))
-                for j, v in enumerate([w.worker_id, w.name, w.unit, w.skill_category, w.designation,
-                                       str(att.days_present), str(att.overtime_hours),
-                                       str(att.da), str(att.hra), str(att.cca),
-                                       str(att.bonus), str(att.arrears), str(att.advance_repayment)]):
-                    it = QTableWidgetItem(v)
-                    if j < 5: it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    table.setItem(i, j, it)
-                # ESI checkbox (col 13)
-                esi_item = QTableWidgetItem()
-                esi_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
-                esi_item.setCheckState(Qt.CheckState.Checked if att.esi_applicable else Qt.CheckState.Unchecked)
-                esi_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                table.setItem(i, 13, esi_item)
-                    
+
+                # Outer card
+                card = QFrame()
+                card.setStyleSheet(
+                    f"QFrame {{ background-color: {SURFACE_3}; border-radius: 6px; "
+                    f"border: 1px solid {CARD_BORDER}; }}"
+                )
+                card_l = QVBoxLayout(card)
+                card_l.setContentsMargins(4, 3, 4, 3)
+                card_l.setSpacing(0)
+
+                # ── Compact top row ────────────────────────────────────────
+                top = QWidget()
+                top.setStyleSheet("background: transparent; border: none;")
+                tl = QHBoxLayout(top)
+                tl.setContentsMargins(2, 2, 2, 2)
+                tl.setSpacing(6)
+
+                arrow = QPushButton("▶")
+                arrow.setFixedSize(22, 22)
+                arrow.setToolTip("Expand extras: DA, HRA, CCA, Bonus, Arrears, Adv Repay, Fine, Loss/Dmg, Other Ded")
+                arrow.setStyleSheet(
+                    f"QPushButton {{ background-color: {SURFACE_2}; color: {ACCENT}; "
+                    f"border-radius: 4px; font-size: 9px; font-weight: bold; border: 1px solid {CARD_BORDER}; }}"
+                    f"QPushButton:hover {{ background-color: {ACCENT}; color: white; }}"
+                )
+                arrow.setCursor(Qt.CursorShape.PointingHandCursor)
+                tl.addWidget(arrow)
+
+                tl.addWidget(_lbl(w.worker_id, 62, muted=False))
+                tl.addWidget(_lbl(w.name, 150, muted=False))
+                tl.addWidget(_lbl(w.unit, 82))
+                tl.addWidget(_lbl(w.designation or w.skill_category, 110))
+
+                tl.addWidget(_lbl("Days", 28))
+                e_days = _le(att.days_present, 56); tl.addWidget(e_days)
+                tl.addWidget(_lbl("OT", 18))
+                e_ot   = _le(att.overtime_hours, 50); tl.addWidget(e_ot)
+
+                esi_cb = QCheckBox("ESI")
+                esi_cb.setChecked(False)
+                esi_cb.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px; background: transparent; border: none; margin-left: 6px;")
+                tl.addWidget(esi_cb)
+                tl.addStretch()
+                card_l.addWidget(top)
+
+                # ── Expandable extras row (hidden by default) ──────────────
+                expand = QFrame()
+                expand.setVisible(False)
+                expand.setStyleSheet(
+                    f"background-color: {SURFACE_2}; border-top: 1px solid {CARD_BORDER}; "
+                    "border-radius: 0; border-bottom-left-radius: 5px; border-bottom-right-radius: 5px;"
+                )
+                el = QHBoxLayout(expand)
+                el.setContentsMargins(30, 5, 8, 5)
+                el.setSpacing(10)
+
+                def _field(lbl_txt, val):
+                    vbox = QVBoxLayout(); vbox.setSpacing(1)
+                    vbox.addWidget(_mini_lbl(lbl_txt))
+                    e = _le(val, 65)
+                    vbox.addWidget(e)
+                    el.addLayout(vbox)
+                    return e
+
+                e_da      = _field("DA",         att.da)
+                e_hra     = _field("HRA",        att.hra)
+                e_cca     = _field("CCA",        att.cca)
+                e_bonus   = _field("Bonus",      att.bonus)
+                e_arrears = _field("Arrears",    att.arrears)
+                e_advrep  = _field("Adv Repay",  att.advance_repayment)
+                e_fine    = _field("Fine",       att.fine)
+                e_loss    = _field("Loss/Dmg",   att.loss_damages)
+                e_other   = _field("Other Ded",  att.other_deductions)
+                el.addStretch()
+                card_l.addWidget(expand)
+
+                # Wire arrow toggle — lambda absorbs the bool emitted by clicked signal
+                def _toggle(_, exp=expand, btn=arrow):
+                    vis = not exp.isVisible()
+                    exp.setVisible(vis)
+                    btn.setText("▼" if vis else "▶")
+                arrow.clicked.connect(_toggle)
+
+                list_layout.addWidget(card)
+
+                _row_data.append({
+                    "wid": w.worker_id, "month": m_cb.currentText(),
+                    "days": e_days, "ot": e_ot, "esi": esi_cb,
+                    "da": e_da, "hra": e_hra, "cca": e_cca,
+                    "bonus": e_bonus, "arrears": e_arrears, "advrep": e_advrep,
+                    "fine": e_fine, "loss": e_loss, "other": e_other,
+                })
+
+            list_layout.addStretch()
+
+        # ── Save ─────────────────────────────────────────────────────────
+        def save_all():
+            month = m_cb.currentText()
+            existing_db = {a.worker_id: a for a in get_attendance(month)}
+            records = []
+            for d in _row_data:
+                att = existing_db.get(d["wid"], AttendanceRecord(d["wid"], month))
+                def _f(e):
+                    try: return float(e.text())
+                    except: return 0.0
+                att.days_present      = _f(d["days"])
+                att.overtime_hours    = _f(d["ot"])
+                att.da                = _f(d["da"])
+                att.hra               = _f(d["hra"])
+                att.cca               = _f(d["cca"])
+                att.bonus             = _f(d["bonus"])
+                att.arrears           = _f(d["arrears"])
+                att.advance_repayment = _f(d["advrep"])
+                att.fine              = _f(d["fine"])
+                att.loss_damages      = _f(d["loss"])
+                att.other_deductions  = _f(d["other"])
+                att.esi_applicable    = d["esi"].isChecked()
+                records.append(att)
+            bulk_upsert_attendance(records)
+            self.set_message(f"✅ Saved {len(records)} records for {month}", SUCCESS)
+
         m_cb.currentTextChanged.connect(refresh)
         u_cb.currentTextChanged.connect(refresh)
         s_ent.textChanged.connect(refresh)
-        
+
         btn = QPushButton("💾 Save All Attendance")
         btn.setStyleSheet(f"background-color: {SUCCESS}; height: 30px;")
         btn.clicked.connect(save_all)
         layout.addWidget(btn)
-        
+
         refresh()
 
     def _build_att_csv(self, layout):
@@ -1336,23 +1450,18 @@ class PayrollApp(QMainWindow):
             vi.addWidget(QLabel(cat, styleSheet="font-size: 15px; font-weight: bold; color: white;"))
             vi.addWidget(QLabel("Skill Category", styleSheet="font-size: 10px; color: white;"))
             cfl.addLayout(vi); cfl.addStretch()
-            
             vd = QVBoxLayout(); vd.addWidget(QLabel("Daily Wage (₹)", styleSheet="font-size: 10px; color: white;"))
             ed = QLineEdit(str(sw.daily_wage)); ed.setFixedWidth(110); vd.addWidget(ed); cfl.addLayout(vd)
-            
             vo = QVBoxLayout(); vo.addWidget(QLabel("OT Rate (₹/hr)", styleSheet="font-size: 10px; color: white;"))
             eo = QLineEdit(str(sw.ot_rate)); eo.setFixedWidth(110); vo.addWidget(eo); cfl.addLayout(vo)
-            
             entries[cat] = {"dw": ed, "ot": eo}
             cwl.addWidget(cf)
-            
         def sv():
             for cat, e in entries.items():
                 try: dw = float(e["dw"].text() or 0); ot = float(e["ot"].text() or 0)
                 except: continue
                 upsert_skill_wage(SkillWage(cat, dw, ot))
             self.set_message("✅ Wage rates saved!", SUCCESS)
-            
         bs = QPushButton("💾 Save All Wage Rates")
         bs.setStyleSheet(f"background-color: {SUCCESS}; height: 35px;")
         bs.clicked.connect(sv)
@@ -1411,166 +1520,148 @@ class PayrollApp(QMainWindow):
                     it = content_layout.takeAt(0)
                     if it.widget(): it.widget().deleteLater()
                 if unit != "All": workers = [w for w in workers if w.unit == unit]
-                results, warnings = calculate_payroll(workers, sw, att, month, get_config())
+                results, _ = calculate_payroll(workers, sw, att, month, get_config())
                 _all_results_cache = results
-                
+
                 if not results:
-                    content_layout.addWidget(QLabel("No payroll data."))
+                    empty = QLabel("📭  No payroll data for this period.")
+                    empty.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 14px; margin: 40px;")
+                    empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    content_layout.addWidget(empty)
                     return
 
-                # ── apply search filter if text already present ─────────────
+                # ── Summary strip ──────────────────────────────────────────
+                from PyQt6.QtWidgets import QCheckBox
                 q = s_ent.text().strip().lower()
                 filtered = [r for r in results if q in r.worker_name.lower() or q in r.worker_id.lower()] if q else results
 
-                _section_label(content_layout, f"📊 Ready: {len(filtered)} slip(s)")
-                table = StyledTable(("ID","Name","Unit","Skill","Designation","Net Pay (₹)"), [70,150,100,80,130,120])
-                table.insert_rows([(r.worker_id, r.worker_name, r.unit, r.skill_category,
-                                    r.profile_title, fmt_inr(r.net_pay)) for r in filtered])
-                # Make rows single-click selectable
-                table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-                content_layout.addWidget(table, 1)
+                summary = QFrame()
+                summary.setStyleSheet(f"background-color: {SURFACE_2}; border-radius: 8px; border: 1px solid {CARD_BORDER};")
+                sl = QHBoxLayout(summary); sl.setContentsMargins(16, 10, 16, 10)
+                unit_label = unit if unit != "All" else "All Units"
+                sl.addWidget(QLabel(f"📅 <b>{month}</b>", styleSheet=f"color: {TEXT_PRIMARY}; font-size: 13px;"))
+                sl.addSpacing(20)
+                sl.addWidget(QLabel(f"🏢 <b>{unit_label}</b>", styleSheet=f"color: {ACCENT}; font-size: 13px;"))
+                sl.addSpacing(20)
+                sl.addWidget(QLabel(f"👷 <b>{len(filtered)}</b> worker(s)", styleSheet=f"color: {SUCCESS}; font-size: 13px;"))
+                sl.addStretch()
+                content_layout.addWidget(summary)
 
+                # ── Action bar ─────────────────────────────────────────────
+                act = QFrame()
+                act.setStyleSheet(f"background-color: {SURFACE_3}; border-radius: 8px; border: 1px solid {CARD_BORDER};")
+                al = QHBoxLayout(act); al.setContentsMargins(12, 8, 12, 8); al.setSpacing(8)
+
+                hint = QLabel("☑  Tick workers → Generate Selected   |   Leave all unticked → use All as ZIP")
+                hint.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 10px;")
+                al.addWidget(hint); al.addStretch()
+
+                sel_all_btn  = QPushButton("☑ Select All")
+                sel_none_btn = QPushButton("☐ Clear")
+                for b in (sel_all_btn, sel_none_btn):
+                    b.setStyleSheet(f"background-color: {SURFACE_2}; color: {TEXT_SECONDARY}; padding: 5px 12px; border-radius: 5px; font-size: 11px;")
+                    b.setFixedHeight(30)
+
+                gen_sel_btn = QPushButton("📄  Generate Selected")
+                gen_sel_btn.setStyleSheet(
+                    f"background-color: {SUCCESS}; color: white; font-weight: bold; "
+                    f"padding: 6px 20px; border-radius: 6px; font-size: 12px;"
+                )
+                gen_sel_btn.setFixedHeight(34)
+
+                gen_all_btn = QPushButton("📦  All as ZIP")
+                gen_all_btn.setStyleSheet(
+                    f"background-color: {ACCENT}; color: white; font-weight: bold; "
+                    f"padding: 6px 16px; border-radius: 6px; font-size: 12px;"
+                )
+                gen_all_btn.setFixedHeight(34)
+
+                al.addWidget(sel_all_btn)
+                al.addWidget(sel_none_btn)
+                al.addSpacing(12)
+                al.addWidget(gen_sel_btn)
+                al.addWidget(gen_all_btn)
+                content_layout.addWidget(act)
+
+                # ── Worker table (Print? checkbox + info only) ─────────────
+                slip_table = StyledTable(
+                    ("Print?", "ID", "Name", "Unit", "Skill", "Designation", "Net Pay (₹)"),
+                    [55, 72, 160, 110, 95, 140, 120],
+                    stretch_last=True
+                )
+                slip_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+                slip_table.setRowCount(len(filtered))
+
+                _print_checks = []
+
+                for i, r in enumerate(filtered):
+                    chk = QCheckBox()
+                    chk.setChecked(False)
+                    chk.setStyleSheet("margin-left: 16px;")
+                    slip_table.setCellWidget(i, 0, chk)
+                    _print_checks.append(chk)
+
+                    net_color = SUCCESS if r.net_pay > 0 else DANGER
+                    for c, val in enumerate([r.worker_id, r.worker_name, r.unit,
+                                             r.skill_category, r.profile_title, fmt_inr(r.net_pay)]):
+                        cell = QTableWidgetItem(str(val))
+                        cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                        if c == 5:  # Net Pay column
+                            cell.setForeground(QColor(net_color))
+                            cell.setFont(QFont(FONT_FAMILY, 9, QFont.Weight.Bold))
+                        slip_table.setItem(i, c + 1, cell)
+
+                content_layout.addWidget(slip_table, 1)
+
+                # ── Bulk toggles ───────────────────────────────────────────
+                sel_all_btn.clicked.connect(lambda: [cb.setChecked(True)  for cb in _print_checks])
+                sel_none_btn.clicked.connect(lambda: [cb.setChecked(False) for cb in _print_checks])
+
+                # ── Generate Selected ──────────────────────────────────────
+                def gen_selected():
+                    chosen = [filtered[i] for i in range(len(filtered)) if _print_checks[i].isChecked()]
+                    if not chosen:
+                        QMessageBox.information(self, "Nothing Selected",
+                                                "Please tick at least one worker in the Print? column.")
+                        return
+                    od = QFileDialog.getExistingDirectory(self, "Output Folder for Slips")
+                    if not od: return
+                    self.set_message(f"⏳ Generating {len(chosen)} slip(s)...", ACCENT)
+                    cfg = get_config()
+                    def do():
+                        return [generate_slip_pdf(r, cfg, od) for r in chosen]
+                    self._pdf_thread = FetchThread(do)
+                    self._pdf_thread.result_ready.connect(
+                        lambda paths: self.set_message(f"✅ {len(paths)} slip(s) saved → {od}", SUCCESS))
+                    self._pdf_thread.start()
+
+                # ── All as ZIP ─────────────────────────────────────────────
                 def gen_all():
-                    path, _ = QFileDialog.getSaveFileName(self, "Save ZIP", f"SalarySlips_{month}.zip", "ZIP (*.zip)")
-                    if path:
-                        self.set_message("⏳ Generating...", ACCENT)
-                        def do():
-                            td = tempfile.mkdtemp()
-                            gen = generate_bulk_pdfs(results, get_config(), td, zip_output=True, zip_only=True)
-                            if gen.get("zip_path"):
-                                import shutil; shutil.move(gen["zip_path"], path)
-                            return True
-                        self._pdf_thread = FetchThread(do)
-                        self._pdf_thread.result_ready.connect(lambda _: self.set_message("✅ Done", SUCCESS))
-                        self._pdf_thread.start()
+                    unit_tag = unit if unit != "All" else "All"
+                    path, _ = QFileDialog.getSaveFileName(self, "Save ZIP",
+                                                          f"SalarySlips_{month}_{unit_tag}.zip", "ZIP (*.zip)")
+                    if not path: return
+                    snap = list(filtered)
+                    self.set_message(f"⏳ Generating {len(snap)} slip(s)...", ACCENT)
+                    def do():
+                        import shutil
+                        td = tempfile.mkdtemp()
+                        gen = generate_bulk_pdfs(snap, get_config(), td, zip_output=True, zip_only=True)
+                        if gen.get("zip_path"): shutil.move(gen["zip_path"], path)
+                        return True
+                    self._pdf_zip_thread = FetchThread(do)
+                    self._pdf_zip_thread.result_ready.connect(
+                        lambda _: self.set_message(f"✅ ZIP saved — {len(snap)} slips!", SUCCESS))
+                    self._pdf_zip_thread.start()
 
-                bz = QPushButton("📦 Download All as ZIP")
-                bz.clicked.connect(gen_all)
-                content_layout.addWidget(bz)
+                gen_sel_btn.clicked.connect(gen_selected)
+                gen_all_btn.clicked.connect(gen_all)
 
-                # ── Single slip bar ────────────────────────────────────────
-                sc_frame = QFrame()
-                sc_frame.setStyleSheet(
-                    f"background-color: {SURFACE_2}; border-radius: 8px; "
-                    f"border: 1px solid {CARD_BORDER};"
-                )
-                sc = QHBoxLayout(sc_frame)
-                sc.setContentsMargins(12, 8, 12, 8)
-                sc.setSpacing(10)
-
-                sel_icon = QLabel("👤")
-                sel_icon.setStyleSheet("font-size: 18px; background: transparent; border: none;")
-                sc.addWidget(sel_icon)
-
-                sel_w = QComboBox()
-                sel_w.addItems([f"{r.worker_id} — {r.worker_name}" for r in filtered])
-                sel_w.setMinimumWidth(260)
-                sel_w.setStyleSheet(
-                    f"background-color: {SURFACE_3}; color: {TEXT_PRIMARY}; "
-                    f"border: 1px solid {ACCENT}; border-radius: 5px; padding: 5px 8px;"
-                )
-                sc.addWidget(sel_w, 1)
-
-                def gen_s():
-                    wid = sel_w.currentText().split(" — ")[0]
-                    r = next((r for r in _all_results_cache if r.worker_id == wid), None)
-                    if r:
-                        od = QFileDialog.getExistingDirectory(self, "Output Folder")
-                        if od:
-                            p = generate_slip_pdf(r, get_config(), od)
-                            self.set_message(f"✅ Saved: {p}", SUCCESS)
-
-                bs = QPushButton("📄 Generate Single")
-                bs.setStyleSheet(
-                    f"background-color: {SUCCESS}; color: white; "
-                    f"font-weight: bold; padding: 8px 18px; border-radius: 6px; border: none;"
-                )
-                bs.setMinimumWidth(160)
-                bs.clicked.connect(gen_s)
-                sc.addWidget(bs)
-
-                content_layout.addWidget(sc_frame)
-
-                # ── Wire table row click → combobox selection ──────────────
-                result_map = {r.worker_id: f"{r.worker_id} — {r.worker_name}" for r in results}
-
-                def _on_row_selected():
-                    rows = table.selectionModel().selectedRows()
-                    if not rows:
-                        return
-                    row = rows[0].row()
-                    wid_item = table.item(row, 0)
-                    if not wid_item:
-                        return
-                    wid = wid_item.text()
-                    label = result_map.get(wid, "")
-                    if label:
-                        sel_w.blockSignals(True)
-                        sel_w.setCurrentText(label)
-                        sel_w.blockSignals(False)
-
-                table.itemSelectionChanged.connect(_on_row_selected)
-                
             self._async_load(_fetch, _render)
-
-        def _apply_search():
-            """Filter already-loaded results without re-fetching from DB."""
-            if not _all_results_cache:
-                return
-            q = s_ent.text().strip().lower()
-            filtered = [r for r in _all_results_cache if q in r.worker_name.lower() or q in r.worker_id.lower()] if q else _all_results_cache
-            # Rebuild content area with filtered data
-            while content_layout.count():
-                it = content_layout.takeAt(0)
-                if it.widget(): it.widget().deleteLater()
-            if not filtered:
-                content_layout.addWidget(QLabel("No matching workers."))
-                return
-            _section_label(content_layout, f"📊 Ready: {len(filtered)} slip(s)")
-            tbl = StyledTable(("ID","Name","Unit","Skill","Designation","Net Pay (₹)"), [70,150,100,80,130,120])
-            tbl.insert_rows([(r.worker_id, r.worker_name, r.unit, r.skill_category,
-                              r.profile_title, fmt_inr(r.net_pay)) for r in filtered])
-            tbl.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-            content_layout.addWidget(tbl, 1)
-
-            sc_frame2 = QFrame()
-            sc_frame2.setStyleSheet(f"background-color: {SURFACE_2}; border-radius: 8px; border: 1px solid {CARD_BORDER};")
-            sc2 = QHBoxLayout(sc_frame2); sc2.setContentsMargins(12, 8, 12, 8); sc2.setSpacing(10)
-            sc2.addWidget(QLabel("👤", styleSheet="font-size: 18px; background: transparent; border: none;"))
-            sel_w2 = QComboBox()
-            sel_w2.addItems([f"{r.worker_id} — {r.worker_name}" for r in filtered])
-            sel_w2.setMinimumWidth(260)
-            sel_w2.setStyleSheet(f"background-color: {SURFACE_3}; color: {TEXT_PRIMARY}; border: 1px solid {ACCENT}; border-radius: 5px; padding: 5px 8px;")
-            sc2.addWidget(sel_w2, 1)
-            def _gen_s2():
-                wid = sel_w2.currentText().split(" — ")[0]
-                rec = next((r for r in _all_results_cache if r.worker_id == wid), None)
-                if rec:
-                    od = QFileDialog.getExistingDirectory(self, "Output Folder")
-                    if od:
-                        p = generate_slip_pdf(rec, get_config(), od)
-                        self.set_message(f"✅ Saved: {p}", SUCCESS)
-            btn_gen2 = QPushButton("📄 Generate Single")
-            btn_gen2.setStyleSheet(f"background-color: {SUCCESS}; color: white; font-weight: bold; padding: 8px 18px; border-radius: 6px; border: none;")
-            btn_gen2.setMinimumWidth(160)
-            btn_gen2.clicked.connect(_gen_s2)
-            sc2.addWidget(btn_gen2)
-            content_layout.addWidget(sc_frame2)
-
-            result_map2 = {r.worker_id: f"{r.worker_id} — {r.worker_name}" for r in filtered}
-            def _on_row2():
-                rows = tbl.selectionModel().selectedRows()
-                if not rows: return
-                wid_item = tbl.item(rows[0].row(), 0)
-                if wid_item and result_map2.get(wid_item.text()):
-                    sel_w2.blockSignals(True)
-                    sel_w2.setCurrentText(result_map2[wid_item.text()])
-                    sel_w2.blockSignals(False)
-            tbl.itemSelectionChanged.connect(_on_row2)
 
         m_cb.currentTextChanged.connect(refresh)
         u_cb.currentTextChanged.connect(refresh)
-        s_ent.textChanged.connect(_apply_search)
+        s_ent.textChanged.connect(lambda _: refresh())
         ref_btn.clicked.connect(refresh)
         refresh()
 
