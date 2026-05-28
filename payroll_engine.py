@@ -62,14 +62,10 @@ def calculate_single(
     else:
         epf = 1800.0
 
-    # ESI — Unskilled workers are exempt; others apply rate if within ceiling
+    # ESI — determined solely by the per-worker checkbox (esi_applicable)
     if att.esi_override > 0:
         esi = round(att.esi_override, 2)
-    elif not att.esi_applicable:
-        esi = 0.0
-    elif worker.skill_category.lower() == "unskilled":
-        esi = 0.0
-    elif gross <= config.esi_ceiling:
+    elif att.esi_applicable:
         esi = round(pf_esi_basis * (config.esi_rate / 100.0), 2)
     else:
         esi = 0.0

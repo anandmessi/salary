@@ -104,7 +104,7 @@ class AttendanceRecord:
     # Manual deduction overrides (0 = let engine calculate)
     epf_override      : float = 0.0
     esi_override      : float = 0.0
-    esi_applicable    : bool  = True   # Toggle: False = no ESI deducted
+    esi_applicable    : bool  = False  # Toggle: True = deduct ESI for this worker
     welfare_fund      : float = 0.0
     tds               : float = 0.0
     profession_tax    : float = 0.0
@@ -121,7 +121,11 @@ class AttendanceRecord:
     def from_dict(d):
         d = dict(d)
         known = set(AttendanceRecord.__dataclass_fields__)
-        return AttendanceRecord(**{k: d[k] for k in known if k in d})
+        filtered = {k: d[k] for k in known if k in d}
+        # Coerce NULL/None esi_applicable → False (checkbox off by default)
+        if filtered.get('esi_applicable') is None:
+            filtered['esi_applicable'] = False
+        return AttendanceRecord(**filtered)
 
 
 @dataclass

@@ -43,6 +43,28 @@ from payroll_engine import calculate_payroll, payroll_summary
 from pdf_generator import generate_bulk_pdfs, generate_slip_pdf
 from schema import SkillWage
 
+# --- Global Exception Hook to prevent crashes from unhandled slot exceptions ---
+def global_excepthook(exc_type, exc_value, exc_tb):
+    import traceback
+    import logging
+    tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    print(tb_str, file=sys.stderr)
+    logging.critical("Uncaught Exception: %s", tb_str)
+    try:
+        from PyQt6.QtWidgets import QApplication, QMessageBox
+        if QApplication.instance():
+            QMessageBox.critical(
+                None,
+                "Unexpected Error",
+                f"An unexpected error occurred:\n\n{exc_value}\n\n"
+                f"The application will attempt to continue."
+            )
+    except Exception as e:
+        print(f"Error in global excepthook: {e}", file=sys.stderr)
+
+sys.excepthook = global_excepthook
+
+
 # ── Theme ─────────────────────────────────────────────────────────────────────
 ACCENT          = "#3B82F6"      # Electric blue
 ACCENT_HOVER    = "#2563EB"
@@ -452,6 +474,7 @@ class StyledTable(QTableWidget):
             self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
 
     def insert_rows(self, rows, tags=None, checkable_col=None):
+        self.setUpdatesEnabled(False)   # batch all repaints
         self.setRowCount(0)
         self.setRowCount(len(rows))
         for r_idx, row in enumerate(rows):
@@ -467,6 +490,7 @@ class StyledTable(QTableWidget):
                     elif tag == "unskilled": item.setForeground(QColor("white"))
                     elif tag == "inactive": item.setForeground(QColor(TEXT_MUTED))
                 self.setItem(r_idx, c_idx, item)
+        self.setUpdatesEnabled(True)    # flush all repaints at once
 
 class FetchThread(QThread):
     result_ready = pyqtSignal(object)
@@ -772,6 +796,12 @@ class PayrollApp(QMainWindow):
                 return workers, sw, list(att_dict.values()), month, unit
             
             def _render(data):
+                # Guard: bail out if the user navigated away before fetch completed
+                try:
+                    content_layout.count()
+                except RuntimeError:
+                    return
+
                 workers, sw, att, month, unit = data
                 while content_layout.count():
                     it = content_layout.takeAt(0)
@@ -955,12 +985,28 @@ class PayrollApp(QMainWindow):
         # ── Build worker rows ─────────────────────────────────────────────
         def _do_refresh(workers, existing):
             """Runs on the main thread: clears and rebuilds the widget list."""
-            nonlocal _row_data
+            nonlocal _row_data, list_layout, list_widget
             _row_data = []
-            while list_layout.count():
-                it = list_layout.takeAt(0)
-                if it.widget(): it.widget().deleteLater()
 
+            # Guard: if the user navigated away before the async fetch finished,
+            # the scroll QScrollArea will have been deleted — bail out silently.
+            try:
+                scroll.isWidgetType()   # raises RuntimeError if C++ object is gone
+            except RuntimeError:
+                return
+
+            # Swap the old widget out — avoids per-item layout recalculations
+            old_widget = scroll.takeWidget()
+            if old_widget:
+                old_widget.deleteLater()
+
+            new_list_widget = QWidget()
+            new_list_layout = QVBoxLayout(new_list_widget)
+            new_list_layout.setSpacing(3)
+            new_list_layout.setContentsMargins(4, 4, 4, 4)
+
+            # Suppress all repaints until every card is built
+            new_list_widget.setUpdatesEnabled(False)
 
             for w in workers:
                 att = existing.get(w.worker_id, AttendanceRecord(w.worker_id, m_cb.currentText()))
@@ -1049,7 +1095,17 @@ class PayrollApp(QMainWindow):
                     btn.setText("▼" if vis else "▶")
                 arrow.clicked.connect(_toggle)
 
-                list_layout.addWidget(card)
+                # Auto-save ESI flag immediately on checkbox toggle
+                def _esi_changed(state, wid=w.worker_id, month_str=m_cb.currentText()):
+                    from database import get_attendance as _ga
+                    att_list = _ga(month_str)
+                    att_map  = {a.worker_id: a for a in att_list}
+                    rec = att_map.get(wid, AttendanceRecord(wid, month_str))
+                    rec.esi_applicable = bool(state)
+                    bulk_upsert_attendance([rec])
+                esi_cb.stateChanged.connect(_esi_changed)
+
+                new_list_layout.addWidget(card)
 
                 _row_data.append({
                     "wid": w.worker_id, "month": m_cb.currentText(),
@@ -1059,8 +1115,13 @@ class PayrollApp(QMainWindow):
                     "fine": e_fine, "loss": e_loss, "other": e_other,
                 })
 
-            list_layout.addStretch()
+            new_list_layout.addStretch()
+            # Re-enable painting and swap the new widget in
+            new_list_widget.setUpdatesEnabled(True)
+            scroll.setWidget(new_list_widget)
             self._att_workers = workers
+            list_layout  = new_list_layout
+            list_widget  = new_list_widget
 
         def refresh():
             sync_combo(m_cb, month_options())
@@ -1147,15 +1208,19 @@ class PayrollApp(QMainWindow):
         def imp():
             fp, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV (*.csv)")
             if fp:
-                res = import_attendance_from_csv(fp, m_cb.currentText())
-                if res["errors"]:
-                    err_path = os.path.join(os.path.dirname(fp), "import_errors.txt")
-                    with open(err_path, "w") as f:
-                        f.write("\n".join(res["errors"]))
-                    QMessageBox.warning(self, "Import Errors", f"Imported {res['imported']} records.\nEncountered {len(res['errors'])} errors.\n\nDetails saved to: {err_path}")
-                else:
-                    self.set_message(f"✅ Imported {res['imported']} records.", SUCCESS)
-                self._navigate("attendance")
+                try:
+                    res = import_attendance_from_csv(fp, m_cb.currentText())
+                    if res["errors"]:
+                        err_path = os.path.join(os.path.dirname(fp), "import_errors.txt")
+                        with open(err_path, "w") as f:
+                            f.write("\n".join(res["errors"]))
+                        QMessageBox.warning(self, "Import Errors", f"Imported {res['imported']} records.\nEncountered {len(res['errors'])} errors.\n\nDetails saved to: {err_path}")
+                    else:
+                        self.set_message(f"✅ Imported {res['imported']} records.", SUCCESS)
+                    self._navigate("attendance")
+                except Exception as e:
+                    QMessageBox.critical(self, "Import Failed", f"An error occurred during import:\n{e}")
+
         b2 = QPushButton("📁 Import CSV")
         b2.clicked.connect(imp)
         cl.addWidget(b2); cl.addStretch()
@@ -1188,23 +1253,36 @@ class PayrollApp(QMainWindow):
         tl.addWidget(fc)
         
         def _db_cb(row):
-            wid = table.item(row, 1).text()
-            w_obj = get_worker_by_id(wid)
-            name = table.item(row, 2).text().strip()
-            if not name: return
-            bname = table.item(row, 6).text().strip()
-            if bname.startswith("(No"): bname = ""
-            upsert_worker(Worker(
-                worker_id=wid, name=name, unit=table.item(row, 3).text().strip(),
-                skill_category=table.item(row, 4).text().strip(),
-                designation=table.item(row, 5).text().strip(),
-                bank_name=bname, bank_account=table.item(row, 7).text().strip(),
-                ifsc_code=table.item(row, 8).text().strip(),
-                uan_number=table.item(row, 9).text().strip(),
-                esic_number=table.item(row, 10).text().strip(),
-                joining_date=w_obj.joining_date if w_obj else "",
-                active=w_obj.active if w_obj else True))
-            self.set_message(f"✅ {wid} auto-saved!", SUCCESS)
+            try:
+                item_id = table.item(row, 1)
+                item_name = table.item(row, 2)
+                if not item_id or not item_name: return
+                wid = item_id.text().strip()
+                name = item_name.text().strip()
+                if not name or not wid: return
+                w_obj = get_worker_by_id(wid)
+                bname_item = table.item(row, 6)
+                bname = bname_item.text().strip() if bname_item else ""
+                if bname.startswith("(No"): bname = ""
+                
+                def _get_txt(col):
+                    it = table.item(row, col)
+                    return it.text().strip() if it else ""
+                
+                upsert_worker(Worker(
+                    worker_id=wid, name=name, unit=_get_txt(3),
+                    skill_category=_get_txt(4),
+                    designation=_get_txt(5),
+                    bank_name=bname, bank_account=_get_txt(7),
+                    ifsc_code=_get_txt(8),
+                    uan_number=_get_txt(9),
+                    esic_number=_get_txt(10),
+                    joining_date=w_obj.joining_date if w_obj else "",
+                    active=w_obj.active if w_obj else True))
+                self.set_message(f"✅ {wid} auto-saved!", SUCCESS)
+            except Exception as e:
+                self.set_message(f"⚠️ Auto-save failed: {e}", DANGER)
+
 
         cols = ("Sel", "ID", "Name", "Unit", "Skill", "Designation", "Bank", "A/C", "IFSC", "UAN", "ESIC", "Status")
         widths = [30, 55, 140, 80, 80, 90, 100, 110, 95, 85, 75, 70]
@@ -1389,15 +1467,19 @@ class PayrollApp(QMainWindow):
         def imp():
             fp, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV (*.csv)")
             if fp:
-                res = import_workers_from_csv(fp)
-                if res["errors"]:
-                    err_path = os.path.join(os.path.dirname(fp), "import_errors.txt")
-                    with open(err_path, "w") as f:
-                        f.write("\n".join(res["errors"]))
-                    QMessageBox.warning(self, "Import Errors", f"Imported {res['imported']} workers.\nEncountered {len(res['errors'])} errors.\n\nDetails saved to: {err_path}")
-                else:
-                    self.set_message(f"✅ Imported {res['imported']} workers.", SUCCESS)
-                self._navigate("workers")
+                try:
+                    res = import_workers_from_csv(fp)
+                    if res["errors"]:
+                        err_path = os.path.join(os.path.dirname(fp), "import_errors.txt")
+                        with open(err_path, "w") as f:
+                            f.write("\n".join(res["errors"]))
+                        QMessageBox.warning(self, "Import Errors", f"Imported {res['imported']} workers.\nEncountered {len(res['errors'])} errors.\n\nDetails saved to: {err_path}")
+                    else:
+                        self.set_message(f"✅ Imported {res['imported']} workers.", SUCCESS)
+                    self._navigate("workers")
+                except Exception as e:
+                    QMessageBox.critical(self, "Import Failed", f"An error occurred during import:\n{e}")
+
                 
         b2 = QPushButton("📁 Import CSV")
         b2.clicked.connect(imp)
@@ -1561,6 +1643,12 @@ class PayrollApp(QMainWindow):
                 return workers, sw, list(att_dict.values()), month, unit
                 
             def _render(data):
+                # Guard: bail out if the user navigated away before fetch completed
+                try:
+                    content_layout.count()
+                except RuntimeError:
+                    return
+
                 nonlocal _all_results_cache
                 workers, sw, att, month, unit = data
                 while content_layout.count():
@@ -1739,7 +1827,6 @@ class PayrollApp(QMainWindow):
         r3 = QHBoxLayout()
         e_epf = QLineEdit(str(cfg.epf_rate)); v6 = QVBoxLayout(); v6.addWidget(QLabel("EPF Rate (%)")); v6.addWidget(e_epf); r3.addLayout(v6)
         e_esi = QLineEdit(str(cfg.esi_rate)); v7 = QVBoxLayout(); v7.addWidget(QLabel("ESI Rate (%)")); v7.addWidget(e_esi); r3.addLayout(v7)
-        e_esic = QLineEdit(str(cfg.esi_ceiling)); v8 = QVBoxLayout(); v8.addWidget(QLabel("ESI Ceiling (₹)")); v8.addWidget(e_esic); r3.addLayout(v8)
         gl2.addLayout(r3)
         cfl.addLayout(gl2)
         
@@ -1748,9 +1835,8 @@ class PayrollApp(QMainWindow):
             try:
                 epf = float(e_epf.text())
                 esi = float(e_esi.text())
-                esic = float(e_esic.text())
             except: return
-            save_config(CompanyConfig(e_cn.text(), e_a1.text(), e_a2.text(), e_ph.text(), e_em.text(), 26, epf, esi, esic, ""))
+            save_config(CompanyConfig(e_cn.text(), e_a1.text(), e_a2.text(), e_ph.text(), e_em.text(), 26, epf, esi, cfg.esi_ceiling, ""))
             self.set_message("✅ Settings saved!", SUCCESS)
         bs.clicked.connect(sv); cfl.addWidget(bs)
 
@@ -1870,6 +1956,12 @@ class PayrollApp(QMainWindow):
                 return workers, sw, list(att_dict.values()), month, unit, q
 
             def _render(data):
+                # Guard: bail out if the user navigated away before fetch completed
+                try:
+                    table.isWidgetType()
+                except RuntimeError:
+                    return
+
                 workers, sw, att, month, unit, q = data
                 nonlocal _results_cache
                 if unit != "All": workers = [w for w in workers if w.unit == unit]
