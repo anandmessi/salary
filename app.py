@@ -947,23 +947,20 @@ class PayrollApp(QMainWindow):
             lb.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 9px; background: transparent; border: none;")
             return lb
 
+        # ── Debounce timer for search ─────────────────────────────────────
+        _att_search_timer = QTimer()
+        _att_search_timer.setSingleShot(True)
+        _att_search_timer.setInterval(300)
+
         # ── Build worker rows ─────────────────────────────────────────────
-        def refresh():
+        def _do_refresh(workers, existing):
+            """Runs on the main thread: clears and rebuilds the widget list."""
             nonlocal _row_data
             _row_data = []
             while list_layout.count():
                 it = list_layout.takeAt(0)
                 if it.widget(): it.widget().deleteLater()
 
-            sync_combo(m_cb, month_options())
-            sync_combo(u_cb, _unit_filter_list())
-            workers = get_all_workers()
-            unit = u_cb.currentText()
-            if unit != "All": workers = [w for w in workers if w.unit == unit]
-            q = s_ent.text().strip().lower()
-            if q: workers = [w for w in workers if q in w.name.lower() or q in w.worker_id.lower()]
-            self._att_workers = workers
-            existing = {a.worker_id: a for a in get_attendance(m_cb.currentText())}
 
             for w in workers:
                 att = existing.get(w.worker_id, AttendanceRecord(w.worker_id, m_cb.currentText()))
@@ -1007,7 +1004,8 @@ class PayrollApp(QMainWindow):
                 e_ot   = _le(att.overtime_hours, 50); tl.addWidget(e_ot)
 
                 esi_cb = QCheckBox("ESI")
-                esi_cb.setChecked(False)
+                # Load saved esi_applicable value (DB default = 1/True → ESI applied)
+                esi_cb.setChecked(bool(att.esi_applicable))
                 esi_cb.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px; background: transparent; border: none; margin-left: 6px;")
                 tl.addWidget(esi_cb)
                 tl.addStretch()
@@ -1062,6 +1060,25 @@ class PayrollApp(QMainWindow):
                 })
 
             list_layout.addStretch()
+            self._att_workers = workers
+
+        def refresh():
+            sync_combo(m_cb, month_options())
+            sync_combo(u_cb, _unit_filter_list())
+            month = m_cb.currentText()
+            unit  = u_cb.currentText()
+            q     = s_ent.text().strip().lower()
+
+            def _fetch():
+                workers  = get_all_workers()
+                existing = {a.worker_id: a for a in get_attendance(month)}
+                if unit != "All":
+                    workers = [w for w in workers if w.unit == unit]
+                if q:
+                    workers = [w for w in workers if q in w.name.lower() or q in w.worker_id.lower()]
+                return workers, existing
+
+            self._async_load(_fetch, lambda data: _do_refresh(*data))
 
         # ── Save ─────────────────────────────────────────────────────────
         def save_all():
@@ -1091,7 +1108,9 @@ class PayrollApp(QMainWindow):
 
         m_cb.currentTextChanged.connect(refresh)
         u_cb.currentTextChanged.connect(refresh)
-        s_ent.textChanged.connect(refresh)
+        # Debounce: only fire refresh 300 ms after the user stops typing
+        _att_search_timer.timeout.connect(refresh)
+        s_ent.textChanged.connect(lambda: _att_search_timer.start())
 
         btn = QPushButton("💾 Save All Attendance")
         btn.setStyleSheet(f"background-color: {SUCCESS}; height: 30px;")
@@ -1309,7 +1328,12 @@ class PayrollApp(QMainWindow):
             act_bar.setVisible(True)
 
         u_cb.currentTextChanged.connect(refresh)
-        s_ent.textChanged.connect(refresh)
+        # Debounce: only fire refresh 300 ms after the user stops typing
+        _wk_search_timer = QTimer()
+        _wk_search_timer.setSingleShot(True)
+        _wk_search_timer.setInterval(300)
+        _wk_search_timer.timeout.connect(refresh)
+        s_ent.textChanged.connect(lambda: _wk_search_timer.start())
         refresh()
 
 
@@ -1439,9 +1463,20 @@ class PayrollApp(QMainWindow):
     def _page_wages(self, layout):
         _page_header(layout, "💰  Wage Rates by Skill", "Set daily wage and overtime rate per skill level")
         cw = QWidget(); cwl = QVBoxLayout(cw); cwl.setContentsMargins(28, 0, 28, 20); layout.addWidget(cw, 1)
-        
+
         wages = get_skill_wages_dict()
         entries = {}
+
+        def _save_one(cat, ed, eo):
+            """Auto-save a single skill-wage row (called on field focus-out)."""
+            try:
+                dw = float(ed.text() or 0)
+                ot = float(eo.text() or 0)
+                upsert_skill_wage(SkillWage(cat, dw, ot))
+                self.set_message(f"✅ {cat} wage auto-saved!", SUCCESS)
+            except Exception as exc:
+                self.set_message(f"⚠️ Failed to save {cat}: {exc}", DANGER)
+
         for cat in SKILL_CATEGORIES:
             sw = wages.get(cat, SkillWage(cat, 0, 0))
             cf = QFrame(); cf.setObjectName("card")
@@ -1455,13 +1490,25 @@ class PayrollApp(QMainWindow):
             vo = QVBoxLayout(); vo.addWidget(QLabel("OT Rate (₹/hr)", styleSheet="font-size: 10px; color: white;"))
             eo = QLineEdit(str(sw.ot_rate)); eo.setFixedWidth(110); vo.addWidget(eo); cfl.addLayout(vo)
             entries[cat] = {"dw": ed, "ot": eo}
+            # Auto-save when the user leaves either field (Tab / click away / Enter)
+            ed.editingFinished.connect(lambda c=cat, d=ed, o=eo: _save_one(c, d, o))
+            eo.editingFinished.connect(lambda c=cat, d=ed, o=eo: _save_one(c, d, o))
             cwl.addWidget(cf)
+
         def sv():
+            saved, failed = 0, 0
             for cat, e in entries.items():
-                try: dw = float(e["dw"].text() or 0); ot = float(e["ot"].text() or 0)
-                except: continue
-                upsert_skill_wage(SkillWage(cat, dw, ot))
-            self.set_message("✅ Wage rates saved!", SUCCESS)
+                try:
+                    dw = float(e["dw"].text() or 0)
+                    ot = float(e["ot"].text() or 0)
+                    upsert_skill_wage(SkillWage(cat, dw, ot))
+                    saved += 1
+                except Exception as exc:
+                    failed += 1
+                    self.set_message(f"⚠️ Error saving {cat}: {exc}", DANGER)
+            if not failed:
+                self.set_message(f"✅ All {saved} wage rates saved!", SUCCESS)
+
         bs = QPushButton("💾 Save All Wage Rates")
         bs.setStyleSheet(f"background-color: {SUCCESS}; height: 35px;")
         bs.clicked.connect(sv)
