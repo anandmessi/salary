@@ -261,3 +261,28 @@ class CompanyConfig:
 
     @staticmethod
     def from_json(s): return CompanyConfig.from_dict(json.loads(s))
+
+
+# ── Runtime DB path ────────────────────────────────────────────────────────────
+# DB_PATH is defined here (not database.py) so both database.py and lan_sync.py
+# can import it without creating a circular dependency.
+import os as _os, sys as _sys
+
+def _schema_base_dir() -> str:
+    if getattr(_sys, 'frozen', False):
+        return _os.path.dirname(_sys.executable)
+    return _os.path.dirname(_os.path.abspath(__file__))
+
+DB_PATH: str = _os.path.join(_schema_base_dir(), "payroll.db")
+
+_runtime_db_path: list = [DB_PATH]   # mutable singleton — LanSync overrides this
+
+
+def get_active_db_path() -> str:
+    """Return the currently active database path (local or UNC)."""
+    return _runtime_db_path[0]
+
+
+def set_active_db_path(path: str) -> None:
+    """Override the active DB path (called by LanSync when client mode is determined)."""
+    _runtime_db_path[0] = path

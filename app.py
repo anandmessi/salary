@@ -14,13 +14,14 @@ if getattr(sys, 'frozen', False):
 
 from version import APP_NAME, APP_VERSION
 from backup_manager import BackupManager
+from lan_sync import LanSync
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QStackedWidget,
                              QScrollArea, QFrame, QComboBox, QLineEdit, QTableWidget,
                              QTableWidgetItem, QHeaderView, QAbstractItemView, QTabWidget,
                              QMessageBox, QFileDialog, QInputDialog, QStyledItemDelegate)
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSize, QThread, pyqtSlot, QEvent
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSize, QThread, pyqtSlot, QEvent, QMetaObject
 from PyQt6.QtGui import QColor, QFont, QIcon, QBrush, QAction, QPalette
 
 from schema import Worker, AttendanceRecord, CompanyConfig, SKILL_CATEGORIES
@@ -538,33 +539,100 @@ class PayrollApp(QMainWindow):
         self.resize(1300, 800)
         self.setMinimumSize(1050, 650)
         self.setStyleSheet(QSS)
-        init_db(DB_PATH, seed=True)
-        
+
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.main_layout = QHBoxLayout(self.central_widget)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
-        
+
         self._build_sidebar()
         self._build_main_area()
-        
-        # Real-time backup manager
-        self._backup_mgr = BackupManager(db_path=DB_PATH, on_sync=self._on_backup_sync)
+
+        # LAN sync: discover role before init_db so DB path is resolved first
+        from schema import DB_PATH as _local_db_path
+        self._lan_role   = "detecting"
+        self._lan_peer   = None
+        self._backup_mgr = None   # created in _finish_init after path is resolved
+        self._lan_sync   = LanSync(_local_db_path, self._on_lan_role_decided)
+        self._lan_sync.start()
+        self._show_detecting_overlay()
+
+    def closeEvent(self, event):
+        self._lan_sync.stop()
+        if self._backup_mgr is not None:
+            self._backup_mgr.stop()
+        event.accept()
+
+    # ── LAN sync callbacks ────────────────────────────────────────────────────
+
+    def _on_lan_role_decided(self, role: str, db_path: str, peer_name: str | None):
+        """Called from the LanSync background thread when role is negotiated."""
+        from schema import set_active_db_path
+        set_active_db_path(db_path)
+        self._lan_role = role
+        self._lan_peer = peer_name
+        # init_db must run on the main thread via Qt's queued connection
+        QMetaObject.invokeMethod(
+            self, "_finish_init", Qt.ConnectionType.QueuedConnection
+        )
+
+    @pyqtSlot()
+    def _finish_init(self):
+        """Runs on the main thread: initialises DB, starts backup manager, navigates home."""
+        from schema import get_active_db_path
+        from database import init_db
+        db = get_active_db_path()
+        # Seed only when this PC owns the DB (not when connecting to host's DB)
+        init_db(db, seed=(self._lan_role != "client"))
+        self._backup_mgr = BackupManager(db_path=db, on_sync=self._on_backup_sync)
         self._backup_mgr.start()
-        
-        # Pre-warm cache
         def _prewarm():
             try:
                 get_all_workers(); get_skill_wages_dict(); get_all_units(); get_config()
-            except: pass
+            except Exception:
+                pass
         threading.Thread(target=_prewarm, daemon=True).start()
-        
         self._navigate("dashboard")
+        self._update_sync_badge()
 
-    def closeEvent(self, event):
-        self._backup_mgr.stop()
-        event.accept()
+    def _show_detecting_overlay(self):
+        """Show a subtle status message while LAN role is being determined."""
+        self.set_message("🔍 Detecting network sync… (up to 3 s)", ACCENT)
+
+    def _update_sync_badge(self):
+        """Update the sync status label in the sidebar footer."""
+        if not hasattr(self, '_sync_lbl') or self._sync_lbl is None:
+            return
+        role = self._lan_role
+        peer = self._lan_peer
+        if role == "host":
+            self._sync_lbl.setText("🟢 Sync: Hosting")
+            self._sync_lbl.setStyleSheet(
+                f"color: {SUCCESS}; font-size: 11px; padding: 2px 8px;"
+            )
+            self._sync_lbl.setToolTip(
+                "This PC is hosting the shared database.\n"
+                "Other PCs on the LAN connect to this one."
+            )
+        elif role == "client":
+            self._sync_lbl.setText(f"🔵 Sync: {peer or 'Host PC'}")
+            self._sync_lbl.setStyleSheet(
+                f"color: {ACCENT}; font-size: 11px; padding: 2px 8px;"
+            )
+            self._sync_lbl.setToolTip(
+                f"Connected to shared database on {peer}.\n"
+                "Changes sync in real time."
+            )
+        else:
+            self._sync_lbl.setText("⚪ Sync: Offline")
+            self._sync_lbl.setStyleSheet(
+                f"color: {TEXT_MUTED}; font-size: 11px; padding: 2px 8px;"
+            )
+            self._sync_lbl.setToolTip(
+                "No other PayrollPro PC found on the network.\n"
+                "Running in standalone mode."
+            )
 
     def _on_backup_sync(self, status: str, timestamp: str):
         self.backup_sync_signal.emit(status, timestamp)
@@ -626,6 +694,14 @@ class PayrollApp(QMainWindow):
         sl.addStretch()
         sl.addWidget(self._h_line(CARD_BORDER))
         
+        # LAN sync status badge
+        self._sync_lbl = QLabel("🔍 Detecting...")
+        self._sync_lbl.setStyleSheet(
+            f"color: {TEXT_MUTED}; font-size: 11px; padding: 2px 8px;"
+        )
+        self._sync_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sl.addWidget(self._sync_lbl)
+
         foot = QFrame()
         foot.setStyleSheet("background-color: #191932;")
         fl = QVBoxLayout(foot)
@@ -637,7 +713,7 @@ class PayrollApp(QMainWindow):
         f2.setStyleSheet(f"font-size: 10px; color: {TEXT_MUTED};")
         fl.addWidget(f2)
         sl.addWidget(foot)
-        
+
         self.main_layout.addWidget(self.sidebar)
 
     def _h_line(self, color):
