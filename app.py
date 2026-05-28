@@ -1018,114 +1018,74 @@ class PayrollApp(QMainWindow):
         _att_search_timer.setInterval(300)
 
         # ── Build worker rows ─────────────────────────────────────────────
-        def _do_refresh(workers, existing):
-            """Runs on the main thread: clears and rebuilds the widget list."""
-            nonlocal _row_data
+        def _do_refresh(workers, existing, token, month_snap):
+            """
+            Fix #1: Runs on the main thread.
+            Fix #3: Renders cards in batches using QTimer.singleShot(0) to
+                    yield between batches and keep the UI responsive.
+            Fix #7: Validates token before touching _row_data.
+            Fix #8: No more vestigial nonlocal list_layout/list_widget.
+            """
+            nonlocal _row_data, _last_worker_ids
+
+            # Fix #7: abort if a newer refresh has already started
+            if token != _refresh_token[0]:
+                return
+
+            new_wids = [w.worker_id for w in workers]
+
+            # Fix #1: skip full rebuild when the worker list hasn't changed
+            if new_wids == _last_worker_ids and _row_data:
+                # Just update existing field values without destroying widgets
+                existing_map = {d["wid"]: d for d in _row_data}
+                for w in workers:
+                    att = existing.get(w.worker_id, AttendanceRecord(w.worker_id, month_snap))
+                    d = existing_map.get(w.worker_id)
+                    if d:
+                        d["days"].setText(str(att.days_present))
+                        d["ot"].setText(str(att.overtime_hours))
+                        d["esi"].setChecked(bool(att.esi_applicable))
+                        d["da"].setText(str(att.da))
+                        d["hra"].setText(str(att.hra))
+                        d["cca"].setText(str(att.cca))
+                        d["bonus"].setText(str(att.bonus))
+                        d["arrears"].setText(str(att.arrears))
+                        d["advrep"].setText(str(att.advance_repayment))
+                        d["fine"].setText(str(att.fine))
+                        d["loss"].setText(str(att.loss_damages))
+                        d["other"].setText(str(att.other_deductions))
+                self._att_workers = workers
+                return
+
+            # Full rebuild — clear existing widgets
             _row_data = []
-            while list_layout.count():
-                it = list_layout.takeAt(0)
+            _last_worker_ids = []
+            while _list_container_layout.count():
+                it = _list_container_layout.takeAt(0)
                 if it.widget(): it.widget().deleteLater()
 
+            # Fix #3: batch card insertion to yield to the event loop between batches
+            BATCH_SIZE = 15
+            worker_batches = [workers[i:i+BATCH_SIZE] for i in range(0, len(workers), BATCH_SIZE)]
 
-            for w in workers:
-                att = existing.get(w.worker_id, AttendanceRecord(w.worker_id, m_cb.currentText()))
+            def _insert_batch(batch_idx):
+                if token != _refresh_token[0]:
+                    return  # Fix #7: abort if outdated
+                if batch_idx >= len(worker_batches):
+                    # All done — add stretch and finalise
+                    _list_container_layout.addStretch()
+                    _last_worker_ids[:] = [w.worker_id for w in workers]
+                    return
+                batch = worker_batches[batch_idx]
+                for w in batch:
+                    att = existing.get(w.worker_id, AttendanceRecord(w.worker_id, month_snap))
+                    card, row = _build_card(w, att)
+                    _list_container_layout.addWidget(card)
+                    _row_data.append(row)
+                QTimer.singleShot(0, lambda bi=batch_idx+1: _insert_batch(bi))
 
-                # Outer card
-                card = QFrame()
-                card.setStyleSheet(
-                    f"QFrame {{ background-color: {SURFACE_3}; border-radius: 6px; "
-                    f"border: 1px solid {CARD_BORDER}; }}"
-                )
-                card_l = QVBoxLayout(card)
-                card_l.setContentsMargins(4, 3, 4, 3)
-                card_l.setSpacing(0)
-
-            # ── Compact top row ────────────────────────────────────────
-            top = QWidget()
-            top.setStyleSheet("background: transparent; border: none;")
-            tl = QHBoxLayout(top)
-            tl.setContentsMargins(2, 2, 2, 2)
-            tl.setSpacing(6)
-
-            arrow = QPushButton("▶")
-            arrow.setFixedSize(22, 22)
-            arrow.setToolTip("Expand extras: DA, HRA, CCA, Bonus, Arrears, Adv Repay, Fine, Loss/Dmg, Other Ded")
-            arrow.setStyleSheet(
-                f"QPushButton {{ background-color: {SURFACE_2}; color: {ACCENT}; "
-                f"border-radius: 4px; font-size: 9px; font-weight: bold; border: 1px solid {CARD_BORDER}; }}"
-                f"QPushButton:hover {{ background-color: {ACCENT}; color: white; }}"
-            )
-            arrow.setCursor(Qt.CursorShape.PointingHandCursor)
-            tl.addWidget(arrow)
-
-            tl.addWidget(_lbl(w.worker_id, 62, muted=False))
-            tl.addWidget(_lbl(w.name, 150, muted=False))
-            tl.addWidget(_lbl(w.unit, 82))
-            tl.addWidget(_lbl(w.designation or w.skill_category, 110))
-
-            tl.addWidget(_lbl("Days", 28))
-            e_days = _le(att.days_present, 56); tl.addWidget(e_days)
-            tl.addWidget(_lbl("OT", 18))
-            e_ot   = _le(att.overtime_hours, 50); tl.addWidget(e_ot)
-
-            esi_cb = QCheckBox("ESI")
-            esi_cb.setChecked(bool(att.esi_applicable))
-            esi_cb.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px; background: transparent; border: none; margin-left: 6px;")
-            tl.addWidget(esi_cb)
-            tl.addStretch()
-            card_l.addWidget(top)
-
-            # ── Expandable extras row (hidden by default) ──────────────
-            expand = QFrame()
-            expand.setVisible(False)
-            expand.setStyleSheet(
-                f"background-color: {SURFACE_2}; border-top: 1px solid {CARD_BORDER}; "
-                "border-radius: 0; border-bottom-left-radius: 5px; border-bottom-right-radius: 5px;"
-            )
-            el = QHBoxLayout(expand)
-            el.setContentsMargins(30, 5, 8, 5)
-            el.setSpacing(10)
-
-            def _field(lbl_txt, val):
-                vbox = QVBoxLayout(); vbox.setSpacing(1)
-                vbox.addWidget(_mini_lbl(lbl_txt))
-                e = _le(val, 65)
-                vbox.addWidget(e)
-                el.addLayout(vbox)
-                return e
-
-            e_da      = _field("DA",        att.da)
-            e_hra     = _field("HRA",       att.hra)
-            e_cca     = _field("CCA",       att.cca)
-            e_bonus   = _field("Bonus",     att.bonus)
-            e_arrears = _field("Arrears",   att.arrears)
-            e_advrep  = _field("Adv Repay", att.advance_repayment)
-            e_fine    = _field("Fine",      att.fine)
-            e_loss    = _field("Loss/Dmg",  att.loss_damages)
-            e_other   = _field("Other Ded", att.other_deductions)
-            el.addStretch()
-            card_l.addWidget(expand)
-
-            def _toggle(_, exp=expand, btn=arrow):
-                vis = not exp.isVisible()
-                exp.setVisible(vis)
-                btn.setText("▼" if vis else "▶")
-            arrow.clicked.connect(_toggle)
-
-                list_layout.addWidget(card)
-
-                _row_data.append({
-                    "wid": w.worker_id, "month": m_cb.currentText(),
-                    "days": e_days, "ot": e_ot, "esi": esi_cb,
-                    "da": e_da, "hra": e_hra, "cca": e_cca,
-                    "bonus": e_bonus, "arrears": e_arrears, "advrep": e_advrep,
-                    "fine": e_fine, "loss": e_loss, "other": e_other,
-                })
-
-            list_layout.addStretch()
+            _insert_batch(0)
             self._att_workers = workers
-            list_layout  = new_list_layout
-            list_widget  = new_list_widget
 
         def refresh():
             nonlocal _last_worker_ids
