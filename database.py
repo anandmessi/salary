@@ -51,6 +51,22 @@ def get_conn(db_path=DB_PATH):
         conn.rollback()
         raise
 
+
+def close_thread_conn():
+    """Close and discard the thread-local SQLite connection.
+
+    Call this at the end of every background thread (FetchThread.run finally block)
+    to avoid file-handle leaks when many short-lived threads are created.
+    """
+    conn = getattr(_db_local, 'conn', None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _db_local.conn = None
+        _db_local.path = None
+
 DDL = """
 CREATE TABLE IF NOT EXISTS units (
     name TEXT PRIMARY KEY
@@ -408,7 +424,7 @@ def upsert_attendance(a: AttendanceRecord, db_path=DB_PATH):
         conn.execute(
             f"INSERT INTO attendance({','.join(_ATT_COLS)}) VALUES({','.join('?'*len(_ATT_COLS))})"
             f" ON CONFLICT(worker_id,month) DO UPDATE SET {sets}", vals)
-    cache.invalidate(f"attendance:{db_path}:{a.month}")
+    cache.invalidate(f"attendance:{db_path}:{a.month}", f"months_with_data:{db_path}")
 
 def bulk_upsert_attendance(records: List[AttendanceRecord], db_path=DB_PATH):
     """Upsert all records in a single transaction — much faster than N separate calls."""
@@ -421,10 +437,11 @@ def bulk_upsert_attendance(records: List[AttendanceRecord], db_path=DB_PATH):
     )
     with get_conn(db_path) as conn:
         conn.executemany(sql, [tuple(getattr(a, c) for c in _ATT_COLS) for a in records])
-    # Invalidate all months touched
+    # Invalidate all months touched + months list cache
     months = {r.month for r in records}
     for m in months:
         cache.invalidate(f"attendance:{db_path}:{m}")
+    cache.invalidate(f"months_with_data:{db_path}")
 
 def delete_attendance_for_worker(worker_id: str, month: str = None, db_path=DB_PATH):
     """Delete attendance records for a worker. If month given, only that month; else all months."""
@@ -457,9 +474,16 @@ def import_attendance_from_csv(filepath, month, db_path=DB_PATH):
     return {"imported": len(records), "errors": errors}
 
 def get_months_with_data(db_path=DB_PATH):
+    """Return distinct months that have attendance records (cached)."""
+    key = f"months_with_data:{db_path}"
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
     with get_conn(db_path) as conn:
         rows = conn.execute("SELECT DISTINCT month FROM attendance ORDER BY month DESC").fetchall()
-    return [r["month"] for r in rows]
+    result = [r["month"] for r in rows]
+    cache.set(key, result)
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -470,8 +494,9 @@ def get_workers_and_attendance(month: str, db_path=DB_PATH):
     Returns (workers, attendance_dict) in a single DB round-trip.
     attendance_dict maps worker_id -> AttendanceRecord.
     Caches both pieces independently so individual invalidation still works.
+    Only active workers are fetched (active_only=True) to reduce rendering load.
     """
-    workers = get_all_workers(db_path, active_only=False)
+    workers = get_all_workers(db_path, active_only=True)  # Fix #4: exclude inactive workers
     att_list = get_attendance(month, db_path)
     att_dict = {a.worker_id: a for a in att_list}
     return workers, att_dict

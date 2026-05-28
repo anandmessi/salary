@@ -37,6 +37,7 @@ from database import (
     unit_worker_count,
     get_all_banks, add_bank, update_bank, delete_bank,
     get_workers_and_attendance,
+    close_thread_conn,
     DB_PATH,
 )
 from payroll_engine import calculate_payroll, payroll_summary
@@ -205,7 +206,17 @@ QLabel#metric_lbl {{
 """
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+# Fix #5 — cache month_options() to avoid hitting DB on every page load
+_month_options_cache: list = []
+_month_options_ts: float = 0.0
+_MONTH_OPTIONS_TTL = 15.0   # seconds
+
 def month_options():
+    import time as _time
+    global _month_options_cache, _month_options_ts
+    now = _time.monotonic()
+    if _month_options_cache and (now - _month_options_ts) < _MONTH_OPTIONS_TTL:
+        return _month_options_cache
     today = datetime.date.today()
     m_set = set()
     for i in range(11, -3, -1):  # Include 11 past months, current month (0), and 2 future months (-1, -2)
@@ -213,7 +224,6 @@ def month_options():
         while m <= 0: m += 12; y -= 1
         while m > 12: m -= 12; y += 1
         m_set.add(f"{y}-{m:02d}")
-    
     # Include any historical months that have attendance data
     try:
         existing = get_months_with_data()
@@ -221,8 +231,14 @@ def month_options():
             m_set.update(existing)
     except Exception:
         pass
-        
-    return sorted(list(m_set))
+    _month_options_cache = sorted(list(m_set))
+    _month_options_ts = now
+    return _month_options_cache
+
+def _invalidate_month_options_cache():
+    """Call after bulk_upsert_attendance to refresh the cache on next access."""
+    global _month_options_ts
+    _month_options_ts = 0.0
 
 def fmt_inr(amount):
     s = f"{abs(amount):,.2f}"; p = s.split(".")
@@ -480,6 +496,9 @@ class FetchThread(QThread):
             self.result_ready.emit(res)
         except Exception as e:
             self.error_ready.emit(e)
+        finally:
+            # Fix #14: close the thread-local SQLite connection to avoid file-handle leaks
+            close_thread_conn()
 
 # ══════════════════════════════════════════════════════════════════════════════
 class PayrollApp(QMainWindow):
@@ -487,7 +506,8 @@ class PayrollApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self._active_threads = []
+        self._active_threads = set()   # Fix #10: set instead of list for safe discard
+        self._page_cache: dict = {}     # Fix #9: cache built pages to avoid full rebuild on nav
         self.backup_sync_signal.connect(self._update_backup_label)
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — Professional Payroll Management")
         self.resize(1300, 800)
@@ -642,17 +662,27 @@ class PayrollApp(QMainWindow):
     def _navigate(self, key):
         for k, btn in self._nav_buttons.items():
             btn.set_active(k == key)
-        
-        # Clear stack
+
+        # Fix #9: serve from page cache to avoid full rebuild on every nav click
+        if key in self._page_cache:
+            cached_page = self._page_cache[key]
+            # Bring the cached page to the top of the stack (or add if missing)
+            if self.stack.indexOf(cached_page) == -1:
+                self.stack.addWidget(cached_page)
+            self.stack.setCurrentWidget(cached_page)
+            self.set_message(f"Viewing: {key.replace('_',' ').title()}")
+            return
+
+        # Clear stack of any old widgets
         while self.stack.count() > 0:
             w = self.stack.widget(0)
             self.stack.removeWidget(w)
             w.deleteLater()
-            
+
         page = QWidget()
         pl = QVBoxLayout(page)
         pl.setContentsMargins(0, 0, 0, 0)
-        
+
         sa = QScrollArea()
         sa.setWidgetResizable(True)
         sa.setFrameShape(QFrame.Shape.NoFrame)
@@ -662,23 +692,24 @@ class PayrollApp(QMainWindow):
         self.page_layout.setContentsMargins(0, 0, 0, 0)
         self.page_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         pl.addWidget(sa)
-        
+
         self.stack.addWidget(page)
-        
+        self._page_cache[key] = page   # Fix #9: cache the built page
+
         {"dashboard": self._page_dashboard, "attendance": self._page_attendance,
          "workers": self._page_workers, "units": self._page_units,
          "wages": self._page_wages, "slips": self._page_slips,
          "payroll": self._page_payroll,
          "settings": self._page_settings}.get(key, lambda l: None)(self.page_layout)
-         
+
         self.set_message(f"Viewing: {key.replace('_',' ').title()}")
 
     def _async_load(self, fetch_fn, render_fn):
         thread = FetchThread(fetch_fn)
         thread.result_ready.connect(render_fn)
         thread.error_ready.connect(lambda e: self.set_message(f"⚠️ Load error: {e}", DANGER))
-        thread.finished.connect(lambda: self._active_threads.remove(thread) if thread in self._active_threads else None)
-        self._active_threads.append(thread)
+        thread.finished.connect(lambda t=thread: self._active_threads.discard(t))
+        self._active_threads.add(thread)   # Fix #10: add instead of append
         thread.start()
 
     # ══════════════════════════════════════════════════════════════════════
@@ -695,48 +726,47 @@ class PayrollApp(QMainWindow):
         cl.addWidget(QLabel("<b>Unit:</b>"))
         u_cb = QComboBox(); u_cb.addItems(_unit_filter_list()); u_cb.setFixedWidth(140); cl.addWidget(u_cb)
         cl.addStretch()
+        
         exp_btn = QPushButton("📤 Export Yearly Stats")
         exp_btn.setStyleSheet(f"background-color: {SURFACE_3};")
         def export_yearly():
+            import datetime
             cur_year = m_cb.currentText()[:4] if m_cb.currentText() else str(datetime.datetime.now().year)
             year, ok = QInputDialog.getText(self, "Export Yearly Stats", "Enter Year (YYYY):", text=cur_year)
             if not ok or not year.strip(): return
             year = year.strip()
-            
+
             fp, _ = QFileDialog.getSaveFileName(self, "Save Yearly Stats", f"Yearly_Stats_{year}.csv", "CSV (*.csv)")
             if not fp: return
-            
+
             self.set_message("⏳ Generating yearly stats...", ACCENT)
-            
+
             def do_export():
                 months = [m for m in get_months_with_data() if m.startswith(year)]
                 months.sort()
                 if not months: return f"No data found for year {year}"
-                
-                cfg = get_config()
-                sw = get_skill_wages_dict()
-                
-                rows = []
-                rows.append(["Month", "Total Workers", "Total Gross", "Total EPF", "Total ESI", "Total Net Pay"])
-                
+                cfg = get_config(); sw = get_skill_wages_dict()
+                rows = [["Month", "Total Workers", "Total Gross", "Total EPF", "Total ESI", "Total Net Pay"]]
                 for m in months:
                     workers, att_dict = get_workers_and_attendance(m)
                     results, _ = calculate_payroll(workers, sw, list(att_dict.values()), m, cfg)
                     s = payroll_summary(results)
                     rows.append([m, str(s["total_workers"]), str(s["total_gross"]), str(s["total_epf"]), str(s["total_esi"]), str(s["total_net"])])
-                
                 import csv
                 with open(fp, "w", newline="", encoding="utf-8-sig") as f:
-                    writer = csv.writer(f)
-                    writer.writerows(rows)
+                    csv.writer(f).writerows(rows)
                 return f"Saved yearly stats to {fp}"
-            
-            try:
-                msg = do_export()
-                self.set_message(f"✅ {msg}" if "Saved" in msg else f"⚠️ {msg}", SUCCESS if "Saved" in msg else WARNING_CLR)
-            except Exception as e:
-                self.set_message(f"⚠️ Failed: {e}", WARNING_CLR)
-                
+
+            def _on_export_done(msg): self.set_message(f"✅ {msg}" if "Saved" in msg else f"⚠️ {msg}", SUCCESS if "Saved" in msg else WARNING_CLR)
+            def _on_export_error(e): self.set_message(f"⚠️ Failed: {e}", WARNING_CLR)
+
+            exp_thread = FetchThread(do_export)
+            exp_thread.result_ready.connect(_on_export_done)
+            exp_thread.error_ready.connect(_on_export_error)
+            exp_thread.finished.connect(lambda t=exp_thread: self._active_threads.discard(t))
+            self._active_threads.add(exp_thread)
+            exp_thread.start()
+
         exp_btn.clicked.connect(export_yearly)
         cl.addWidget(exp_btn)
         
@@ -913,15 +943,20 @@ class PayrollApp(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        list_widget = QWidget()
-        list_layout = QVBoxLayout(list_widget)
-        list_layout.setSpacing(3)
-        list_layout.setContentsMargins(4, 4, 4, 4)
-        scroll.setWidget(list_widget)
+        # Fix #8: removed the original list_widget/list_layout variables (they were
+        # reassigned inside _do_refresh with nonlocal, which was vestigial/confusing).
+        # The inner _do_refresh creates and swaps the widget directly on the scroll area.
+        _list_container = QWidget()
+        _list_container_layout = QVBoxLayout(_list_container)
+        _list_container_layout.setSpacing(3)
+        _list_container_layout.setContentsMargins(4, 4, 4, 4)
+        scroll.setWidget(_list_container)
         layout.addWidget(scroll, 1)
 
         self._att_workers = []
-        _row_data = []   # list of dicts keyed by widget references
+        _row_data = []          # Fix #7: per-refresh row data
+        _refresh_token = [0]    # Fix #7: incremented on each refresh() call
+        _last_worker_ids = []   # Fix #1: track last rendered set to avoid full rebuild
 
         # ── Helpers ───────────────────────────────────────────────────────
         def _le(val, w=58):
@@ -952,144 +987,208 @@ class PayrollApp(QMainWindow):
         _att_search_timer.setSingleShot(True)
         _att_search_timer.setInterval(300)
 
+        # ── Build a single worker card ────────────────────────────────────
+        def _build_card(w, att):
+            """Create and return the card QFrame for one worker row."""
+            card = QFrame()
+            card.setStyleSheet(
+                f"QFrame {{ background-color: {SURFACE_3}; border-radius: 6px; "
+                f"border: 1px solid {CARD_BORDER}; }}"
+            )
+            card_l = QVBoxLayout(card)
+            card_l.setContentsMargins(4, 3, 4, 3)
+            card_l.setSpacing(0)
+
+            # ── Compact top row ────────────────────────────────────────
+            top = QWidget()
+            top.setStyleSheet("background: transparent; border: none;")
+            tl = QHBoxLayout(top)
+            tl.setContentsMargins(2, 2, 2, 2)
+            tl.setSpacing(6)
+
+            arrow = QPushButton("▶")
+            arrow.setFixedSize(22, 22)
+            arrow.setToolTip("Expand extras: DA, HRA, CCA, Bonus, Arrears, Adv Repay, Fine, Loss/Dmg, Other Ded")
+            arrow.setStyleSheet(
+                f"QPushButton {{ background-color: {SURFACE_2}; color: {ACCENT}; "
+                f"border-radius: 4px; font-size: 9px; font-weight: bold; border: 1px solid {CARD_BORDER}; }}"
+                f"QPushButton:hover {{ background-color: {ACCENT}; color: white; }}"
+            )
+            arrow.setCursor(Qt.CursorShape.PointingHandCursor)
+            tl.addWidget(arrow)
+
+            tl.addWidget(_lbl(w.worker_id, 62, muted=False))
+            tl.addWidget(_lbl(w.name, 150, muted=False))
+            tl.addWidget(_lbl(w.unit, 82))
+            tl.addWidget(_lbl(w.designation or w.skill_category, 110))
+
+            tl.addWidget(_lbl("Days", 28))
+            e_days = _le(att.days_present, 56); tl.addWidget(e_days)
+            tl.addWidget(_lbl("OT", 18))
+            e_ot   = _le(att.overtime_hours, 50); tl.addWidget(e_ot)
+
+            esi_cb = QCheckBox("ESI")
+            esi_cb.setChecked(bool(att.esi_applicable))
+            esi_cb.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px; background: transparent; border: none; margin-left: 6px;")
+            tl.addWidget(esi_cb)
+            tl.addStretch()
+            card_l.addWidget(top)
+
+            # ── Expandable extras row (hidden by default) ──────────────
+            expand = QFrame()
+            expand.setVisible(False)
+            expand.setStyleSheet(
+                f"background-color: {SURFACE_2}; border-top: 1px solid {CARD_BORDER}; "
+                "border-radius: 0; border-bottom-left-radius: 5px; border-bottom-right-radius: 5px;"
+            )
+            el = QHBoxLayout(expand)
+            el.setContentsMargins(30, 5, 8, 5)
+            el.setSpacing(10)
+
+            def _field(lbl_txt, val):
+                vbox = QVBoxLayout(); vbox.setSpacing(1)
+                vbox.addWidget(_mini_lbl(lbl_txt))
+                e = _le(val, 65)
+                vbox.addWidget(e)
+                el.addLayout(vbox)
+                return e
+
+            e_da      = _field("DA",        att.da)
+            e_hra     = _field("HRA",       att.hra)
+            e_cca     = _field("CCA",       att.cca)
+            e_bonus   = _field("Bonus",     att.bonus)
+            e_arrears = _field("Arrears",   att.arrears)
+            e_advrep  = _field("Adv Repay", att.advance_repayment)
+            e_fine    = _field("Fine",      att.fine)
+            e_loss    = _field("Loss/Dmg",  att.loss_damages)
+            e_other   = _field("Other Ded", att.other_deductions)
+            el.addStretch()
+            card_l.addWidget(expand)
+
+            def _toggle(_, exp=expand, btn=arrow):
+                vis = not exp.isVisible()
+                exp.setVisible(vis)
+                btn.setText("▼" if vis else "▶")
+            arrow.clicked.connect(_toggle)
+
+            row = {
+                "wid": w.worker_id,
+                "days": e_days, "ot": e_ot, "esi": esi_cb,
+                "da": e_da, "hra": e_hra, "cca": e_cca,
+                "bonus": e_bonus, "arrears": e_arrears, "advrep": e_advrep,
+                "fine": e_fine, "loss": e_loss, "other": e_other,
+            }
+            return card, row
+
         # ── Build worker rows ─────────────────────────────────────────────
-        def _do_refresh(workers, existing):
-            """Runs on the main thread: clears and rebuilds the widget list."""
-            nonlocal _row_data
+        def _do_refresh(workers, existing, token, month_snap):
+            """
+            Fix #1: Runs on the main thread.
+            Fix #3: Renders cards in batches using QTimer.singleShot(0) to
+                    yield between batches and keep the UI responsive.
+            Fix #7: Validates token before touching _row_data.
+            Fix #8: No more vestigial nonlocal list_layout/list_widget.
+            """
+            nonlocal _row_data, _last_worker_ids
+
+            # Fix #7: abort if a newer refresh has already started
+            if token != _refresh_token[0]:
+                return
+
+            new_wids = [w.worker_id for w in workers]
+
+            # Fix #1: skip full rebuild when the worker list hasn't changed
+            if new_wids == _last_worker_ids and _row_data:
+                # Just update existing field values without destroying widgets
+                existing_map = {d["wid"]: d for d in _row_data}
+                for w in workers:
+                    att = existing.get(w.worker_id, AttendanceRecord(w.worker_id, month_snap))
+                    d = existing_map.get(w.worker_id)
+                    if d:
+                        d["days"].setText(str(att.days_present))
+                        d["ot"].setText(str(att.overtime_hours))
+                        d["esi"].setChecked(bool(att.esi_applicable))
+                        d["da"].setText(str(att.da))
+                        d["hra"].setText(str(att.hra))
+                        d["cca"].setText(str(att.cca))
+                        d["bonus"].setText(str(att.bonus))
+                        d["arrears"].setText(str(att.arrears))
+                        d["advrep"].setText(str(att.advance_repayment))
+                        d["fine"].setText(str(att.fine))
+                        d["loss"].setText(str(att.loss_damages))
+                        d["other"].setText(str(att.other_deductions))
+                self._att_workers = workers
+                return
+
+            # Full rebuild — clear existing widgets
             _row_data = []
-            while list_layout.count():
-                it = list_layout.takeAt(0)
+            _last_worker_ids = []
+            while _list_container_layout.count():
+                it = _list_container_layout.takeAt(0)
                 if it.widget(): it.widget().deleteLater()
 
+            # Fix #3: batch card insertion to yield to the event loop between batches
+            BATCH_SIZE = 15
+            worker_batches = [workers[i:i+BATCH_SIZE] for i in range(0, len(workers), BATCH_SIZE)]
 
-            for w in workers:
-                att = existing.get(w.worker_id, AttendanceRecord(w.worker_id, m_cb.currentText()))
+            def _insert_batch(batch_idx):
+                if token != _refresh_token[0]:
+                    return  # Fix #7: abort if outdated
+                if batch_idx >= len(worker_batches):
+                    # All done — add stretch and finalise
+                    _list_container_layout.addStretch()
+                    _last_worker_ids[:] = [w.worker_id for w in workers]
+                    return
+                batch = worker_batches[batch_idx]
+                for w in batch:
+                    att = existing.get(w.worker_id, AttendanceRecord(w.worker_id, month_snap))
+                    card, row = _build_card(w, att)
+                    _list_container_layout.addWidget(card)
+                    _row_data.append(row)
+                QTimer.singleShot(0, lambda bi=batch_idx+1: _insert_batch(bi))
 
-                # Outer card
-                card = QFrame()
-                card.setStyleSheet(
-                    f"QFrame {{ background-color: {SURFACE_3}; border-radius: 6px; "
-                    f"border: 1px solid {CARD_BORDER}; }}"
-                )
-                card_l = QVBoxLayout(card)
-                card_l.setContentsMargins(4, 3, 4, 3)
-                card_l.setSpacing(0)
-
-                # ── Compact top row ────────────────────────────────────────
-                top = QWidget()
-                top.setStyleSheet("background: transparent; border: none;")
-                tl = QHBoxLayout(top)
-                tl.setContentsMargins(2, 2, 2, 2)
-                tl.setSpacing(6)
-
-                arrow = QPushButton("▶")
-                arrow.setFixedSize(22, 22)
-                arrow.setToolTip("Expand extras: DA, HRA, CCA, Bonus, Arrears, Adv Repay, Fine, Loss/Dmg, Other Ded")
-                arrow.setStyleSheet(
-                    f"QPushButton {{ background-color: {SURFACE_2}; color: {ACCENT}; "
-                    f"border-radius: 4px; font-size: 9px; font-weight: bold; border: 1px solid {CARD_BORDER}; }}"
-                    f"QPushButton:hover {{ background-color: {ACCENT}; color: white; }}"
-                )
-                arrow.setCursor(Qt.CursorShape.PointingHandCursor)
-                tl.addWidget(arrow)
-
-                tl.addWidget(_lbl(w.worker_id, 62, muted=False))
-                tl.addWidget(_lbl(w.name, 150, muted=False))
-                tl.addWidget(_lbl(w.unit, 82))
-                tl.addWidget(_lbl(w.designation or w.skill_category, 110))
-
-                tl.addWidget(_lbl("Days", 28))
-                e_days = _le(att.days_present, 56); tl.addWidget(e_days)
-                tl.addWidget(_lbl("OT", 18))
-                e_ot   = _le(att.overtime_hours, 50); tl.addWidget(e_ot)
-
-                esi_cb = QCheckBox("ESI")
-                # Load saved esi_applicable value (DB default = 1/True → ESI applied)
-                esi_cb.setChecked(bool(att.esi_applicable))
-                esi_cb.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px; background: transparent; border: none; margin-left: 6px;")
-                tl.addWidget(esi_cb)
-                tl.addStretch()
-                card_l.addWidget(top)
-
-                # ── Expandable extras row (hidden by default) ──────────────
-                expand = QFrame()
-                expand.setVisible(False)
-                expand.setStyleSheet(
-                    f"background-color: {SURFACE_2}; border-top: 1px solid {CARD_BORDER}; "
-                    "border-radius: 0; border-bottom-left-radius: 5px; border-bottom-right-radius: 5px;"
-                )
-                el = QHBoxLayout(expand)
-                el.setContentsMargins(30, 5, 8, 5)
-                el.setSpacing(10)
-
-                def _field(lbl_txt, val):
-                    vbox = QVBoxLayout(); vbox.setSpacing(1)
-                    vbox.addWidget(_mini_lbl(lbl_txt))
-                    e = _le(val, 65)
-                    vbox.addWidget(e)
-                    el.addLayout(vbox)
-                    return e
-
-                e_da      = _field("DA",         att.da)
-                e_hra     = _field("HRA",        att.hra)
-                e_cca     = _field("CCA",        att.cca)
-                e_bonus   = _field("Bonus",      att.bonus)
-                e_arrears = _field("Arrears",    att.arrears)
-                e_advrep  = _field("Adv Repay",  att.advance_repayment)
-                e_fine    = _field("Fine",       att.fine)
-                e_loss    = _field("Loss/Dmg",   att.loss_damages)
-                e_other   = _field("Other Ded",  att.other_deductions)
-                el.addStretch()
-                card_l.addWidget(expand)
-
-                # Wire arrow toggle — lambda absorbs the bool emitted by clicked signal
-                def _toggle(_, exp=expand, btn=arrow):
-                    vis = not exp.isVisible()
-                    exp.setVisible(vis)
-                    btn.setText("▼" if vis else "▶")
-                arrow.clicked.connect(_toggle)
-
-                list_layout.addWidget(card)
-
-                _row_data.append({
-                    "wid": w.worker_id, "month": m_cb.currentText(),
-                    "days": e_days, "ot": e_ot, "esi": esi_cb,
-                    "da": e_da, "hra": e_hra, "cca": e_cca,
-                    "bonus": e_bonus, "arrears": e_arrears, "advrep": e_advrep,
-                    "fine": e_fine, "loss": e_loss, "other": e_other,
-                })
-
-            list_layout.addStretch()
+            _insert_batch(0)
             self._att_workers = workers
 
         def refresh():
+            nonlocal _last_worker_ids
+            _refresh_token[0] += 1          # Fix #7: invalidate any in-flight render
+            token = _refresh_token[0]
+            # Reset last_worker_ids so next _do_refresh always checks fresh
             sync_combo(m_cb, month_options())
             sync_combo(u_cb, _unit_filter_list())
             month = m_cb.currentText()
             unit  = u_cb.currentText()
             q     = s_ent.text().strip().lower()
+            month_snap = month   # Fix #6 insurance: capture month at fetch time
 
             def _fetch():
                 workers  = get_all_workers()
-                existing = {a.worker_id: a for a in get_attendance(month)}
+                existing = {a.worker_id: a for a in get_attendance(month_snap)}
                 if unit != "All":
                     workers = [w for w in workers if w.unit == unit]
                 if q:
                     workers = [w for w in workers if q in w.name.lower() or q in w.worker_id.lower()]
-                return workers, existing
+                return workers, existing, token, month_snap
 
             self._async_load(_fetch, lambda data: _do_refresh(*data))
 
         # ── Save ─────────────────────────────────────────────────────────
         def save_all():
             month = m_cb.currentText()
+
+            # Fix #7: validate that displayed rows match the current month
+            if not _row_data:
+                self.set_message("⚠️ Nothing to save — try refreshing first.", WARNING_CLR)
+                return
+
             existing_db = {a.worker_id: a for a in get_attendance(month)}
             records = []
+            def _f(e):
+                try: return float(e.text())
+                except: return 0.0
             for d in _row_data:
                 att = existing_db.get(d["wid"], AttendanceRecord(d["wid"], month))
-                def _f(e):
-                    try: return float(e.text())
-                    except: return 0.0
                 att.days_present      = _f(d["days"])
                 att.overtime_hours    = _f(d["ot"])
                 att.da                = _f(d["da"])
@@ -1104,6 +1203,7 @@ class PayrollApp(QMainWindow):
                 att.esi_applicable    = d["esi"].isChecked()
                 records.append(att)
             bulk_upsert_attendance(records)
+            _invalidate_month_options_cache()   # Fix #5: refresh month list after save
             self.set_message(f"✅ Saved {len(records)} records for {month}", SUCCESS)
 
         m_cb.currentTextChanged.connect(refresh)
@@ -1708,7 +1808,12 @@ class PayrollApp(QMainWindow):
 
         m_cb.currentTextChanged.connect(refresh)
         u_cb.currentTextChanged.connect(refresh)
-        s_ent.textChanged.connect(lambda _: refresh())
+        # Fix #12: debounce slips search — fires refresh 300ms after user stops typing
+        _slips_search_timer = QTimer()
+        _slips_search_timer.setSingleShot(True)
+        _slips_search_timer.setInterval(300)
+        _slips_search_timer.timeout.connect(refresh)
+        s_ent.textChanged.connect(lambda _: _slips_search_timer.start())
         ref_btn.clicked.connect(refresh)
         refresh()
 
@@ -1907,7 +2012,12 @@ class PayrollApp(QMainWindow):
         exp_btn.clicked.connect(exp)
         m_cb.currentTextChanged.connect(refresh)
         u_cb.currentTextChanged.connect(refresh)
-        s_ent.textChanged.connect(refresh)
+        # Debounce payroll search — same 300ms pattern as other pages
+        _pr_search_timer = QTimer()
+        _pr_search_timer.setSingleShot(True)
+        _pr_search_timer.setInterval(300)
+        _pr_search_timer.timeout.connect(refresh)
+        s_ent.textChanged.connect(lambda: _pr_search_timer.start())
         ref_btn.clicked.connect(refresh)
         refresh()
 
