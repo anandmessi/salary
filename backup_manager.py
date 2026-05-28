@@ -209,9 +209,24 @@ class BackupManager:
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         try:
-            rows = conn.execute(
-                "SELECT * FROM workers ORDER BY name"
-            ).fetchall()
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM workers ORDER BY name"
+                ).fetchall()
+            except sqlite3.DatabaseError:
+                # Corrupted index — fall back to row-by-row ROWID scan
+                logger.warning("_sync_csv: SELECT * failed, falling back to ROWID scan")
+                max_rowid = conn.execute("SELECT MAX(rowid) FROM workers").fetchone()[0] or 0
+                rows = []
+                for rowid in range(1, max_rowid + 1):
+                    try:
+                        row = conn.execute(
+                            "SELECT * FROM workers WHERE rowid=?", (rowid,)
+                        ).fetchone()
+                        if row:
+                            rows.append(row)
+                    except Exception:
+                        pass
         finally:
             conn.close()
 

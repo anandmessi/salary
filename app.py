@@ -532,6 +532,7 @@ class PayrollApp(QMainWindow):
         super().__init__()
         self._active_threads = set()   # Fix #10: set instead of list for safe discard
         self._page_cache: dict = {}     # Fix #9: cache built pages to avoid full rebuild on nav
+        self._nav_generation = 0        # Fix #1: invalidate in-flight renders on navigation
         self.backup_sync_signal.connect(self._update_backup_label)
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — Professional Payroll Management")
         self.resize(1300, 800)
@@ -684,24 +685,22 @@ class PayrollApp(QMainWindow):
             QTimer.singleShot(4000, lambda: self.set_message("Ready", TEXT_MUTED, False))
 
     def _navigate(self, key):
+        self._nav_generation += 1          # Fix #1: invalidate all in-flight renders
         for k, btn in self._nav_buttons.items():
             btn.set_active(k == key)
 
-        # Fix #9: serve from page cache to avoid full rebuild on every nav click
+        # Fix #4: serve from page cache to avoid full rebuild on every nav click
         if key in self._page_cache:
             cached_page = self._page_cache[key]
-            # Bring the cached page to the top of the stack (or add if missing)
-            if self.stack.indexOf(cached_page) == -1:
-                self.stack.addWidget(cached_page)
-            self.stack.setCurrentWidget(cached_page)
-            self.set_message(f"Viewing: {key.replace('_',' ').title()}")
-            return
-
-        # Clear stack of any old widgets
-        while self.stack.count() > 0:
-            w = self.stack.widget(0)
-            self.stack.removeWidget(w)
-            w.deleteLater()
+            try:
+                cached_page.isWidgetType()   # Fix #1: check not deleted
+                if self.stack.indexOf(cached_page) == -1:
+                    self.stack.addWidget(cached_page)
+                self.stack.setCurrentWidget(cached_page)
+                self.set_message(f"Viewing: {key.replace('_',' ').title()}")
+                return
+            except RuntimeError:
+                del self._page_cache[key]   # stale cache entry — rebuild
 
         page = QWidget()
         pl = QVBoxLayout(page)
@@ -718,7 +717,7 @@ class PayrollApp(QMainWindow):
         pl.addWidget(sa)
 
         self.stack.addWidget(page)
-        self._page_cache[key] = page   # Fix #9: cache the built page
+        self._page_cache[key] = page   # Fix #4: cache the built page
 
         {"dashboard": self._page_dashboard, "attendance": self._page_attendance,
          "workers": self._page_workers, "units": self._page_units,
@@ -729,8 +728,16 @@ class PayrollApp(QMainWindow):
         self.set_message(f"Viewing: {key.replace('_',' ').title()}")
 
     def _async_load(self, fetch_fn, render_fn):
+        generation = self._nav_generation          # Fix #1: capture at dispatch time
+        def guarded_render(result):
+            if self._nav_generation != generation:
+                return                             # page was navigated away — discard
+            try:
+                render_fn(result)
+            except RuntimeError:
+                pass                               # widget deleted between check and render
         thread = FetchThread(fetch_fn)
-        thread.result_ready.connect(render_fn)
+        thread.result_ready.connect(guarded_render)
         thread.error_ready.connect(lambda e: self.set_message(f"⚠️ Load error: {e}", DANGER))
         thread.finished.connect(lambda t=thread: self._active_threads.discard(t))
         self._active_threads.add(thread)   # Fix #10: add instead of append
@@ -1016,6 +1023,103 @@ class PayrollApp(QMainWindow):
         _att_search_timer = QTimer()
         _att_search_timer.setSingleShot(True)
         _att_search_timer.setInterval(300)
+
+        # ── Card builder (Fix #2+#3) ──────────────────────────────────────
+        def _build_card(w, att):
+            """Create and return the card QFrame for one worker row."""
+            card = QFrame()
+            card.setStyleSheet(
+                f"QFrame {{ background-color: {SURFACE_3}; border-radius: 6px; "
+                f"border: 1px solid {CARD_BORDER}; }}"
+            )
+            card_l = QVBoxLayout(card)
+            card_l.setContentsMargins(4, 3, 4, 3)
+            card_l.setSpacing(0)
+
+            # ── Compact top row ────────────────────────────────────────
+            top = QWidget()
+            top.setStyleSheet("background: transparent; border: none;")
+            tl = QHBoxLayout(top)
+            tl.setContentsMargins(2, 2, 2, 2)
+            tl.setSpacing(6)
+
+            arrow = QPushButton("\u25b6")
+            arrow.setFixedSize(22, 22)
+            arrow.setToolTip("Expand extras: DA, HRA, CCA, Bonus, Arrears, Adv Repay, Fine, Loss/Dmg, Other Ded")
+            arrow.setStyleSheet(
+                f"QPushButton {{ background-color: {SURFACE_2}; color: {ACCENT}; "
+                f"border-radius: 4px; font-size: 9px; font-weight: bold; border: 1px solid {CARD_BORDER}; }}"
+                f"QPushButton:hover {{ background-color: {ACCENT}; color: white; }}"
+            )
+            arrow.setCursor(Qt.CursorShape.PointingHandCursor)
+            tl.addWidget(arrow)
+
+            tl.addWidget(_lbl(w.worker_id, 62, muted=False))
+            tl.addWidget(_lbl(w.name, 150, muted=False))
+            tl.addWidget(_lbl(w.unit, 82))
+            tl.addWidget(_lbl(w.designation or w.skill_category, 110))
+
+            tl.addWidget(_lbl("Days", 28))
+            e_days = _le(att.days_present, 56); tl.addWidget(e_days)
+            tl.addWidget(_lbl("OT", 18))
+            e_ot   = _le(att.overtime_hours, 50); tl.addWidget(e_ot)
+
+            from PyQt6.QtWidgets import QCheckBox as _QCB
+            esi_cb = _QCB("ESI")
+            esi_cb.setChecked(bool(att.esi_applicable))
+            esi_cb.setStyleSheet(
+                f"color: {TEXT_SECONDARY}; font-size: 10px; background: transparent; "
+                "border: none; margin-left: 6px;"
+            )
+            tl.addWidget(esi_cb)
+            tl.addStretch()
+            card_l.addWidget(top)
+
+            # ── Expandable extras row (hidden by default) ──────────────
+            expand = QFrame()
+            expand.setVisible(False)
+            expand.setStyleSheet(
+                f"background-color: {SURFACE_2}; border-top: 1px solid {CARD_BORDER}; "
+                "border-radius: 0; border-bottom-left-radius: 5px; border-bottom-right-radius: 5px;"
+            )
+            el = QHBoxLayout(expand)
+            el.setContentsMargins(30, 5, 8, 5)
+            el.setSpacing(10)
+
+            def _field(lbl_txt, val):
+                vbox = QVBoxLayout(); vbox.setSpacing(1)
+                vbox.addWidget(_mini_lbl(lbl_txt))
+                e = _le(val, 65)
+                vbox.addWidget(e)
+                el.addLayout(vbox)
+                return e
+
+            e_da      = _field("DA",        att.da)
+            e_hra     = _field("HRA",       att.hra)
+            e_cca     = _field("CCA",       att.cca)
+            e_bonus   = _field("Bonus",     att.bonus)
+            e_arrears = _field("Arrears",   att.arrears)
+            e_advrep  = _field("Adv Repay", att.advance_repayment)
+            e_fine    = _field("Fine",      att.fine)
+            e_loss    = _field("Loss/Dmg",  att.loss_damages)
+            e_other   = _field("Other Ded", att.other_deductions)
+            el.addStretch()
+            card_l.addWidget(expand)
+
+            def _toggle(_, exp=expand, btn=arrow):
+                vis = not exp.isVisible()
+                exp.setVisible(vis)
+                btn.setText("\u25bc" if vis else "\u25b6")
+            arrow.clicked.connect(_toggle)
+
+            row = {
+                "wid": w.worker_id,
+                "days": e_days, "ot": e_ot, "esi": esi_cb,
+                "da": e_da, "hra": e_hra, "cca": e_cca,
+                "bonus": e_bonus, "arrears": e_arrears, "advrep": e_advrep,
+                "fine": e_fine, "loss": e_loss, "other": e_other,
+            }
+            return card, row
 
         # ── Build worker rows ─────────────────────────────────────────────
         def _do_refresh(workers, existing, token, month_snap):

@@ -462,6 +462,7 @@ def delete_attendance_for_worker(worker_id: str, month: str = None, db_path=DB_P
         else:
             conn.execute("DELETE FROM attendance WHERE worker_id=?", (worker_id,))
             cache.invalidate_prefix(f"attendance:{db_path}:")
+    cache.invalidate(f"months_with_data:{db_path}")  # Fix #5: refresh months list after deletion
 
 def import_attendance_from_csv(filepath, month, db_path=DB_PATH):
     import csv
