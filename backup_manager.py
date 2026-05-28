@@ -206,7 +206,7 @@ class BackupManager:
         self.csv_dir.mkdir(parents=True, exist_ok=True)
 
         # Read workers directly from SQLite (avoids import cycles)
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
@@ -251,9 +251,9 @@ class BackupManager:
 
     def _sync_db(self) -> None:
         """Create a consistent 1-to-1 SQLite backup at backup.db."""
-        src = sqlite3.connect(self.db_path)
+        src = sqlite3.connect(self.db_path, timeout=30.0)
         try:
-            dst = sqlite3.connect(self.backup_db_path)
+            dst = sqlite3.connect(self.backup_db_path, timeout=30.0)
             try:
                 # sqlite3.backup() is the safest way — works even under load
                 src.backup(dst, pages=0)  # pages=0 = copy all at once

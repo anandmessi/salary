@@ -38,7 +38,7 @@ _PRAGMAS = (
 def get_conn(db_path=DB_PATH):
     conn = getattr(_db_local, 'conn', None)
     if conn is None or getattr(_db_local, 'path', None) != db_path:
-        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30.0)
         conn.row_factory = sqlite3.Row
         for pragma in _PRAGMAS:
             conn.execute(pragma)
@@ -154,6 +154,16 @@ def init_db(db_path=DB_PATH, seed=True):
             except sqlite3.OperationalError:
                 pass
             conn.execute("PRAGMA user_version = 2")
+
+        # Migration 3: Backfill NULL esi_applicable to 0 (off by default)
+        if user_version < 3:
+            conn.execute("UPDATE attendance SET esi_applicable = 0 WHERE esi_applicable IS NULL")
+            conn.execute("PRAGMA user_version = 3")
+
+        # Migration 4: ESI now off-by-default — reset all rows so user opts in per worker
+        if user_version < 4:
+            conn.execute("UPDATE attendance SET esi_applicable = 0")
+            conn.execute("PRAGMA user_version = 4")
         # ------------------
         
         # Seed skill_wages with all categories (0 wage = user must set)
