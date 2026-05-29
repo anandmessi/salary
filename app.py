@@ -551,10 +551,13 @@ class PayrollApp(QMainWindow):
 
         # LAN sync: discover role before init_db so DB path is resolved first
         from schema import DB_PATH as _local_db_path
-        self._lan_role   = "detecting"
-        self._lan_peer   = None
-        self._backup_mgr = None   # created in _finish_init after path is resolved
-        self._lan_sync   = LanSync(_local_db_path, self._on_lan_role_decided)
+        self._lan_role    = "detecting"
+        self._lan_peer    = None
+        self._lan_host_ip = None
+        self._sync_client = None
+        self._backup_mgr  = None   # created in _finish_init after path is resolved
+        self._current_page_key = "dashboard"  # track active page reliably
+        self._lan_sync    = LanSync(_local_db_path, self._on_lan_role_decided)
         self._lan_sync.start()
         self._show_detecting_overlay()
 
@@ -566,12 +569,23 @@ class PayrollApp(QMainWindow):
 
     # ── LAN sync callbacks ────────────────────────────────────────────────────
 
-    def _on_lan_role_decided(self, role: str, db_path: str, peer_name: str | None):
+    def _on_lan_role_decided(self, role: str, db_path: str, peer_name: str | None, host_ip: str | None = None):
         """Called from the LanSync background thread when role is negotiated."""
+        import database as _db_mod
         from schema import set_active_db_path
+
+        self._lan_role    = role
+        self._lan_peer    = peer_name
+        self._lan_host_ip = host_ip
+
+        if role == "client" and host_ip:
+            # Inject HTTP proxy — CLIENT never touches SQLite directly
+            from sync_client import SyncClient
+            self._sync_client = SyncClient(host_ip=host_ip)
+            _db_mod.set_sync_client(self._sync_client)
+            # db_path stays as local path; it won't be used (SyncClient takes over)
+
         set_active_db_path(db_path)
-        self._lan_role = role
-        self._lan_peer = peer_name
         # init_db must run on the main thread via Qt's queued connection
         QMetaObject.invokeMethod(
             self, "_finish_init", Qt.ConnectionType.QueuedConnection
@@ -583,10 +597,18 @@ class PayrollApp(QMainWindow):
         from schema import get_active_db_path
         from database import init_db
         db = get_active_db_path()
-        # Seed only when this PC owns the DB (not when connecting to host's DB)
-        init_db(db, seed=(self._lan_role != "client"))
-        self._backup_mgr = BackupManager(db_path=db, on_sync=self._on_backup_sync)
-        self._backup_mgr.start()
+
+        if self._lan_role == "client":
+            # CLIENT: do NOT init/seed the local DB or run BackupManager
+            # Start polling for host changes so the UI auto-refreshes
+            if self._sync_client:
+                self._sync_client.start_polling(on_change=self._on_host_data_changed)
+        else:
+            # HOST / standalone: init local DB and start backup manager as usual
+            init_db(db, seed=True)
+            self._backup_mgr = BackupManager(db_path=db, on_sync=self._on_backup_sync)
+            self._backup_mgr.start()
+
         def _prewarm():
             try:
                 get_all_workers(); get_skill_wages_dict(); get_all_units(); get_config()
@@ -600,29 +622,65 @@ class PayrollApp(QMainWindow):
         """Show a subtle status message while LAN role is being determined."""
         self.set_message("🔍 Detecting network sync… (up to 3 s)", ACCENT)
 
+    def _on_host_data_changed(self):
+        """Called (from background thread) when the host's DB has new data.
+        Invalidates the page cache and triggers a UI refresh via Qt signal."""
+        # Schedule a UI refresh on the Qt main thread
+        QMetaObject.invokeMethod(
+            self, "_refresh_current_page", Qt.ConnectionType.QueuedConnection
+        )
+
+    @pyqtSlot()
+    def _refresh_current_page(self):
+        """Refresh UI after host data changed (CLIENT mode auto-sync)."""
+        key = self._current_page_key
+
+        # Remove the cached page widget from the stack so it gets rebuilt fresh
+        if key in self._page_cache:
+            old_page = self._page_cache.pop(key)
+            try:
+                idx = self.stack.indexOf(old_page)
+                if idx != -1:
+                    self.stack.removeWidget(old_page)
+                    old_page.deleteLater()
+            except RuntimeError:
+                pass  # already deleted
+
+        # Navigate rebuilds the page and fetches fresh data from the host
+        self._navigate(key)
+        self._update_sync_badge()
+
     def _update_sync_badge(self):
         """Update the sync status label in the sidebar footer."""
         if not hasattr(self, '_sync_lbl') or self._sync_lbl is None:
             return
         role = self._lan_role
         peer = self._lan_peer
+        host_ip = getattr(self, '_lan_host_ip', None)
         if role == "host":
-            self._sync_lbl.setText("🟢 Sync: Hosting")
+            ip_str = f" ({host_ip}:{5050})" if host_ip else ""
+            self._sync_lbl.setText(f"🟢 Hosting{ip_str}")
             self._sync_lbl.setStyleSheet(
                 f"color: {SUCCESS}; font-size: 11px; padding: 2px 8px;"
             )
             self._sync_lbl.setToolTip(
-                "This PC is hosting the shared database.\n"
+                f"This PC is hosting the database API on port 5050.\n"
+                f"IP: {host_ip or 'unknown'}\n"
                 "Other PCs on the LAN connect to this one."
             )
         elif role == "client":
-            self._sync_lbl.setText(f"🔵 Sync: {peer or 'Host PC'}")
+            connected = self._sync_client and self._sync_client.connected
+            icon = "🔵" if connected else "🟡"
+            status = "Synced" if connected else "Reconnecting"
+            addr = host_ip or peer or 'Host PC'
+            self._sync_lbl.setText(f"{icon} {status}: {peer or addr}")
             self._sync_lbl.setStyleSheet(
-                f"color: {ACCENT}; font-size: 11px; padding: 2px 8px;"
+                f"color: {ACCENT if connected else WARNING_CLR}; font-size: 11px; padding: 2px 8px;"
             )
             self._sync_lbl.setToolTip(
-                f"Connected to shared database on {peer}.\n"
-                "Changes sync in real time."
+                f"Connected to HTTP API on {addr}:5050\n"
+                f"Host: {peer or 'unknown'}\n"
+                "Data refreshes automatically every 2 seconds."
             )
         else:
             self._sync_lbl.setText("⚪ Sync: Offline")
@@ -762,6 +820,7 @@ class PayrollApp(QMainWindow):
 
     def _navigate(self, key):
         self._nav_generation += 1          # Fix #1: invalidate all in-flight renders
+        self._current_page_key = key       # Track active page reliably
         for k, btn in self._nav_buttons.items():
             btn.set_active(k == key)
 

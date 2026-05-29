@@ -1,38 +1,34 @@
 r"""
 lan_sync.py — Automatic LAN database sharing for PayrollPro
 ============================================================
-Uses UDP broadcast for zero-config host discovery.
-One PC becomes the HOST (serves the DB over a TCP file-sync port).
-The other becomes a CLIENT (discovers host, maps to host's shared folder).
+Uses UDP broadcast for zero-config host discovery (unchanged).
+Uses an embedded Flask HTTP server for actual data sync (replaces SMB).
 
 Flow:
   1. On startup, broadcast UDP "PAYROLLPRO_DISCOVER" on port 47474
-  2. If another PC responds with "PAYROLLPRO_HOST:<share_name>|<pc_name>", become CLIENT
-  3. If nobody responds within 2.5s, become HOST — share the DB folder via
-     Windows built-in net share and start broadcasting
-  4. HOST also starts a heartbeat responder (UDP) so late-joining clients find it
-  5. CLIENT switches DB_PATH to the UNC path \\HOST_IP\PayrollProShare\payroll.db
-  6. Both show a status badge in the UI (🟢 Host / 🔵 Synced with HOST-PC)
+  2. If another PC responds with "PAYROLLPRO_HOST:<ip>|<pc_name>", become CLIENT
+  3. If nobody responds within 2.5s, become HOST — start Flask on port 5050
+  4. HOST listens for future clients via UDP heartbeat responder
+  5. CLIENT connects to HOST's Flask API; all DB calls go through HTTP
+  6. Both show a status badge in the UI
 """
 
 import os
-import sys
 import socket
 import threading
-import subprocess
 import time
 import logging
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DISCOVER_PORT     = 47474
-DISCOVER_MSG      = b"PAYROLLPRO_DISCOVER"
-HOST_PREFIX       = b"PAYROLLPRO_HOST:"
-SHARE_NAME        = "PayrollProShare"
-BROADCAST_ADDR    = "255.255.255.255"
-DISCOVER_TIMEOUT  = 2.5    # seconds to wait for a host response
-HEARTBEAT_INTERVAL = 5     # seconds between host beacons (unused in this impl; heartbeat is reactive)
+DISCOVER_PORT      = 47474
+DISCOVER_MSG       = b"PAYROLLPRO_DISCOVER"
+HOST_PREFIX        = b"PAYROLLPRO_HOST:"
+BROADCAST_ADDR     = "255.255.255.255"
+DISCOVER_TIMEOUT   = 2.5    # seconds to wait for a host response
+
+from sync_server import SYNC_PORT
 
 
 def _get_local_ip() -> str:
@@ -51,79 +47,30 @@ def _get_pc_name() -> str:
     return socket.gethostname()
 
 
-def _share_exists(share_name: str) -> bool:
-    result = subprocess.run(
-        ["net", "share", share_name],
-        capture_output=True, text=True
-    )
-    return result.returncode == 0
-
-
-def _create_share(folder_path: str, share_name: str) -> bool:
-    """Create a Windows network share. Returns True on success."""
-    if _share_exists(share_name):
-        logger.info("Share %s already exists", share_name)
-        return True
-    result = subprocess.run(
-        ["net", "share",
-         f"{share_name}={folder_path}",
-         "/GRANT:Everyone,FULL",
-         "/REMARK:PayrollPro shared database"],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        logger.error("net share failed: %s", result.stderr.strip())
-        return False
-    logger.info("Created share: %s -> %s", share_name, folder_path)
-    return True
-
-
-def _remove_share(share_name: str) -> None:
-    subprocess.run(
-        ["net", "share", share_name, "/DELETE", "/Y"],
-        capture_output=True
-    )
-    logger.info("Removed share: %s", share_name)
-
-
-def _unc_path(host_ip: str, share_name: str, filename: str) -> str:
-    return f"\\\\{host_ip}\\{share_name}\\{filename}"
-
-
-def _is_valid_db(path: str) -> bool:
-    import sqlite3
-    try:
-        con = sqlite3.connect(path, timeout=5)
-        con.execute("SELECT 1")
-        con.close()
-        return True
-    except Exception:
-        return False
-
-
 class LanSync:
     """
-    Manages host/client role negotiation and DB path switching.
+    Manages host/client role negotiation and DB path/sync-client setup.
 
     Usage:
         sync = LanSync(db_path, on_role_decided)
         sync.start()   # non-blocking; calls on_role_decided when done
 
-    on_role_decided(role, db_path, peer_name):
+    on_role_decided(role, db_path, peer_name, host_ip):
         role      : "host" | "client" | "standalone"
-        db_path   : resolved DB path to use
+        db_path   : local DB path (always the local path now)
         peer_name : hostname of the other PC (or None)
+        host_ip   : IP of the host (or None if host/standalone)
     """
 
     def __init__(self, local_db_path: str, on_role_decided):
         self.local_db_path = os.path.abspath(local_db_path)
-        self.db_folder     = os.path.dirname(self.local_db_path)
-        self.db_filename   = os.path.basename(self.local_db_path)
         self._on_role      = on_role_decided
         self._role         = None            # "host" | "client" | "standalone"
         self._peer_name    = None
+        self._host_ip      = None
         self._stop_evt     = threading.Event()
         self._responder    = None
+        self._local_ip     = _get_local_ip()
 
     def start(self) -> None:
         t = threading.Thread(
@@ -135,9 +82,10 @@ class LanSync:
         self._stop_evt.set()
         if self._role == "host":
             try:
-                _remove_share(SHARE_NAME)
+                import sync_server
+                sync_server.stop()
             except Exception as e:
-                logger.warning("Error removing share on stop: %s", e)
+                logger.warning("Error stopping sync server: %s", e)
 
     @property
     def role(self) -> str | None:
@@ -147,74 +95,91 @@ class LanSync:
     def peer_name(self) -> str | None:
         return self._peer_name
 
-    # ── Negotiation ────────────────────────────────────────────────────────
+    @property
+    def host_ip(self) -> str | None:
+        return self._host_ip
+
+    # ── Negotiation ────────────────────────────────────────────────────────────
 
     def _negotiate(self) -> None:
-        host_ip, host_share, peer_name = self._discover_host()
+        host_ip, peer_name = self._discover_host()
+
         if host_ip:
-            # Another PC is already hosting
-            unc = _unc_path(host_ip, host_share or SHARE_NAME, self.db_filename)
-            logger.info("Found host at %s (%s) → UNC: %s", host_ip, peer_name, unc)
-            # Wait up to 5 s for the UNC path to become accessible
-            for _ in range(10):
-                if os.path.exists(unc):
-                    break
-                time.sleep(0.5)
-            db_ok = _is_valid_db(unc) if os.path.exists(unc) else False
-            if db_ok:
+            # Another PC is already hosting — become CLIENT
+            logger.info("Found host at %s (%s)", host_ip, peer_name)
+            # Verify the Flask server is actually reachable
+            if self._check_server_reachable(host_ip):
                 self._role      = "client"
                 self._peer_name = peer_name
-                self._on_role("client", unc, peer_name)
+                self._host_ip   = host_ip
+                self._on_role("client", self.local_db_path, peer_name, host_ip)
             else:
                 logger.warning(
-                    "UNC path %s not accessible — falling back to standalone", unc
+                    "Host at %s discovered but Flask API not reachable on port %d. "
+                    "Falling back to standalone.", host_ip, SYNC_PORT
                 )
                 self._role = "standalone"
-                self._on_role("standalone", self.local_db_path, None)
+                self._on_role("standalone", self.local_db_path, None, None)
         else:
-            # No host found — become the host
-            ok = _create_share(self.db_folder, SHARE_NAME)
+            # No host found — become the HOST
+            logger.info("No host found — becoming HOST on %s:%d", self._local_ip, SYNC_PORT)
+            import sync_server
+            ok = sync_server.start(self.local_db_path)
             if ok:
-                self._role = "host"
+                # Give Flask a moment to bind the port
+                time.sleep(0.5)
+                self._role      = "host"
                 self._peer_name = None
+                self._host_ip   = self._local_ip
                 self._start_heartbeat()
-                self._on_role("host", self.local_db_path, None)
+                self._on_role("host", self.local_db_path, None, self._local_ip)
             else:
                 logger.warning(
-                    "Could not create Windows share — running standalone. "
-                    "Try launching the app as Administrator on the HOST PC."
+                    "Could not start Flask sync server — running standalone. "
+                    "Ensure 'flask' is installed: pip install flask"
                 )
                 self._role = "standalone"
-                self._on_role("standalone", self.local_db_path, None)
+                self._on_role("standalone", self.local_db_path, None, None)
+
+    def _check_server_reachable(self, host_ip: str) -> bool:
+        """Try to reach the host's Flask /api/ping endpoint."""
+        try:
+            import urllib.request
+            url = f"http://{host_ip}:{SYNC_PORT}/api/ping"
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                return resp.status == 200
+        except Exception as e:
+            logger.debug("Server reachability check failed: %s", e)
+            return False
+
+    # ── Discovery (UDP broadcast) ──────────────────────────────────────────────
 
     def _discover_host(self):
         """
         Broadcast a discovery packet and wait DISCOVER_TIMEOUT seconds.
-        Returns (host_ip, share_name, peer_name) or (None, None, None).
+        Returns (host_ip, peer_name) or (None, None).
         """
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.settimeout(DISCOVER_TIMEOUT)
-        local_ip = _get_local_ip()
         try:
             sock.bind(("", 0))
             sock.sendto(DISCOVER_MSG, (BROADCAST_ADDR, DISCOVER_PORT))
-            logger.debug("Discovery broadcast sent from %s", local_ip)
+            logger.debug("Discovery broadcast sent from %s", self._local_ip)
             deadline = time.time() + DISCOVER_TIMEOUT
             while time.time() < deadline:
                 try:
                     data, addr = sock.recvfrom(512)
                     if data.startswith(HOST_PREFIX):
-                        if addr[0] == local_ip:
-                            # Ignore our own reply (edge case when host/client on same PC)
-                            continue
+                        if addr[0] == self._local_ip:
+                            continue  # ignore our own reply
                         payload = data[len(HOST_PREFIX):].decode("utf-8", errors="ignore")
-                        # payload format: "SHARE_NAME|PC_NAME"
-                        parts   = payload.split("|")
-                        share   = parts[0] if parts else SHARE_NAME
-                        peer    = parts[1] if len(parts) > 1 else addr[0]
-                        return addr[0], share, peer
+                        # payload format: "IP|PC_NAME"
+                        parts    = payload.split("|")
+                        host_ip  = parts[0] if parts else addr[0]
+                        peer     = parts[1] if len(parts) > 1 else addr[0]
+                        return host_ip, peer
                 except socket.timeout:
                     break
                 except OSError:
@@ -223,7 +188,9 @@ class LanSync:
             logger.debug("Discovery error: %s", e)
         finally:
             sock.close()
-        return None, None, None
+        return None, None
+
+    # ── Heartbeat (HOST broadcasts its availability) ───────────────────────────
 
     def _start_heartbeat(self) -> None:
         """HOST: listen on the discovery port and reply to any discovery request."""
@@ -241,7 +208,8 @@ class LanSync:
                 )
                 return
             pc_name = _get_pc_name()
-            reply   = HOST_PREFIX + f"{SHARE_NAME}|{pc_name}".encode("utf-8")
+            # Reply includes local IP and PC name so client can build the API URL
+            reply   = HOST_PREFIX + f"{self._local_ip}|{pc_name}".encode("utf-8")
             logger.info("HOST heartbeat listening on UDP port %d", DISCOVER_PORT)
             while not self._stop_evt.is_set():
                 try:

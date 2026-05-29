@@ -4,6 +4,9 @@ database.py — SQLite Database Layer for PayrollPro
 All public functions accept an optional db_path argument.
 When db_path=None (the default), get_active_db_path() is called at
 call-time so that LanSync can switch the DB to a UNC path after startup.
+
+When running as a LAN CLIENT, set_sync_client() injects a SyncClient
+instance and all public functions are transparently routed over HTTP.
 """
 import sqlite3
 import json
@@ -21,6 +24,22 @@ from schema import (
 from db_cache import cache
 
 logger = logging.getLogger(__name__)
+
+# ── LAN CLIENT dispatch ────────────────────────────────────────────────────────
+# When set, all public DB calls are forwarded to the SyncClient (HTTP proxy).
+_sync_client = None   # type: Optional["sync_client.SyncClient"]
+
+
+def set_sync_client(client) -> None:
+    """Inject a SyncClient so all DB calls are proxied over HTTP (CLIENT mode)."""
+    global _sync_client
+    _sync_client = client
+    logger.info("SyncClient injected — DB calls will go through HTTP proxy")
+
+
+def get_sync_client():
+    """Return the active SyncClient, or None if running locally."""
+    return _sync_client
 
 
 # ── Runtime DB path resolver ───────────────────────────────────────────────────
@@ -214,6 +233,8 @@ def init_db(db_path=None, seed=True):
 #   SKILL WAGES
 # ══════════════════════════════════════════════════════════════════════════════
 def get_all_skill_wages(db_path=None) -> List[SkillWage]:
+    if _sync_client and db_path is None:
+        return _sync_client.get_all_skill_wages()
     db_path = _db(db_path)
     key = f"skill_wages:{db_path}"
     cached = cache.get(key)
@@ -229,10 +250,15 @@ def get_all_skill_wages(db_path=None) -> List[SkillWage]:
 
 
 def get_skill_wages_dict(db_path=None) -> Dict[str, SkillWage]:
+    if _sync_client and db_path is None:
+        return _sync_client.get_skill_wages_dict()
     return {sw.skill_category: sw for sw in get_all_skill_wages(db_path)}
 
 
 def upsert_skill_wage(sw: SkillWage, db_path=None):
+    if _sync_client and db_path is None:
+        _sync_client.upsert_skill_wage(sw)
+        return
     db_path = _db(db_path)
     with get_conn(db_path) as conn:
         conn.execute(
@@ -249,6 +275,8 @@ def upsert_skill_wage(sw: SkillWage, db_path=None):
 # ══════════════════════════════════════════════════════════════════════════════
 def get_all_banks(db_path=None) -> List[str]:
     """Return sorted list of bank name strings."""
+    if _sync_client and db_path is None:
+        return _sync_client.get_all_banks()
     db_path = _db(db_path)
     key = f"banks:{db_path}"
     cached = cache.get(key)
@@ -262,6 +290,9 @@ def get_all_banks(db_path=None) -> List[str]:
 
 
 def add_bank(name: str, db_path=None):
+    if _sync_client and db_path is None:
+        _sync_client.add_bank(name)
+        return
     db_path = _db(db_path)
     with get_conn(db_path) as conn:
         conn.execute("INSERT INTO banks(name) VALUES(?)", (name.strip(),))
@@ -269,6 +300,9 @@ def add_bank(name: str, db_path=None):
 
 
 def update_bank(old_name: str, new_name: str, db_path=None):
+    if _sync_client and db_path is None:
+        _sync_client.update_bank(old_name, new_name)
+        return
     db_path = _db(db_path)
     new = new_name.strip()
     with get_conn(db_path) as conn:
@@ -284,6 +318,9 @@ def update_bank(old_name: str, new_name: str, db_path=None):
 
 
 def delete_bank(name: str, db_path=None):
+    if _sync_client and db_path is None:
+        _sync_client.delete_bank(name)
+        return
     db_path = _db(db_path)
     with get_conn(db_path) as conn:
         conn.execute("DELETE FROM banks WHERE name=?", (name,))
@@ -294,6 +331,8 @@ def delete_bank(name: str, db_path=None):
 #   UNITS
 # ══════════════════════════════════════════════════════════════════════════════
 def get_all_units(db_path=None) -> List[str]:
+    if _sync_client and db_path is None:
+        return _sync_client.get_all_units()
     db_path = _db(db_path)
     key = f"units:{db_path}"
     cached = cache.get(key)
@@ -307,6 +346,9 @@ def get_all_units(db_path=None) -> List[str]:
 
 
 def add_unit(name: str, db_path=None):
+    if _sync_client and db_path is None:
+        _sync_client.add_unit(name)
+        return
     db_path = _db(db_path)
     with get_conn(db_path) as conn:
         conn.execute("INSERT INTO units(name) VALUES(?)", (name.strip(),))
@@ -314,6 +356,9 @@ def add_unit(name: str, db_path=None):
 
 
 def rename_unit(old_name: str, new_name: str, db_path=None):
+    if _sync_client and db_path is None:
+        _sync_client.rename_unit(old_name, new_name)
+        return
     db_path = _db(db_path)
     new = new_name.strip()
     with get_conn(db_path) as conn:
@@ -328,6 +373,8 @@ def rename_unit(old_name: str, new_name: str, db_path=None):
 
 
 def delete_unit(name: str, db_path=None) -> int:
+    if _sync_client and db_path is None:
+        return _sync_client.delete_unit(name)
     db_path = _db(db_path)
     with get_conn(db_path) as conn:
         count = conn.execute(
@@ -346,6 +393,8 @@ def delete_unit(name: str, db_path=None) -> int:
 
 
 def unit_worker_count(db_path=None) -> Dict[str, int]:
+    if _sync_client and db_path is None:
+        return _sync_client.unit_worker_count()
     db_path = _db(db_path)
     key = f"unit_worker_count:{db_path}"
     cached = cache.get(key)
@@ -366,6 +415,8 @@ def unit_worker_count(db_path=None) -> Dict[str, int]:
 #   WORKERS
 # ══════════════════════════════════════════════════════════════════════════════
 def get_all_workers(db_path=None, active_only=True):
+    if _sync_client and db_path is None:
+        return _sync_client.get_all_workers(active_only=active_only)
     db_path = _db(db_path)
     key = f"workers:{db_path}:{'active' if active_only else 'all'}"
     cached = cache.get(key)
@@ -384,6 +435,8 @@ def get_all_workers(db_path=None, active_only=True):
 
 
 def get_workers_by_unit(unit, db_path=None, active_only=True):
+    if _sync_client and db_path is None:
+        return _sync_client.get_workers_by_unit(unit, active_only=active_only)
     db_path = _db(db_path)
     sql = "SELECT * FROM workers WHERE unit=?"
     if active_only:
@@ -395,6 +448,9 @@ def get_workers_by_unit(unit, db_path=None, active_only=True):
 
 
 def upsert_worker(w: Worker, db_path=None):
+    if _sync_client and db_path is None:
+        _sync_client.upsert_worker(w)
+        return
     db_path = _db(db_path)
     with get_conn(db_path) as conn:
         conn.execute(
@@ -423,6 +479,9 @@ def upsert_worker(w: Worker, db_path=None):
 
 
 def deactivate_worker(worker_id, db_path=None):
+    if _sync_client and db_path is None:
+        _sync_client.deactivate_worker(worker_id)
+        return
     db_path = _db(db_path)
     with get_conn(db_path) as conn:
         conn.execute("UPDATE workers SET active=0 WHERE worker_id=?", (worker_id,))
@@ -433,6 +492,9 @@ def deactivate_worker(worker_id, db_path=None):
 
 
 def reactivate_worker(worker_id, db_path=None):
+    if _sync_client and db_path is None:
+        _sync_client.reactivate_worker(worker_id)
+        return
     db_path = _db(db_path)
     with get_conn(db_path) as conn:
         conn.execute("UPDATE workers SET active=1 WHERE worker_id=?", (worker_id,))
@@ -443,6 +505,9 @@ def reactivate_worker(worker_id, db_path=None):
 
 
 def delete_worker(worker_id, db_path=None):
+    if _sync_client and db_path is None:
+        _sync_client.delete_worker(worker_id)
+        return
     db_path = _db(db_path)
     with get_conn(db_path) as conn:
         conn.execute("DELETE FROM attendance WHERE worker_id=?", (worker_id,))
@@ -455,6 +520,8 @@ def delete_worker(worker_id, db_path=None):
 
 
 def get_worker_by_id(worker_id, db_path=None):
+    if _sync_client and db_path is None:
+        return _sync_client.get_worker_by_id(worker_id)
     db_path = _db(db_path)
     with get_conn(db_path) as conn:
         row = conn.execute(
@@ -464,6 +531,8 @@ def get_worker_by_id(worker_id, db_path=None):
 
 
 def import_workers_from_csv(filepath, db_path=None):
+    if _sync_client and db_path is None:
+        return _sync_client.import_workers_from_csv(filepath)
     db_path = _db(db_path)
     import csv
 
@@ -539,6 +608,8 @@ _ATT_COLS = (
 
 
 def get_attendance(month, db_path=None):
+    if _sync_client and db_path is None:
+        return _sync_client.get_attendance(month)
     db_path = _db(db_path)
     key = f"attendance:{db_path}:{month}"
     cached = cache.get(key)
@@ -554,6 +625,9 @@ def get_attendance(month, db_path=None):
 
 
 def upsert_attendance(a: AttendanceRecord, db_path=None):
+    if _sync_client and db_path is None:
+        _sync_client.upsert_attendance(a)
+        return
     db_path = _db(db_path)
     vals = tuple(getattr(a, c) for c in _ATT_COLS)
     sets = ", ".join(f"{c}=excluded.{c}" for c in _ATT_COLS[2:])
@@ -569,6 +643,9 @@ def upsert_attendance(a: AttendanceRecord, db_path=None):
 
 def bulk_upsert_attendance(records: List[AttendanceRecord], db_path=None):
     """Upsert all records in a single transaction — much faster than N separate calls."""
+    if _sync_client and db_path is None:
+        _sync_client.bulk_upsert_attendance(records)
+        return
     db_path = _db(db_path)
     if not records:
         return
@@ -590,6 +667,9 @@ def bulk_upsert_attendance(records: List[AttendanceRecord], db_path=None):
 
 def delete_attendance_for_worker(worker_id: str, month: str = None, db_path=None):
     """Delete attendance records for a worker. If month given, only that month; else all months."""
+    if _sync_client and db_path is None:
+        _sync_client.delete_attendance_for_worker(worker_id, month)
+        return
     db_path = _db(db_path)
     with get_conn(db_path) as conn:
         if month:
@@ -604,6 +684,8 @@ def delete_attendance_for_worker(worker_id: str, month: str = None, db_path=None
 
 
 def import_attendance_from_csv(filepath, month, db_path=None):
+    if _sync_client and db_path is None:
+        return _sync_client.import_attendance_from_csv(filepath, month)
     db_path = _db(db_path)
     import csv
 
@@ -634,6 +716,8 @@ def import_attendance_from_csv(filepath, month, db_path=None):
 
 def get_months_with_data(db_path=None):
     """Return distinct months that have attendance records (cached)."""
+    if _sync_client and db_path is None:
+        return _sync_client.get_months_with_data()
     db_path = _db(db_path)
     key = f"months_with_data:{db_path}"
     cached = cache.get(key)
@@ -658,6 +742,8 @@ def get_workers_and_attendance(month: str, db_path=None):
     Caches both pieces independently so individual invalidation still works.
     Only active workers are fetched (active_only=True) to reduce rendering load.
     """
+    if _sync_client and db_path is None:
+        return _sync_client.get_workers_and_attendance(month)
     db_path = _db(db_path)
     workers  = get_all_workers(db_path, active_only=True)
     att_list = get_attendance(month, db_path)
@@ -669,6 +755,8 @@ def get_workers_and_attendance(month: str, db_path=None):
 #   CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 def get_config(db_path=None):
+    if _sync_client and db_path is None:
+        return _sync_client.get_config()
     db_path = _db(db_path)
     key = f"config:{db_path}"
     cached = cache.get(key)
@@ -684,6 +772,9 @@ def get_config(db_path=None):
 
 
 def save_config(cfg: CompanyConfig, db_path=None):
+    if _sync_client and db_path is None:
+        _sync_client.save_config(cfg)
+        return
     db_path = _db(db_path)
     with get_conn(db_path) as conn:
         conn.execute(
