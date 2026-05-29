@@ -580,10 +580,16 @@ class PayrollApp(QMainWindow):
 
         if role == "client" and host_ip:
             # Inject HTTP proxy — CLIENT never touches SQLite directly
-            from sync_client import SyncClient
-            self._sync_client = SyncClient(host_ip=host_ip)
-            _db_mod.set_sync_client(self._sync_client)
-            # db_path stays as local path; it won't be used (SyncClient takes over)
+            try:
+                from sync_client import SyncClient
+                self._sync_client = SyncClient(host_ip=host_ip)
+                _db_mod.set_sync_client(self._sync_client)
+            except Exception as e:
+                import logging as _logging
+                _logging.error("Failed to initialize SyncClient (missing dependencies?): %s. Falling back to standalone.", e)
+                self._lan_role = "standalone"
+                self._lan_peer = None
+                self._lan_host_ip = None
 
         set_active_db_path(db_path)
         # init_db must run on the main thread via Qt's queued connection
