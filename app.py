@@ -630,8 +630,10 @@ class PayrollApp(QMainWindow):
 
     def _on_host_data_changed(self):
         """Called (from background thread) when the host's DB has new data.
-        Invalidates the page cache and triggers a UI refresh via Qt signal."""
-        # Schedule a UI refresh on the Qt main thread
+        Flushes the local cache so the next read goes to the HOST over HTTP,
+        then triggers a UI refresh via Qt signal."""
+        from db_cache import cache as _db_cache
+        _db_cache.clear()   # drop stale CLIENT-side HTTP-response cache
         QMetaObject.invokeMethod(
             self, "_refresh_current_page", Qt.ConnectionType.QueuedConnection
         )

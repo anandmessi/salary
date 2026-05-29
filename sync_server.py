@@ -45,6 +45,7 @@ def _make_app(host_db_path: str):
     # Import DB functions here so they use the resolved DB path
     import database as db
     import schema as sc
+    from db_cache import cache as _cache
 
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
@@ -80,24 +81,46 @@ def _make_app(host_db_path: str):
         data = request.get_json(force=True)
         w = sc.Worker.from_dict(data)
         db.upsert_worker(w, host_db_path)
+        _cache.invalidate(
+            f"workers:{host_db_path}:active",
+            f"workers:{host_db_path}:all",
+            f"unit_worker_count:{host_db_path}",
+        )
         _bump_change()
         return jsonify({"ok": True})
 
     @app.route("/api/workers/<worker_id>/deactivate", methods=["POST"])
     def deactivate_worker(worker_id):
         db.deactivate_worker(worker_id, host_db_path)
+        _cache.invalidate(
+            f"workers:{host_db_path}:active",
+            f"workers:{host_db_path}:all",
+            f"unit_worker_count:{host_db_path}",
+        )
         _bump_change()
         return jsonify({"ok": True})
 
     @app.route("/api/workers/<worker_id>/reactivate", methods=["POST"])
     def reactivate_worker(worker_id):
         db.reactivate_worker(worker_id, host_db_path)
+        _cache.invalidate(
+            f"workers:{host_db_path}:active",
+            f"workers:{host_db_path}:all",
+            f"unit_worker_count:{host_db_path}",
+        )
         _bump_change()
         return jsonify({"ok": True})
 
     @app.route("/api/workers/<worker_id>", methods=["DELETE"])
     def delete_worker(worker_id):
         db.delete_worker(worker_id, host_db_path)
+        _cache.invalidate(
+            f"workers:{host_db_path}:active",
+            f"workers:{host_db_path}:all",
+            f"unit_worker_count:{host_db_path}",
+            f"months_with_data:{host_db_path}",
+        )
+        _cache.invalidate_prefix(f"attendance:{host_db_path}:")
         _bump_change()
         return jsonify({"ok": True})
 
@@ -108,6 +131,11 @@ def _make_app(host_db_path: str):
         if not filepath:
             return jsonify({"error": "filepath required"}), 400
         result = db.import_workers_from_csv(filepath, host_db_path)
+        _cache.invalidate(
+            f"workers:{host_db_path}:active",
+            f"workers:{host_db_path}:all",
+            f"unit_worker_count:{host_db_path}",
+        )
         _bump_change()
         return jsonify(result)
 
@@ -123,6 +151,10 @@ def _make_app(host_db_path: str):
         data = request.get_json(force=True)
         rec = sc.AttendanceRecord.from_dict(data)
         db.upsert_attendance(rec, host_db_path)
+        _cache.invalidate(
+            f"attendance:{host_db_path}:{rec.month}",
+            f"months_with_data:{host_db_path}",
+        )
         _bump_change()
         return jsonify({"ok": True})
 
@@ -131,18 +163,28 @@ def _make_app(host_db_path: str):
         data = request.get_json(force=True)
         records = [sc.AttendanceRecord.from_dict(r) for r in data]
         db.bulk_upsert_attendance(records, host_db_path)
+        months = {r.month for r in records}
+        for m in months:
+            _cache.invalidate(f"attendance:{host_db_path}:{m}")
+        _cache.invalidate(f"months_with_data:{host_db_path}")
         _bump_change()
         return jsonify({"ok": True, "count": len(records)})
 
     @app.route("/api/attendance/<worker_id>/<month>", methods=["DELETE"])
     def delete_attendance(worker_id, month):
         db.delete_attendance_for_worker(worker_id, month, host_db_path)
+        _cache.invalidate(
+            f"attendance:{host_db_path}:{month}",
+            f"months_with_data:{host_db_path}",
+        )
         _bump_change()
         return jsonify({"ok": True})
 
     @app.route("/api/attendance/<worker_id>", methods=["DELETE"])
     def delete_attendance_all(worker_id):
         db.delete_attendance_for_worker(worker_id, None, host_db_path)
+        _cache.invalidate_prefix(f"attendance:{host_db_path}:")
+        _cache.invalidate(f"months_with_data:{host_db_path}")
         _bump_change()
         return jsonify({"ok": True})
 
@@ -154,6 +196,10 @@ def _make_app(host_db_path: str):
         if not filepath or not month:
             return jsonify({"error": "filepath and month required"}), 400
         result = db.import_attendance_from_csv(filepath, month, host_db_path)
+        _cache.invalidate(
+            f"attendance:{host_db_path}:{month}",
+            f"months_with_data:{host_db_path}",
+        )
         _bump_change()
         return jsonify(result)
 
@@ -177,6 +223,7 @@ def _make_app(host_db_path: str):
     def add_unit():
         data = request.get_json(force=True)
         db.add_unit(data["name"], host_db_path)
+        _cache.invalidate(f"units:{host_db_path}")
         _bump_change()
         return jsonify({"ok": True})
 
@@ -184,12 +231,24 @@ def _make_app(host_db_path: str):
     def rename_unit():
         data = request.get_json(force=True)
         db.rename_unit(data["old_name"], data["new_name"], host_db_path)
+        _cache.invalidate(
+            f"units:{host_db_path}",
+            f"workers:{host_db_path}:active",
+            f"workers:{host_db_path}:all",
+            f"unit_worker_count:{host_db_path}",
+        )
         _bump_change()
         return jsonify({"ok": True})
 
     @app.route("/api/units/<name>", methods=["DELETE"])
     def delete_unit(name):
         count = db.delete_unit(name, host_db_path)
+        _cache.invalidate(
+            f"units:{host_db_path}",
+            f"workers:{host_db_path}:active",
+            f"workers:{host_db_path}:all",
+            f"unit_worker_count:{host_db_path}",
+        )
         _bump_change()
         return jsonify({"ok": True, "workers_moved": count})
 
@@ -213,6 +272,7 @@ def _make_app(host_db_path: str):
     def add_bank():
         data = request.get_json(force=True)
         db.add_bank(data["name"], host_db_path)
+        _cache.invalidate(f"banks:{host_db_path}")
         _bump_change()
         return jsonify({"ok": True})
 
@@ -220,12 +280,18 @@ def _make_app(host_db_path: str):
     def update_bank():
         data = request.get_json(force=True)
         db.update_bank(data["old_name"], data["new_name"], host_db_path)
+        _cache.invalidate(
+            f"banks:{host_db_path}",
+            f"workers:{host_db_path}:active",
+            f"workers:{host_db_path}:all",
+        )
         _bump_change()
         return jsonify({"ok": True})
 
     @app.route("/api/banks/<name>", methods=["DELETE"])
     def delete_bank(name):
         db.delete_bank(name, host_db_path)
+        _cache.invalidate(f"banks:{host_db_path}")
         _bump_change()
         return jsonify({"ok": True})
 
@@ -241,6 +307,7 @@ def _make_app(host_db_path: str):
         data = request.get_json(force=True)
         sw = sc.SkillWage.from_dict(data)
         db.upsert_skill_wage(sw, host_db_path)
+        _cache.invalidate(f"skill_wages:{host_db_path}")
         _bump_change()
         return jsonify({"ok": True})
 
@@ -256,6 +323,7 @@ def _make_app(host_db_path: str):
         data = request.get_json(force=True)
         cfg = sc.CompanyConfig.from_dict(data)
         db.save_config(cfg, host_db_path)
+        _cache.invalidate(f"config:{host_db_path}")
         _bump_change()
         return jsonify({"ok": True})
 
