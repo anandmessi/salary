@@ -525,6 +525,117 @@ class FetchThread(QThread):
             # Fix #14: close the thread-local SQLite connection to avoid file-handle leaks
             close_thread_conn()
 
+
+class _LoadingOverlay(QWidget):
+    """Full-window loading overlay shown during startup data pre-fetch.
+
+    Displayed immediately on launch and dismissed only after all DB data
+    has been loaded into cache, ensuring the first tab click is instant.
+    Covers self.central_widget entirely (sidebar + content area).
+    """
+    SPINNER_FRAMES = ["\u280b", "\u2819", "\u2838", "\u2834", "\u2826", "\u2807"]
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"background-color: {SURFACE_2};")
+        self.setGeometry(parent.rect())
+
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Braille spinner character
+        self._spinner_lbl = QLabel(self.SPINNER_FRAMES[0])
+        self._spinner_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._spinner_lbl.setStyleSheet(
+            f"font-size: 52px; color: {ACCENT}; background: transparent; border: none;"
+        )
+        layout.addWidget(self._spinner_lbl)
+        layout.addSpacing(20)
+
+        # Bold primary status label
+        self._status_lbl = QLabel("\U0001f50d Detecting network role\u2026")
+        self._status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status_lbl.setStyleSheet(
+            f"font-size: 17px; font-weight: bold; color: {TEXT_PRIMARY}; "
+            "background: transparent; border: none;"
+        )
+        layout.addWidget(self._status_lbl)
+        layout.addSpacing(12)
+
+        # Secondary sub-label
+        self._sub_lbl = QLabel("Please wait, loading all data\u2026")
+        self._sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._sub_lbl.setStyleSheet(
+            f"font-size: 12px; color: {TEXT_SECONDARY}; "
+            "background: transparent; border: none;"
+        )
+        layout.addWidget(self._sub_lbl)
+
+        # 80 ms spinner animation
+        self._spinner_idx = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(80)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+    def _tick(self):
+        self._spinner_idx = (self._spinner_idx + 1) % len(self.SPINNER_FRAMES)
+        self._spinner_lbl.setText(self.SPINNER_FRAMES[self._spinner_idx])
+
+    def set_status(self, msg: str):
+        """Update the main status label (must be called from the main thread)."""
+        self._status_lbl.setText(msg)
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        super().hideEvent(event)
+
+
+class PrewarmThread(QThread):
+    """Pre-fetches all frequently-used DB data into cache before the dashboard loads.
+
+    Emits progress signals so the loading overlay can display step-by-step status.
+    Calls result_ready only after every dataset has been fetched, so _navigate is
+    deferred until the cache is fully warm.
+    """
+    progress     = pyqtSignal(str)       # human-readable step description
+    result_ready = pyqtSignal(object)    # emits True on success
+    error_ready  = pyqtSignal(Exception) # emits on unexpected failure
+
+    def __init__(self, current_month: str):
+        super().__init__()
+        self._month = current_month
+
+    def run(self):
+        try:
+            self.progress.emit("Loading workers\u2026")
+            get_all_workers()
+
+            self.progress.emit("Loading wage rates\u2026")
+            get_skill_wages_dict()
+
+            self.progress.emit("Loading units\u2026")
+            get_all_units()
+
+            self.progress.emit("Loading company config\u2026")
+            get_config()
+
+            self.progress.emit("Loading banks\u2026")
+            get_all_banks()
+
+            self.progress.emit(f"Loading attendance for {self._month}\u2026")
+            get_workers_and_attendance(self._month)
+
+            self.result_ready.emit(True)
+        except Exception as e:
+            self.error_ready.emit(e)
+        finally:
+            close_thread_conn()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 class PayrollApp(QMainWindow):
     backup_sync_signal = pyqtSignal(str, str)
@@ -534,6 +645,7 @@ class PayrollApp(QMainWindow):
         self._active_threads = set()   # Fix #10: set instead of list for safe discard
         self._page_cache: dict = {}     # Fix #9: cache built pages to avoid full rebuild on nav
         self._nav_generation = 0        # Fix #1: invalidate in-flight renders on navigation
+        self._loading_overlay = None    # assigned after sidebar+main area are built
         self.backup_sync_signal.connect(self._update_backup_label)
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — Professional Payroll Management")
         self.resize(1300, 800)
@@ -548,6 +660,15 @@ class PayrollApp(QMainWindow):
 
         self._build_sidebar()
         self._build_main_area()
+
+        # Disable all sidebar nav buttons until prewarm completes
+        for btn in self._nav_buttons.values():
+            btn.setEnabled(False)
+
+        # Full-screen loading overlay — covers central_widget (sidebar + content area)
+        self._loading_overlay = _LoadingOverlay(self.central_widget)
+        self._loading_overlay.raise_()
+        self._loading_overlay.show()
 
         # LAN sync: discover role before init_db so DB path is resolved first
         from schema import DB_PATH as _local_db_path
@@ -566,6 +687,15 @@ class PayrollApp(QMainWindow):
         if self._backup_mgr is not None:
             self._backup_mgr.stop()
         event.accept()
+
+    def resizeEvent(self, event):
+        """Keep the loading overlay full-screen if the window is resized during startup."""
+        super().resizeEvent(event)
+        if self._loading_overlay is not None:
+            try:
+                self._loading_overlay.setGeometry(self.central_widget.rect())
+            except RuntimeError:
+                self._loading_overlay = None
 
     # ── LAN sync callbacks ────────────────────────────────────────────────────
 
@@ -615,18 +745,61 @@ class PayrollApp(QMainWindow):
             self._backup_mgr = BackupManager(db_path=db, on_sync=self._on_backup_sync)
             self._backup_mgr.start()
 
-        def _prewarm():
-            try:
-                get_all_workers(); get_skill_wages_dict(); get_all_units(); get_config()
-            except Exception:
-                pass
-        threading.Thread(target=_prewarm, daemon=True).start()
-        self._navigate("dashboard")
+        # Update overlay and launch prewarm — dashboard shown only AFTER cache is warm
+        if self._loading_overlay is not None:
+            self._loading_overlay.set_status("\U0001f504 Initializing database\u2026")
+        current_month = datetime.date.today().strftime("%Y-%m")
+        self._prewarm_thread = PrewarmThread(current_month)
+        self._prewarm_thread.progress.connect(self._on_prewarm_progress)
+        self._prewarm_thread.result_ready.connect(self._on_prewarm_done)
+        self._prewarm_thread.error_ready.connect(self._on_prewarm_error)
+        self._prewarm_thread.start()
         self._update_sync_badge()
 
     def _show_detecting_overlay(self):
-        """Show a subtle status message while LAN role is being determined."""
-        self.set_message("🔍 Detecting network sync… (up to 3 s)", ACCENT)
+        """Update overlay status while LAN role is being determined."""
+        if self._loading_overlay is not None:
+            self._loading_overlay.set_status("\U0001f50d Detecting network role\u2026")
+        self.set_message("\U0001f50d Detecting network sync\u2026 (up to 3 s)", ACCENT)
+
+    # ── Prewarm callbacks (Bug 1 fix) ──────────────────────────────────────────
+
+    @pyqtSlot(str)
+    def _on_prewarm_progress(self, msg: str):
+        """Relay prewarm step description to the loading overlay label."""
+        if self._loading_overlay is not None:
+            self._loading_overlay.set_status(msg)
+
+    @pyqtSlot(object)
+    def _on_prewarm_done(self, _result):
+        """Called when PrewarmThread finishes — dismiss overlay and show dashboard."""
+        if self._loading_overlay is not None:
+            try:
+                self._loading_overlay.hide()
+                self._loading_overlay.deleteLater()
+            except RuntimeError:
+                pass
+            self._loading_overlay = None
+        # Re-enable all sidebar navigation buttons
+        for btn in self._nav_buttons.values():
+            btn.setEnabled(True)
+        self._navigate("dashboard")
+        self._update_sync_badge()
+
+    def _on_prewarm_error(self, e: Exception):
+        """Called if PrewarmThread fails — still dismiss overlay and continue."""
+        if self._loading_overlay is not None:
+            try:
+                self._loading_overlay.hide()
+                self._loading_overlay.deleteLater()
+            except RuntimeError:
+                pass
+            self._loading_overlay = None
+        for btn in self._nav_buttons.values():
+            btn.setEnabled(True)
+        self._navigate("dashboard")
+        self._update_sync_badge()
+        self.set_message(f"\u26a0\ufe0f Startup data error: {e}", WARNING_CLR)
 
     def _on_host_data_changed(self):
         """Called (from background thread) when the host's DB has new data.
@@ -654,8 +827,9 @@ class PayrollApp(QMainWindow):
             except RuntimeError:
                 pass  # already deleted
 
-        # Navigate rebuilds the page and fetches fresh data from the host
-        self._navigate(key)
+        # Navigate rebuilds the page and fetches fresh data from the host.
+        # _background_refresh=True prevents cancelling the page's own in-flight fetch.
+        self._navigate(key, _background_refresh=True)
         self._update_sync_badge()
 
     def _update_sync_badge(self):
@@ -826,8 +1000,11 @@ class PayrollApp(QMainWindow):
         if auto_clear and color != DANGER:
             QTimer.singleShot(4000, lambda: self.set_message("Ready", TEXT_MUTED, False))
 
-    def _navigate(self, key):
-        self._nav_generation += 1          # Fix #1: invalidate all in-flight renders
+    def _navigate(self, key, _background_refresh: bool = False):
+        # Fix #1: invalidate in-flight renders — skip when refreshing in the background
+        # so a LAN-sync-triggered rebuild does not cancel the page's own data fetch.
+        if not _background_refresh:
+            self._nav_generation += 1
         self._current_page_key = key       # Track active page reliably
         for k, btn in self._nav_buttons.items():
             btn.set_active(k == key)
