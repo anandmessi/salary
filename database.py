@@ -234,6 +234,7 @@ def init_db(db_path=None, seed=True):
 # ══════════════════════════════════════════════════════════════════════════════
 def get_all_skill_wages(db_path=None) -> List[SkillWage]:
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → get_all_skill_wages")
         return _sync_client.get_all_skill_wages()
     db_path = _db(db_path)
     key = f"skill_wages:{db_path}"
@@ -251,12 +252,14 @@ def get_all_skill_wages(db_path=None) -> List[SkillWage]:
 
 def get_skill_wages_dict(db_path=None) -> Dict[str, SkillWage]:
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → get_skill_wages_dict")
         return _sync_client.get_skill_wages_dict()
     return {sw.skill_category: sw for sw in get_all_skill_wages(db_path)}
 
 
 def upsert_skill_wage(sw: SkillWage, db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → upsert_skill_wage(%s)", sw.skill_category)
         _sync_client.upsert_skill_wage(sw)
         return
     db_path = _db(db_path)
@@ -276,6 +279,7 @@ def upsert_skill_wage(sw: SkillWage, db_path=None):
 def get_all_banks(db_path=None) -> List[str]:
     """Return sorted list of bank name strings."""
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → get_all_banks")
         return _sync_client.get_all_banks()
     db_path = _db(db_path)
     key = f"banks:{db_path}"
@@ -291,6 +295,7 @@ def get_all_banks(db_path=None) -> List[str]:
 
 def add_bank(name: str, db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → add_bank(%r)", name)
         _sync_client.add_bank(name)
         return
     db_path = _db(db_path)
@@ -301,6 +306,7 @@ def add_bank(name: str, db_path=None):
 
 def update_bank(old_name: str, new_name: str, db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → update_bank(%r → %r)", old_name, new_name)
         _sync_client.update_bank(old_name, new_name)
         return
     db_path = _db(db_path)
@@ -319,6 +325,7 @@ def update_bank(old_name: str, new_name: str, db_path=None):
 
 def delete_bank(name: str, db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → delete_bank(%r)", name)
         _sync_client.delete_bank(name)
         return
     db_path = _db(db_path)
@@ -332,6 +339,7 @@ def delete_bank(name: str, db_path=None):
 # ══════════════════════════════════════════════════════════════════════════════
 def get_all_units(db_path=None) -> List[str]:
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → get_all_units")
         return _sync_client.get_all_units()
     db_path = _db(db_path)
     key = f"units:{db_path}"
@@ -347,6 +355,7 @@ def get_all_units(db_path=None) -> List[str]:
 
 def add_unit(name: str, db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → add_unit(%r)", name)
         _sync_client.add_unit(name)
         return
     db_path = _db(db_path)
@@ -357,6 +366,7 @@ def add_unit(name: str, db_path=None):
 
 def rename_unit(old_name: str, new_name: str, db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → rename_unit(%r → %r)", old_name, new_name)
         _sync_client.rename_unit(old_name, new_name)
         return
     db_path = _db(db_path)
@@ -374,6 +384,7 @@ def rename_unit(old_name: str, new_name: str, db_path=None):
 
 def delete_unit(name: str, db_path=None) -> int:
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → delete_unit(%r)", name)
         return _sync_client.delete_unit(name)
     db_path = _db(db_path)
     with get_conn(db_path) as conn:
@@ -394,6 +405,7 @@ def delete_unit(name: str, db_path=None) -> int:
 
 def unit_worker_count(db_path=None) -> Dict[str, int]:
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → unit_worker_count")
         return _sync_client.unit_worker_count()
     db_path = _db(db_path)
     key = f"unit_worker_count:{db_path}"
@@ -416,6 +428,7 @@ def unit_worker_count(db_path=None) -> Dict[str, int]:
 # ══════════════════════════════════════════════════════════════════════════════
 def get_all_workers(db_path=None, active_only=True):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → get_all_workers(active_only=%s)", active_only)
         return _sync_client.get_all_workers(active_only=active_only)
     db_path = _db(db_path)
     key = f"workers:{db_path}:{'active' if active_only else 'all'}"
@@ -436,6 +449,7 @@ def get_all_workers(db_path=None, active_only=True):
 
 def get_workers_by_unit(unit, db_path=None, active_only=True):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → get_workers_by_unit(%r)", unit)
         return _sync_client.get_workers_by_unit(unit, active_only=active_only)
     db_path = _db(db_path)
     sql = "SELECT * FROM workers WHERE unit=?"
@@ -449,6 +463,7 @@ def get_workers_by_unit(unit, db_path=None, active_only=True):
 
 def upsert_worker(w: Worker, db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → upsert_worker(%r)", w.worker_id)
         _sync_client.upsert_worker(w)
         return
     db_path = _db(db_path)
@@ -480,6 +495,7 @@ def upsert_worker(w: Worker, db_path=None):
 
 def deactivate_worker(worker_id, db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → deactivate_worker(%r)", worker_id)
         _sync_client.deactivate_worker(worker_id)
         return
     db_path = _db(db_path)
@@ -493,6 +509,7 @@ def deactivate_worker(worker_id, db_path=None):
 
 def reactivate_worker(worker_id, db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → reactivate_worker(%r)", worker_id)
         _sync_client.reactivate_worker(worker_id)
         return
     db_path = _db(db_path)
@@ -506,6 +523,7 @@ def reactivate_worker(worker_id, db_path=None):
 
 def delete_worker(worker_id, db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → delete_worker(%r)", worker_id)
         _sync_client.delete_worker(worker_id)
         return
     db_path = _db(db_path)
@@ -521,6 +539,7 @@ def delete_worker(worker_id, db_path=None):
 
 def get_worker_by_id(worker_id, db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → get_worker_by_id(%r)", worker_id)
         return _sync_client.get_worker_by_id(worker_id)
     db_path = _db(db_path)
     with get_conn(db_path) as conn:
@@ -532,6 +551,7 @@ def get_worker_by_id(worker_id, db_path=None):
 
 def import_workers_from_csv(filepath, db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → import_workers_from_csv(%r)", filepath)
         return _sync_client.import_workers_from_csv(filepath)
     db_path = _db(db_path)
     import csv
@@ -609,6 +629,7 @@ _ATT_COLS = (
 
 def get_attendance(month, db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → get_attendance(%r)", month)
         return _sync_client.get_attendance(month)
     db_path = _db(db_path)
     key = f"attendance:{db_path}:{month}"
@@ -626,6 +647,7 @@ def get_attendance(month, db_path=None):
 
 def upsert_attendance(a: AttendanceRecord, db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → upsert_attendance(worker=%r, month=%r)", a.worker_id, a.month)
         _sync_client.upsert_attendance(a)
         return
     db_path = _db(db_path)
@@ -644,6 +666,7 @@ def upsert_attendance(a: AttendanceRecord, db_path=None):
 def bulk_upsert_attendance(records: List[AttendanceRecord], db_path=None):
     """Upsert all records in a single transaction — much faster than N separate calls."""
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → bulk_upsert_attendance(count=%d)", len(records))
         _sync_client.bulk_upsert_attendance(records)
         return
     db_path = _db(db_path)
@@ -668,6 +691,7 @@ def bulk_upsert_attendance(records: List[AttendanceRecord], db_path=None):
 def delete_attendance_for_worker(worker_id: str, month: str = None, db_path=None):
     """Delete attendance records for a worker. If month given, only that month; else all months."""
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → delete_attendance_for_worker(%r, month=%r)", worker_id, month)
         _sync_client.delete_attendance_for_worker(worker_id, month)
         return
     db_path = _db(db_path)
@@ -685,6 +709,7 @@ def delete_attendance_for_worker(worker_id: str, month: str = None, db_path=None
 
 def import_attendance_from_csv(filepath, month, db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → import_attendance_from_csv(%r, month=%r)", filepath, month)
         return _sync_client.import_attendance_from_csv(filepath, month)
     db_path = _db(db_path)
     import csv
@@ -717,6 +742,7 @@ def import_attendance_from_csv(filepath, month, db_path=None):
 def get_months_with_data(db_path=None):
     """Return distinct months that have attendance records (cached)."""
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → get_months_with_data")
         return _sync_client.get_months_with_data()
     db_path = _db(db_path)
     key = f"months_with_data:{db_path}"
@@ -743,6 +769,7 @@ def get_workers_and_attendance(month: str, db_path=None):
     Only active workers are fetched (active_only=True) to reduce rendering load.
     """
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → get_workers_and_attendance(month=%r)", month)
         return _sync_client.get_workers_and_attendance(month)
     db_path = _db(db_path)
     workers  = get_all_workers(db_path, active_only=True)
@@ -756,6 +783,7 @@ def get_workers_and_attendance(month: str, db_path=None):
 # ══════════════════════════════════════════════════════════════════════════════
 def get_config(db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → get_config")
         return _sync_client.get_config()
     db_path = _db(db_path)
     key = f"config:{db_path}"
@@ -773,6 +801,7 @@ def get_config(db_path=None):
 
 def save_config(cfg: CompanyConfig, db_path=None):
     if _sync_client and db_path is None:
+        logger.debug("CLIENT proxy → save_config")
         _sync_client.save_config(cfg)
         return
     db_path = _db(db_path)

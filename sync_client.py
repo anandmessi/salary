@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-POLL_INTERVAL = 2.0          # seconds between /api/changes polls
+POLL_INTERVAL = 2.0          # seconds between version/change polls
 CONNECT_TIMEOUT = 3.0        # seconds for initial connection attempts
 REQUEST_TIMEOUT = 8.0        # seconds for regular API calls
 
@@ -34,6 +34,7 @@ class SyncClient:
         self._host_ip = host_ip
         self._port = port
         self._last_ts: float = 0.0          # last seen change timestamp
+        self._last_version: int = -1        # last seen /api/version counter (-1 = uninitialised)
         self._connected: bool = False
         self._stop_evt = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
@@ -87,25 +88,54 @@ class SyncClient:
         self._stop_evt.set()
 
     def _poll_loop(self):
+        """Background poll thread.
+
+        Tries /api/version first (monotonic integer counter added in sync_server
+        alongside _write_version).  Falls back to the original /api/changes
+        timestamp approach so the client stays compatible with hosts that haven't
+        been updated yet.
+        """
         while not self._stop_evt.is_set():
+            changed = False
             try:
+                # ── Primary: integer version counter (immune to clock-skew) ──
                 r = self._requests.get(
-                    f"{self.base_url}/changes", timeout=CONNECT_TIMEOUT
+                    f"{self.base_url}/version", timeout=CONNECT_TIMEOUT
                 )
                 if r.status_code == 200:
-                    ts = r.json().get("ts", 0.0)
-                    if ts > self._last_ts:
-                        self._last_ts = ts
-                        self._connected = True
-                        if self._on_change:
-                            try:
-                                self._on_change()
-                            except Exception as e:
-                                logger.debug("on_change callback error: %s", e)
+                    ver = r.json().get("version", -1)
+                    if self._last_version == -1:
+                        # First successful poll — initialise without firing on_change
+                        self._last_version = ver
+                    elif ver > self._last_version:
+                        self._last_version = ver
+                        changed = True
+                    self._connected = True
                 else:
-                    self._connected = False
+                    raise ValueError(f"HTTP {r.status_code}")
             except Exception:
-                self._connected = False
+                # ── Fallback: timestamp-based /api/changes ────────────────────
+                try:
+                    r = self._requests.get(
+                        f"{self.base_url}/changes", timeout=CONNECT_TIMEOUT
+                    )
+                    if r.status_code == 200:
+                        ts = r.json().get("ts", 0.0)
+                        if ts > self._last_ts:
+                            self._last_ts = ts
+                            changed = True
+                        self._connected = True
+                    else:
+                        self._connected = False
+                except Exception:
+                    self._connected = False
+
+            if changed and self._on_change:
+                try:
+                    self._on_change()
+                except Exception as e:
+                    logger.debug("on_change callback error: %s", e)
+
             self._stop_evt.wait(POLL_INTERVAL)
 
     # ── Internal helpers ───────────────────────────────────────────────────────
@@ -133,6 +163,19 @@ class SyncClient:
         r.raise_for_status()
         self._connected = True
         return r.json()
+
+    # ── Version ────────────────────────────────────────────────────────────────
+
+    def get_version(self) -> int:
+        """Query the host's write-version counter.
+
+        Returns -1 if the host does not support /api/version (older server).
+        """
+        try:
+            data = self._get("/version")
+            return int(data.get("version", -1))
+        except Exception:
+            return -1
 
     # ── Workers ────────────────────────────────────────────────────────────────
 

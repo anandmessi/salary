@@ -25,12 +25,18 @@ _shutdown_event = threading.Event()
 _last_change_ts: float = 0.0
 _change_lock = threading.Lock()
 
+# Monotonically-increasing write counter — incremented on every write operation.
+# Clients can poll /api/version and compare against their last known value to
+# detect changes without relying on wall-clock timestamps.
+_write_version: int = 0
+
 
 def _bump_change():
-    """Called after every write so polling clients see a new timestamp."""
-    global _last_change_ts
+    """Called after every write so polling clients see a new timestamp and version."""
+    global _last_change_ts, _write_version
     with _change_lock:
         _last_change_ts = time.time()
+        _write_version += 1
 
 
 def _make_app(host_db_path: str):
@@ -60,6 +66,16 @@ def _make_app(host_db_path: str):
     def changes():
         """Lightweight polling endpoint — returns current change timestamp."""
         return jsonify({"ts": _last_change_ts})
+
+    @app.route("/api/version")
+    def version():
+        """Returns the monotonically-increasing write version counter.
+
+        Clients poll this every 2 s and call on_change() when the version
+        number increases. This is an alternative to /api/changes that is
+        immune to clock-skew between host and client machines.
+        """
+        return jsonify({"version": _write_version})
 
     # ── Workers ───────────────────────────────────────────────────────────────
 
