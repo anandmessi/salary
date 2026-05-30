@@ -728,6 +728,11 @@ class PayrollApp(QMainWindow):
             self._lan_sync.start()
 
     def closeEvent(self, event):
+        if hasattr(self, '_host_poll_client') and self._host_poll_client is not None:
+            try:
+                self._host_poll_client.stop_polling()
+            except Exception:
+                pass
         if hasattr(self, '_lan_sync') and self._lan_sync is not None:
             self._lan_sync.stop()
         if self._backup_mgr is not None:
@@ -780,10 +785,20 @@ class PayrollApp(QMainWindow):
             # Server-connected mode: skip local DB init, start polling for server changes.
             self._sync_client.start_polling(on_change=self._on_host_data_changed)
         else:
-            # Standalone mode: init local DB and start the backup manager.
+            # Standalone or Host mode: init local DB and start the backup manager.
             init_db(db, seed=True)
             self._backup_mgr = BackupManager(db_path=db, on_sync=self._on_backup_sync)
             self._backup_mgr.start()
+
+            # If running as the Host, start a background local poll to refresh GUI on client writes
+            if getattr(self, '_lan_role', None) == "host":
+                try:
+                    from sync_client import SyncClient
+                    self._host_poll_client = SyncClient(host_ip="127.0.0.1", port=5050)
+                    self._host_poll_client.start_polling(on_change=self._on_host_data_changed)
+                except Exception as _e:
+                    import logging as _logging
+                    _logging.error("Failed to start Host local poll client: %s", _e)
 
         # Update overlay and launch prewarm — dashboard shown only AFTER cache is warm
         if self._loading_overlay is not None:
