@@ -636,6 +636,14 @@ class PrewarmThread(QThread):
             close_thread_conn()
 
 
+def _safe_delete(widget):
+    """Safely call deleteLater() on a widget, ignoring RuntimeError if already deleted."""
+    try:
+        widget.deleteLater()
+    except RuntimeError:
+        pass
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 class PayrollApp(QMainWindow):
     backup_sync_signal = pyqtSignal(str, str)
@@ -646,6 +654,7 @@ class PayrollApp(QMainWindow):
         self._page_cache: dict = {}     # Fix #9: cache built pages to avoid full rebuild on nav
         self._nav_generation = 0        # Fix #1: invalidate in-flight renders on navigation
         self._loading_overlay = None    # assigned after sidebar+main area are built
+        self._refresh_timer = None      # debounce timer for LAN-sync refresh (see _schedule_refresh)
         self.backup_sync_signal.connect(self._update_backup_label)
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — Professional Payroll Management")
         self.resize(1300, 800)
@@ -804,26 +813,48 @@ class PayrollApp(QMainWindow):
     def _on_host_data_changed(self):
         """Called (from background thread) when the host's DB has new data.
         Flushes the local cache so the next read goes to the HOST over HTTP,
-        then triggers a UI refresh via Qt signal."""
+        then schedules a debounced UI refresh on the main thread."""
         from db_cache import cache as _db_cache
         _db_cache.clear()   # drop stale CLIENT-side HTTP-response cache
+        # Route to main thread via invokeMethod, then debounce through _schedule_refresh
+        # so rapid-fire host writes (e.g. bulk attendance save) coalesce into ONE refresh.
         QMetaObject.invokeMethod(
-            self, "_refresh_current_page", Qt.ConnectionType.QueuedConnection
+            self, "_schedule_refresh", Qt.ConnectionType.QueuedConnection
         )
+
+    @pyqtSlot()
+    def _schedule_refresh(self):
+        """Called on the main thread. Debounces rapid-fire sync events so
+        multiple host writes within 200 ms produce only one UI rebuild."""
+        if self._refresh_timer is not None:
+            try:
+                self._refresh_timer.stop()
+                self._refresh_timer.deleteLater()
+            except RuntimeError:
+                pass
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._refresh_current_page)
+        self._refresh_timer.start(200)  # 200 ms debounce window
 
     @pyqtSlot()
     def _refresh_current_page(self):
         """Refresh UI after host data changed (CLIENT mode auto-sync)."""
         key = self._current_page_key
 
-        # Remove the cached page widget from the stack so it gets rebuilt fresh
+        # Remove the cached page widget from the stack so it gets rebuilt fresh.
+        # Delay the actual QObject deletion by 500 ms so any in-flight closures
+        # that captured references to the old page's child widgets (e.g. the
+        # save_all callback in _build_att_manual) can finish cleanly before Qt
+        # destroys the widget tree, preventing spurious tab switches.
         if key in self._page_cache:
             old_page = self._page_cache.pop(key)
             try:
                 idx = self.stack.indexOf(old_page)
                 if idx != -1:
                     self.stack.removeWidget(old_page)
-                    old_page.deleteLater()
+                # Defer deletion so in-flight widget callbacks can complete first
+                QTimer.singleShot(500, lambda w=old_page: _safe_delete(w))
             except RuntimeError:
                 pass  # already deleted
 
@@ -1284,6 +1315,19 @@ class PayrollApp(QMainWindow):
     def _build_att_manual(self, layout):
         from PyQt6.QtWidgets import QCheckBox, QScrollArea
 
+        # ── Page-alive guard ──────────────────────────────────────────────────
+        # Set to False when the tab_man widget that owns this layout is destroyed
+        # (e.g. by _refresh_current_page replacing the attendance page).  All
+        # closures below check the flag before touching Qt widgets so they bail
+        # out safely instead of operating on a deleted widget tree, which was
+        # the root cause of the spurious jump to the Workers tab.
+        _page_alive = [True]
+        tab_man_widget = layout.parentWidget()
+        if tab_man_widget is not None:
+            tab_man_widget.destroyed.connect(
+                lambda: _page_alive.__setitem__(0, False)
+            )
+
         # ── Control bar ──────────────────────────────────────────────────
         ctrl = QWidget(); cl = QHBoxLayout(ctrl); cl.setContentsMargins(12, 12, 12, 8)
         cl.addWidget(QLabel("<b>Month:</b>"))
@@ -1452,6 +1496,10 @@ class PayrollApp(QMainWindow):
             """
             nonlocal _row_data, _last_worker_ids
 
+            # Guard: bail out if the page was replaced by a sync refresh
+            if not _page_alive[0]:
+                return
+
             # Fix #7: abort if a newer refresh has already started
             if token != _refresh_token[0]:
                 return
@@ -1493,6 +1541,8 @@ class PayrollApp(QMainWindow):
             worker_batches = [workers[i:i+BATCH_SIZE] for i in range(0, len(workers), BATCH_SIZE)]
 
             def _insert_batch(batch_idx):
+                if not _page_alive[0]:
+                    return  # Page was replaced — stop rendering
                 if token != _refresh_token[0]:
                     return  # Fix #7: abort if outdated
                 if batch_idx >= len(worker_batches):
@@ -1513,6 +1563,9 @@ class PayrollApp(QMainWindow):
 
         def refresh():
             nonlocal _last_worker_ids
+            # Guard: bail out if the page was replaced by a sync refresh
+            if not _page_alive[0]:
+                return
             _refresh_token[0] += 1          # Fix #7: invalidate any in-flight render
             token = _refresh_token[0]
             # Reset last_worker_ids so next _do_refresh always checks fresh
@@ -1536,6 +1589,9 @@ class PayrollApp(QMainWindow):
 
         # ── Save ─────────────────────────────────────────────────────────
         def save_all():
+            # Guard: bail out if the page was replaced while save was queued
+            if not _page_alive[0]:
+                return
             month = m_cb.currentText()
 
             # Fix #7: validate that displayed rows match the current month
@@ -1563,6 +1619,11 @@ class PayrollApp(QMainWindow):
                 att.other_deductions  = _f(d["other"])
                 att.esi_applicable    = d["esi"].isChecked()
                 records.append(att)
+
+            # Guard again after the (potentially slow) data-collection loop
+            if not _page_alive[0]:
+                return
+
             bulk_upsert_attendance(records)
             _invalidate_month_options_cache()   # Fix #5: refresh month list after save
             self.set_message(f"✅ Saved {len(records)} records for {month}", SUCCESS)

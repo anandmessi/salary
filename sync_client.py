@@ -39,6 +39,10 @@ class SyncClient:
         self._stop_evt = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
         self._on_change: Optional[callable] = None  # UI callback
+        # Prevents stacking on_change calls when the host writes faster than the
+        # client can refresh (e.g. bulk-save 20 workers).  Set while a refresh is
+        # in-flight; cleared after REFRESH_SETTLE_SECS to allow the next one.
+        self._refresh_in_progress = threading.Event()
 
         try:
             import requests
@@ -87,13 +91,21 @@ class SyncClient:
     def stop_polling(self):
         self._stop_evt.set()
 
+    # How long (seconds) to suppress duplicate on_change calls after one fires.
+    # Must be long enough for a full cache-clear + HTTP re-fetch to complete.
+    _REFRESH_SETTLE_SECS = 3.0
+
     def _poll_loop(self):
         """Background poll thread.
 
-        Tries /api/version first (monotonic integer counter added in sync_server
-        alongside _write_version).  Falls back to the original /api/changes
-        timestamp approach so the client stays compatible with hosts that haven't
-        been updated yet.
+        Tries /api/version first (monotonic integer counter, immune to
+        clock-skew).  Falls back to /api/changes timestamp approach so the
+        client stays compatible with older server versions.
+
+        Uses _refresh_in_progress to prevent stacking on_change calls when
+        the host writes faster than the client can refresh (e.g. bulk saves).
+        A daemon thread clears the flag after _REFRESH_SETTLE_SECS so future
+        changes are never permanently suppressed.
         """
         while not self._stop_evt.is_set():
             changed = False
@@ -131,10 +143,27 @@ class SyncClient:
                     self._connected = False
 
             if changed and self._on_change:
-                try:
-                    self._on_change()
-                except Exception as e:
-                    logger.debug("on_change callback error: %s", e)
+                if self._refresh_in_progress.is_set():
+                    logger.debug(
+                        "Skipping on_change: previous refresh still in progress"
+                    )
+                else:
+                    self._refresh_in_progress.set()
+                    try:
+                        self._on_change()
+                    except Exception as e:
+                        logger.debug("on_change callback error: %s", e)
+                    # Clear the flag after a settle delay so future changes go
+                    # through.  Run in a daemon thread so we never block the
+                    # poll loop itself.
+                    def _clear_flag(evt=self._refresh_in_progress,
+                                    delay=self._REFRESH_SETTLE_SECS):
+                        time.sleep(delay)
+                        evt.clear()
+                    threading.Thread(
+                        target=_clear_flag, daemon=True,
+                        name="SyncClient-settle"
+                    ).start()
 
             self._stop_evt.wait(POLL_INTERVAL)
 
