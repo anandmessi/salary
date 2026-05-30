@@ -1,15 +1,19 @@
 """
-sync_server.py — Embedded Flask REST API for PayrollPro LAN Sync
-=================================================================
-Runs on the HOST machine in a background thread.
-Exposes all DB operations as JSON REST endpoints so CLIENT machines
-can read/write data over HTTP instead of directly accessing the SQLite file.
+sync_server.py — PayrollPro Central Database Server
+====================================================
+Run this on ONE dedicated "server PC" on your network:
 
-Port: 5050  (configurable via SYNC_PORT)
+    python sync_server.py
+
+All other PCs (and this PC itself) connect to it via the desktop app's
+Settings → Server Connection screen.  No UDP broadcasts, no role election.
+
+Port: 5050  (change SYNC_PORT below if needed)
 """
 
 import json
 import logging
+import socket
 import threading
 import time
 from typing import Optional
@@ -26,7 +30,7 @@ _last_change_ts: float = 0.0
 _change_lock = threading.Lock()
 
 # Monotonically-increasing write counter — incremented on every write operation.
-# Clients can poll /api/version and compare against their last known value to
+# Clients poll /api/version and compare against their last known value to
 # detect changes without relying on wall-clock timestamps.
 _write_version: int = 0
 
@@ -400,3 +404,75 @@ def stop():
         except Exception:
             pass
     logger.info("Sync server stop requested")
+
+
+def get_local_ips():
+    """Discover all non-loopback local IP addresses."""
+    ips = []
+    try:
+        hostname = socket.gethostname()
+        for ip in socket.gethostbyname_ex(hostname)[2]:
+            if not ip.startswith("127."):
+                ips.append(ip)
+    except Exception:
+        pass
+    try:
+        # Fallback UDP socket trick to get primary routing IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and ip not in ips and not ip.startswith("127."):
+            ips.append(ip)
+    except Exception:
+        pass
+    return ips
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(description="PayrollPro Central Database Server")
+    parser.add_argument("--db", default="payroll.db", help="Path to SQLite database file")
+    parser.add_argument("--port", type=int, default=5050, help="Port to run the Flask server on")
+    args = parser.parse_args()
+
+    db_path = os.path.abspath(args.db)
+    port = args.port
+
+    print("=" * 60)
+    print("      PayrollPro Central Database Server (Flask API)")
+    print("=" * 60)
+    print(f"Database Path: {db_path}")
+    print(f"Server Port:   {port}")
+    print("-" * 60)
+    print("To connect from desktop apps, enter one of these IPs in Settings:")
+    
+    local_ips = get_local_ips()
+    if local_ips:
+        for ip in local_ips:
+            print(f"  ->  {ip}")
+    else:
+        print("  ->  (Could not auto-detect network IPs; check ipconfig/ifconfig)")
+    
+    print("-" * 60)
+    print("Press Ctrl+C to stop the server.")
+    print("=" * 60)
+
+    # Initialize the database if it doesn't exist
+    from database import init_db
+    init_db(db_path, seed=True)
+
+    # Silence default Flask requests log
+    import logging as _logging
+    _logging.getLogger("werkzeug").setLevel(_logging.WARNING)
+
+    # Build Flask app
+    app = _make_app(db_path)
+    
+    try:
+        app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    except KeyboardInterrupt:
+        print("\nStopping central database server...")
+

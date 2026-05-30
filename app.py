@@ -679,20 +679,41 @@ class PayrollApp(QMainWindow):
         self._loading_overlay.raise_()
         self._loading_overlay.show()
 
-        # LAN sync: discover role before init_db so DB path is resolved first
+        # Load server config and decide mode immediately — no discovery delay
+        from server_config import get_server_config
         from schema import DB_PATH as _local_db_path
-        self._lan_role    = "detecting"
+        _srv_cfg = get_server_config()
+
+        self._lan_role    = "standalone"
         self._lan_peer    = None
         self._lan_host_ip = None
         self._sync_client = None
-        self._backup_mgr  = None   # created in _finish_init after path is resolved
+        self._backup_mgr  = None   # created in _finish_init for standalone mode
         self._current_page_key = "dashboard"  # track active page reliably
-        self._lan_sync    = LanSync(_local_db_path, self._on_lan_role_decided)
-        self._lan_sync.start()
-        self._show_detecting_overlay()
+
+        if _srv_cfg["enabled"] and _srv_cfg["ip"]:
+            try:
+                from sync_client import SyncClient
+                import database as _db_mod
+                self._sync_client = SyncClient(
+                    host_ip=_srv_cfg["ip"], port=_srv_cfg["port"]
+                )
+                _db_mod.set_sync_client(self._sync_client)
+                self._lan_role    = "client"
+                self._lan_peer    = _srv_cfg["ip"]
+                self._lan_host_ip = _srv_cfg["ip"]
+            except Exception as _e:
+                import logging as _logging
+                _logging.error(
+                    "Failed to connect to server %s:%s — %s. Falling back to standalone.",
+                    _srv_cfg["ip"], _srv_cfg["port"], _e,
+                )
+                self._sync_client = None
+
+        # Kick off DB init and prewarm on the next event-loop tick (main thread)
+        QTimer.singleShot(0, self._finish_init)
 
     def closeEvent(self, event):
-        self._lan_sync.stop()
         if self._backup_mgr is not None:
             self._backup_mgr.stop()
         event.accept()
@@ -706,50 +727,20 @@ class PayrollApp(QMainWindow):
             except RuntimeError:
                 self._loading_overlay = None
 
-    # ── LAN sync callbacks ────────────────────────────────────────────────────
-
-    def _on_lan_role_decided(self, role: str, db_path: str, peer_name: str | None, host_ip: str | None = None):
-        """Called from the LanSync background thread when role is negotiated."""
-        import database as _db_mod
-        from schema import set_active_db_path
-
-        self._lan_role    = role
-        self._lan_peer    = peer_name
-        self._lan_host_ip = host_ip
-
-        if role == "client" and host_ip:
-            # Inject HTTP proxy — CLIENT never touches SQLite directly
-            try:
-                from sync_client import SyncClient
-                self._sync_client = SyncClient(host_ip=host_ip)
-                _db_mod.set_sync_client(self._sync_client)
-            except Exception as e:
-                import logging as _logging
-                _logging.error("Failed to initialize SyncClient (missing dependencies?): %s. Falling back to standalone.", e)
-                self._lan_role = "standalone"
-                self._lan_peer = None
-                self._lan_host_ip = None
-
-        set_active_db_path(db_path)
-        # init_db must run on the main thread via Qt's queued connection
-        QMetaObject.invokeMethod(
-            self, "_finish_init", Qt.ConnectionType.QueuedConnection
-        )
+    # ── Startup: DB init + prewarm ────────────────────────────────────────────
 
     @pyqtSlot()
     def _finish_init(self):
-        """Runs on the main thread: initialises DB, starts backup manager, navigates home."""
+        """Runs on the main thread: initialises DB, starts backup/polling, launches prewarm."""
         from schema import get_active_db_path
         from database import init_db
         db = get_active_db_path()
 
-        if self._lan_role == "client":
-            # CLIENT: do NOT init/seed the local DB or run BackupManager
-            # Start polling for host changes so the UI auto-refreshes
-            if self._sync_client:
-                self._sync_client.start_polling(on_change=self._on_host_data_changed)
+        if self._sync_client is not None:
+            # Server-connected mode: skip local DB init, start polling for server changes.
+            self._sync_client.start_polling(on_change=self._on_host_data_changed)
         else:
-            # HOST / standalone: init local DB and start backup manager as usual
+            # Standalone mode: init local DB and start the backup manager.
             init_db(db, seed=True)
             self._backup_mgr = BackupManager(db_path=db, on_sync=self._on_backup_sync)
             self._backup_mgr.start()
@@ -765,13 +756,7 @@ class PayrollApp(QMainWindow):
         self._prewarm_thread.start()
         self._update_sync_badge()
 
-    def _show_detecting_overlay(self):
-        """Update overlay status while LAN role is being determined."""
-        if self._loading_overlay is not None:
-            self._loading_overlay.set_status("\U0001f50d Detecting network role\u2026")
-        self.set_message("\U0001f50d Detecting network sync\u2026 (up to 3 s)", ACCENT)
-
-    # ── Prewarm callbacks (Bug 1 fix) ──────────────────────────────────────────
+    # ── Prewarm callbacks ─────────────────────────────────────────────────────
 
     @pyqtSlot(str)
     def _on_prewarm_progress(self, msg: str):
@@ -867,42 +852,29 @@ class PayrollApp(QMainWindow):
         """Update the sync status label in the sidebar footer."""
         if not hasattr(self, '_sync_lbl') or self._sync_lbl is None:
             return
-        role = self._lan_role
-        peer = self._lan_peer
-        host_ip = getattr(self, '_lan_host_ip', None)
-        if role == "host":
-            ip_str = f" ({host_ip}:{5050})" if host_ip else ""
-            self._sync_lbl.setText(f"🟢 Hosting{ip_str}")
+        if self._sync_client is not None:
+            connected = self._sync_client.connected
+            icon   = "\U0001f535" if connected else "\U0001f7e1"  # blue / yellow
+            status = "Connected" if connected else "Reconnecting"
+            addr   = self._lan_host_ip or "Server"
+            port   = getattr(self._sync_client, '_port', 5050)
+            self._sync_lbl.setText(f"{icon} Server: {addr}")
             self._sync_lbl.setStyleSheet(
-                f"color: {SUCCESS}; font-size: 11px; padding: 2px 8px;"
+                f"color: {'#3B82F6' if connected else '#F59E0B'}; font-size: 11px; padding: 2px 8px;"
             )
             self._sync_lbl.setToolTip(
-                f"This PC is hosting the database API on port 5050.\n"
-                f"IP: {host_ip or 'unknown'}\n"
-                "Other PCs on the LAN connect to this one."
-            )
-        elif role == "client":
-            connected = self._sync_client and self._sync_client.connected
-            icon = "🔵" if connected else "🟡"
-            status = "Synced" if connected else "Reconnecting"
-            addr = host_ip or peer or 'Host PC'
-            self._sync_lbl.setText(f"{icon} {status}: {peer or addr}")
-            self._sync_lbl.setStyleSheet(
-                f"color: {ACCENT if connected else WARNING_CLR}; font-size: 11px; padding: 2px 8px;"
-            )
-            self._sync_lbl.setToolTip(
-                f"Connected to HTTP API on {addr}:5050\n"
-                f"Host: {peer or 'unknown'}\n"
+                f"PayrollPro Server: {addr}:{port}\n"
+                f"Status: {status}\n"
                 "Data refreshes automatically every 2 seconds."
             )
         else:
-            self._sync_lbl.setText("⚪ Sync: Offline")
+            self._sync_lbl.setText("\u26aa Standalone Mode")
             self._sync_lbl.setStyleSheet(
                 f"color: {TEXT_MUTED}; font-size: 11px; padding: 2px 8px;"
             )
             self._sync_lbl.setToolTip(
-                "No other PayrollPro PC found on the network.\n"
-                "Running in standalone mode."
+                "No server configured. Running with local database.\n"
+                "Go to Settings \u2192 Server Connection to connect to a server."
             )
 
     def _on_backup_sync(self, status: str, timestamp: str):
@@ -2357,11 +2329,113 @@ class PayrollApp(QMainWindow):
                 
         btn_b_add.clicked.connect(add_bank_action)
         refresh_banks()
-        
+
+        # ── Server Connection tab ─────────────────────────────────────────
+        from server_config import get_server_config, save_server_config, clear_server_config
+
+        srv_tab = QFrame(); srv_tab.setObjectName("card")
+        stl = QVBoxLayout(srv_tab); stl.setContentsMargins(20, 20, 20, 20); stl.setSpacing(14)
+
+        stl.addWidget(QLabel(
+            "\U0001f5a5\ufe0f  Server Connection",
+            styleSheet="font-size: 15px; font-weight: bold;"
+        ))
+        stl.addWidget(QLabel(
+            "Enter the IP address of the PC running <b>python sync_server.py</b>. "
+            "All PCs on the network connect to that one central server.",
+            styleSheet=f"color: {TEXT_SECONDARY}; font-size: 11px;"
+        ))
+
+        # IP + Port row
+        ip_row = QHBoxLayout()
+        ip_row.addWidget(QLabel("<b>Server IP:</b>"))
+        e_srv_ip = QLineEdit(); e_srv_ip.setPlaceholderText("e.g. 192.168.1.10"); e_srv_ip.setFixedWidth(200)
+        ip_row.addWidget(e_srv_ip)
+        ip_row.addSpacing(16)
+        ip_row.addWidget(QLabel("<b>Port:</b>"))
+        e_srv_port = QLineEdit(); e_srv_port.setFixedWidth(70)
+        ip_row.addWidget(e_srv_port)
+        ip_row.addStretch()
+        stl.addLayout(ip_row)
+
+        # Pre-fill from saved config
+        _cur_cfg = get_server_config()
+        e_srv_ip.setText(_cur_cfg["ip"] or "")
+        e_srv_port.setText(str(_cur_cfg["port"]))
+
+        # Button row
+        btn_row = QHBoxLayout()
+        btn_connect = QPushButton("\U0001f517 Connect & Save")
+        btn_connect.setStyleSheet(f"background-color: {SUCCESS}; height: 32px; min-width: 150px;")
+        btn_disconnect = QPushButton("\u2716 Disconnect")
+        btn_disconnect.setStyleSheet(f"background-color: {DANGER}; height: 32px; min-width: 120px;")
+        btn_row.addWidget(btn_connect)
+        btn_row.addWidget(btn_disconnect)
+        btn_row.addStretch()
+        stl.addLayout(btn_row)
+
+        # Live status label
+        srv_status_lbl = QLabel()
+        srv_status_lbl.setStyleSheet(f"font-size: 11px; color: {TEXT_SECONDARY};")
+        stl.addWidget(srv_status_lbl)
+        stl.addStretch()
+
+        def _refresh_srv_status():
+            if self._sync_client is not None:
+                connected = self._sync_client.connected
+                icon   = "\U0001f535" if connected else "\U0001f7e1"
+                status = "Connected" if connected else "Reconnecting\u2026"
+                addr   = self._lan_host_ip or "Server"
+                port   = getattr(self._sync_client, '_port', 5050)
+                srv_status_lbl.setText(f"{icon} {status} \u2014 {addr}:{port}")
+                srv_status_lbl.setStyleSheet(
+                    f"font-size: 11px; color: {'#3B82F6' if connected else '#F59E0B'};"
+                )
+            else:
+                srv_status_lbl.setText("\u26aa Standalone \u2014 no server configured")
+                srv_status_lbl.setStyleSheet(f"font-size: 11px; color: {TEXT_MUTED};")
+
+        _refresh_srv_status()
+
+        # Auto-refresh status every 3 s while this page is visible
+        _srv_poll = QTimer()
+        _srv_poll.setInterval(3000)
+        _srv_poll.timeout.connect(_refresh_srv_status)
+        _srv_poll.start()
+        srv_tab.destroyed.connect(_srv_poll.stop)
+
+        def _do_connect():
+            ip = e_srv_ip.text().strip()
+            if not ip:
+                self.set_message("\u26a0\ufe0f Enter a server IP address first.", WARNING_CLR)
+                return
+            try:
+                port = int(e_srv_port.text().strip() or "5050")
+            except ValueError:
+                self.set_message("\u26a0\ufe0f Port must be a number.", WARNING_CLR)
+                return
+            save_server_config(ip=ip, port=port, enabled=True)
+            self.set_message(
+                "\u2705 Server config saved. Restart the app to connect.", SUCCESS
+            )
+
+        def _do_disconnect():
+            clear_server_config()
+            e_srv_ip.clear()
+            e_srv_port.setText("5050")
+            self.set_message(
+                "\u2705 Disconnected. Restart the app to apply.", SUCCESS
+            )
+
+        btn_connect.clicked.connect(_do_connect)
+        btn_disconnect.clicked.connect(_do_disconnect)
+
         tabs = QTabWidget()
-        tabs.addTab(cf, "🏢 General Settings")
-        tabs.addTab(bf, "🏦 Bank Management")
+        tabs.addTab(cf, "\U0001f3e2 General Settings")
+        tabs.addTab(bf, "\U0001f3e6 Bank Management")
+        tabs.addTab(srv_tab, "\U0001f5a5\ufe0f Server Connection")
         cwl.addWidget(tabs, 1)
+
 
     # ══════════════════════════════════════════════════════════════════════
     #   PAYROLL BREAKDOWN PAGE
