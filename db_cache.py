@@ -37,16 +37,26 @@ class _Cache:
         with self._lock:
             for k in keys:
                 self._data.pop(k, None)
+        self._bump_server_change()
 
     def invalidate_prefix(self, prefix: str) -> None:
         with self._lock:
             to_del = [k for k in self._data if k.startswith(prefix)]
             for k in to_del:
                 del self._data[k]
+        self._bump_server_change()
 
     def clear(self) -> None:
         with self._lock:
             self._data.clear()
+
+    def _bump_server_change(self) -> None:
+        """Inform the background Flask server of local database modifications."""
+        try:
+            import sync_server
+            sync_server._bump_change()
+        except Exception:
+            pass
 
 
 # ── Global cache instance (imported by database.py) ───────────────────────────
