@@ -76,12 +76,49 @@ class SyncClient:
 
     # ── Polling ────────────────────────────────────────────────────────────────
 
-    def start_polling(self, on_change: Optional[callable] = None):
+    def download_db_file(self, local_db_path: str) -> bool:
+        """Download the latest database file from the host and save it locally."""
+        try:
+            url = f"{self.base_url.replace('/api', '')}/api/download_db"
+            r = self._requests.get(url, stream=True, timeout=CONNECT_TIMEOUT)
+            if r.status_code == 200:
+                import os, tempfile, shutil
+                temp_dir = os.path.dirname(local_db_path)
+                with tempfile.NamedTemporaryFile(delete=False, dir=temp_dir, suffix=".db") as tmp:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            tmp.write(chunk)
+                    tmp_name = tmp.name
+                
+                # Close SQLite connections in this process before replacing the file
+                import database as db
+                db.close_thread_conn()
+                
+                # Replace the active database file safely
+                try:
+                    if os.path.exists(local_db_path):
+                        os.remove(local_db_path)
+                    os.rename(tmp_name, local_db_path)
+                except Exception:
+                    # Fallback for Windows file-locking issues
+                    shutil.copy2(tmp_name, local_db_path)
+                    try:
+                        os.remove(tmp_name)
+                    except Exception:
+                        pass
+                logger.info("Successfully synchronized database file from host.")
+                return True
+        except Exception as e:
+            logger.error("Failed to download database file: %s", e)
+        return False
+
+    def start_polling(self, on_change: Optional[callable] = None, on_disconnect: Optional[callable] = None):
         """
         Start a background thread that polls /api/changes every 2 seconds.
         Calls on_change() whenever data has changed on the host.
         """
         self._on_change = on_change
+        self._on_disconnect = on_disconnect
         self._stop_evt.clear()
         self._poll_thread = threading.Thread(
             target=self._poll_loop, daemon=True, name="SyncClient-poll"
@@ -107,6 +144,7 @@ class SyncClient:
         A daemon thread clears the flag after _REFRESH_SETTLE_SECS so future
         changes are never permanently suppressed.
         """
+        consecutive_failures = 0
         while not self._stop_evt.is_set():
             changed = False
             try:
@@ -123,6 +161,7 @@ class SyncClient:
                         self._last_version = ver
                         changed = True
                     self._connected = True
+                    consecutive_failures = 0
                 else:
                     raise ValueError(f"HTTP {r.status_code}")
             except Exception:
@@ -137,33 +176,45 @@ class SyncClient:
                             self._last_ts = ts
                             changed = True
                         self._connected = True
+                        consecutive_failures = 0
                     else:
                         self._connected = False
+                        consecutive_failures += 1
                 except Exception:
                     self._connected = False
+                    consecutive_failures += 1
 
-            if changed and self._on_change:
-                if self._refresh_in_progress.is_set():
-                    logger.debug(
-                        "Skipping on_change: previous refresh still in progress"
-                    )
-                else:
-                    self._refresh_in_progress.set()
-                    try:
-                        self._on_change()
-                    except Exception as e:
-                        logger.debug("on_change callback error: %s", e)
-                    # Clear the flag after a settle delay so future changes go
-                    # through.  Run in a daemon thread so we never block the
-                    # poll loop itself.
-                    def _clear_flag(evt=self._refresh_in_progress,
-                                    delay=self._REFRESH_SETTLE_SECS):
-                        time.sleep(delay)
-                        evt.clear()
-                    threading.Thread(
-                        target=_clear_flag, daemon=True,
-                        name="SyncClient-settle"
-                    ).start()
+            if consecutive_failures >= 3:
+                logger.warning("Lost connection to host after 3 failed polls. Triggering failover...")
+                if hasattr(self, '_on_disconnect') and self._on_disconnect:
+                    self._on_disconnect()
+                break
+
+            if changed:
+                # Download and synchronize the database file in the background!
+                from schema import get_active_db_path
+                self.download_db_file(get_active_db_path())
+                
+                if self._on_change:
+                    if self._refresh_in_progress.is_set():
+                        logger.debug(
+                            "Skipping on_change: previous refresh still in progress"
+                        )
+                    else:
+                        self._refresh_in_progress.set()
+                        try:
+                            self._on_change()
+                        except Exception as e:
+                            logger.debug("on_change callback error: %s", e)
+                        # Clear the flag after a settle delay
+                        def _clear_flag(evt=self._refresh_in_progress,
+                                        delay=self._REFRESH_SETTLE_SECS):
+                            time.sleep(delay)
+                            evt.clear()
+                        threading.Thread(
+                            target=_clear_flag, daemon=True,
+                            name="SyncClient-settle"
+                        ).start()
 
             self._stop_evt.wait(POLL_INTERVAL)
 

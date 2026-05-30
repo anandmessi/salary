@@ -66,6 +66,20 @@ def _make_app(host_db_path: str):
     def ping():
         return jsonify({"status": "ok", "version": 1, "ts": _last_change_ts})
 
+    @app.route("/api/download_db")
+    def download_db():
+        """Serve the SQLite database file to clients for syncing."""
+        try:
+            import sqlite3
+            from flask import send_file
+            # Force sqlite to write WAL pages to main database file
+            conn = sqlite3.connect(host_db_path)
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            conn.close()
+            return send_file(host_db_path, as_attachment=True, download_name="payroll.db")
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
     @app.route("/api/changes")
     def changes():
         """Lightweight polling endpoint — returns current change timestamp."""

@@ -695,28 +695,9 @@ class PayrollApp(QMainWindow):
         self._lan_sync    = None
 
         if _srv_cfg["enabled"] and _srv_cfg["ip"]:
-            # Direct connection mode (Manual override)
-            try:
-                from sync_client import SyncClient
-                import database as _db_mod
-                self._sync_client = SyncClient(
-                    host_ip=_srv_cfg["ip"], port=_srv_cfg["port"]
-                )
-                _db_mod.set_sync_client(self._sync_client)
-                self._lan_role    = "client"
-                self._lan_peer    = _srv_cfg["ip"]
-                self._lan_host_ip = _srv_cfg["ip"]
-            except Exception as _e:
-                import logging as _logging
-                _logging.error(
-                    "Failed to connect to server %s:%s — %s. Falling back to standalone.",
-                    _srv_cfg["ip"], _srv_cfg["port"], _e,
-                )
-                self._sync_client = None
-                self._lan_role = "standalone"
-
-            # Bypass discovery and start immediately
-            QTimer.singleShot(0, self._finish_init)
+            # P2P Unicast Dynamic Negotiation
+            self._loading_overlay.set_status("🔄 Pinging peer database host...")
+            self._start_p2p_negotiation(_srv_cfg["ip"], _srv_cfg["port"])
         else:
             # Auto-Discovery Mode!
             self._loading_overlay.set_status("🔄 Searching for network server...")
@@ -763,6 +744,11 @@ class PayrollApp(QMainWindow):
                 from sync_client import SyncClient
                 import database as _db_mod
                 self._sync_client = SyncClient(host_ip=host_ip, port=5050)
+                
+                # Immediately download the latest DB state on connection!
+                from schema import get_active_db_path
+                self._sync_client.download_db_file(get_active_db_path())
+                
                 _db_mod.set_sync_client(self._sync_client)
             except Exception as e:
                 import logging as _logging
@@ -771,6 +757,76 @@ class PayrollApp(QMainWindow):
                 self._lan_role = "standalone"
 
         self._finish_init()
+
+    def _start_p2p_negotiation(self, peer_ip: str, port: int):
+        """Runs in a background thread to ping the peer.
+        If peer is alive, starts as client and pulls latest database.
+        If peer is dead, starts as host (server).
+        """
+        def _check_and_start():
+            from sync_client import SyncClient
+            from schema import get_active_db_path
+            
+            # 1. Test connection to the peer
+            client = SyncClient(host_ip=peer_ip, port=port)
+            if client.ping():
+                # Peer is active! Become Client
+                try:
+                    # Sync DB file from active host
+                    client.download_db_file(get_active_db_path())
+                    self.lan_role_decided_signal.emit("client", get_active_db_path(), peer_ip, peer_ip)
+                except Exception as e:
+                    import logging
+                    logging.error("P2P Client DB download error: %s", e)
+                    self.lan_role_decided_signal.emit("host", get_active_db_path(), None, None)
+            else:
+                # Peer is offline! Become Host
+                self.lan_role_decided_signal.emit("host", get_active_db_path(), None, None)
+
+        threading.Thread(target=_check_and_start, daemon=True, name="P2PNegotiate").start()
+
+    def _on_host_disconnected(self):
+        """Called on a background thread when connection to host is lost.
+        Routes to the main thread for dynamic role failover."""
+        QMetaObject.invokeMethod(
+            self, "_transition_client_to_host", Qt.ConnectionType.QueuedConnection
+        )
+
+    @pyqtSlot()
+    def _transition_client_to_host(self):
+        """Transition client to host mode gracefully on the main thread."""
+        if getattr(self, '_lan_role', None) == "host":
+            return
+            
+        import logging
+        logging.warning("Lost connection to peer host. Transitioning to Host server...")
+        self.set_message("⚠️ Host offline. Transitioned to Host mode.", WARNING_CLR)
+        
+        # Stop client polling
+        if self._sync_client:
+            self._sync_client.stop_polling()
+            self._sync_client = None
+            
+        # Switch database back to local SQLite
+        import database as _db_mod
+        _db_mod.set_sync_client(None)
+        
+        # Start background Flask server on this PC
+        import sync_server
+        self._lan_role = "host"
+        self._lan_host_ip = "127.0.0.1"
+        ok = sync_server.start(self.local_db_path)
+        
+        # Start backup manager since we are now the Host
+        from schema import get_active_db_path
+        if self._backup_mgr is not None:
+            self._backup_mgr.stop()
+        self._backup_mgr = BackupManager(db_path=get_active_db_path(), on_sync=self._on_backup_sync)
+        self._backup_mgr.start()
+        
+        # Update the UI
+        self._update_sync_badge()
+        self._refresh_current_page()
 
     # ── Startup: DB init + prewarm ────────────────────────────────────────────
 
@@ -783,7 +839,10 @@ class PayrollApp(QMainWindow):
 
         if self._sync_client is not None:
             # Server-connected mode: skip local DB init, start polling for server changes.
-            self._sync_client.start_polling(on_change=self._on_host_data_changed)
+            self._sync_client.start_polling(
+                on_change=self._on_host_data_changed,
+                on_disconnect=self._on_host_disconnected
+            )
         else:
             # Standalone or Host mode: init local DB and start the backup manager.
             init_db(db, seed=True)
@@ -911,36 +970,36 @@ class PayrollApp(QMainWindow):
         role = getattr(self, '_lan_role', 'standalone')
         
         if role == "detecting":
-            self._sync_lbl.setText("🔄 Searching LAN...")
+            self._sync_lbl.setText("🔄 P2P Syncing...")
             self._sync_lbl.setStyleSheet(
                 f"color: {WARNING_CLR}; font-size: 11px; padding: 2px 8px;"
             )
             self._sync_lbl.setToolTip(
-                "Searching for an active central server on the local network..."
+                "Pinging your peer to negotiate Host/Client roles..."
             )
         elif role == "host":
             addr = self._lan_host_ip or "Local"
-            self._sync_lbl.setText(f"🟢 Host: {addr}")
+            self._sync_lbl.setText("🟢 Host: Active")
             self._sync_lbl.setStyleSheet(
                 f"color: {SUCCESS}; font-size: 11px; padding: 2px 8px;"
             )
             self._sync_lbl.setToolTip(
-                f"Running as the central database server.\n"
-                f"Other PCs on the network can connect using this IP address: {addr} (Port 5050)."
+                "Running as the database Host (Server).\n"
+                "Your friend can connect to you, and their app will auto-sync with your database."
             )
         elif role == "client" and self._sync_client is not None:
             connected = self._sync_client.connected
             icon   = "🔵" if connected else "🟡"
             status = "Connected" if connected else "Reconnecting..."
-            addr   = self._lan_host_ip or "Server"
-            self._sync_lbl.setText(f"{icon} Server: {addr}")
+            addr   = self._lan_host_ip or "Peer"
+            self._sync_lbl.setText(f"{icon} Client: Synced")
             self._sync_lbl.setStyleSheet(
                 f"color: {'#3B82F6' if connected else '#F59E0B'}; font-size: 11px; padding: 2px 8px;"
             )
             self._sync_lbl.setToolTip(
-                f"Connected to central database server: {addr}\n"
+                f"Running as Client (Connected to Peer: {addr})\n"
                 f"Status: {status}\n"
-                "Data refreshes automatically every 2 seconds."
+                "Your local database is automatically kept 100% in sync for failover safety."
             )
         else:
             self._sync_lbl.setText("⚪ Standalone Mode")
@@ -948,8 +1007,8 @@ class PayrollApp(QMainWindow):
                 f"color: {TEXT_MUTED}; font-size: 11px; padding: 2px 8px;"
             )
             self._sync_lbl.setToolTip(
-                "No server configured. Running with local database.\n"
-                "Go to Settings → Server Connection to connect to a server manually."
+                "Running with offline local database.\n"
+                "Go to Settings → Server Connection to configure peer connection."
             )
 
     def _on_backup_sync(self, status: str, timestamp: str):
@@ -2412,19 +2471,19 @@ class PayrollApp(QMainWindow):
         stl = QVBoxLayout(srv_tab); stl.setContentsMargins(20, 20, 20, 20); stl.setSpacing(14)
 
         stl.addWidget(QLabel(
-            "\U0001f5a5\ufe0f  Server Connection",
+            "\U0001f5a5\ufe0f  Peer-to-Peer Unicast Connection",
             styleSheet="font-size: 15px; font-weight: bold;"
         ))
         stl.addWidget(QLabel(
-            "Enter the IP address of the PC running <b>python sync_server.py</b>. "
-            "All PCs on the network connect to that one central server.",
+            "Enter your friend's IP address (e.g. from Tailscale). Whichever computer starts first becomes the Host, "
+            "and the other connects as Client. If the Host exits, the Client automatically transitions to Host with no data loss.",
             styleSheet=f"color: {TEXT_SECONDARY}; font-size: 11px;"
         ))
 
         # IP + Port row
         ip_row = QHBoxLayout()
-        ip_row.addWidget(QLabel("<b>Server IP:</b>"))
-        e_srv_ip = QLineEdit(); e_srv_ip.setPlaceholderText("e.g. 192.168.1.10"); e_srv_ip.setFixedWidth(200)
+        ip_row.addWidget(QLabel("<b>Peer IP (P2P):</b>"))
+        e_srv_ip = QLineEdit(); e_srv_ip.setPlaceholderText("e.g. 100.x.y.z"); e_srv_ip.setFixedWidth(200)
         ip_row.addWidget(e_srv_ip)
         ip_row.addSpacing(16)
         ip_row.addWidget(QLabel("<b>Port:</b>"))
@@ -2460,14 +2519,14 @@ class PayrollApp(QMainWindow):
                 connected = self._sync_client.connected
                 icon   = "\U0001f535" if connected else "\U0001f7e1"
                 status = "Connected" if connected else "Reconnecting\u2026"
-                addr   = self._lan_host_ip or "Server"
+                addr   = self._lan_host_ip or "Peer"
                 port   = getattr(self._sync_client, '_port', 5050)
                 srv_status_lbl.setText(f"{icon} {status} \u2014 {addr}:{port}")
                 srv_status_lbl.setStyleSheet(
                     f"font-size: 11px; color: {'#3B82F6' if connected else '#F59E0B'};"
                 )
             else:
-                srv_status_lbl.setText("\u26aa Standalone \u2014 no server configured")
+                srv_status_lbl.setText("\u26aa Auto-Discovery Mode \u2014 no peer IP configured")
                 srv_status_lbl.setStyleSheet(f"font-size: 11px; color: {TEXT_MUTED};")
 
         _refresh_srv_status()
