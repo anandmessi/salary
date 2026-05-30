@@ -679,19 +679,21 @@ class PayrollApp(QMainWindow):
         self._loading_overlay.raise_()
         self._loading_overlay.show()
 
-        # Load server config and decide mode immediately — no discovery delay
+        # Load server config and decide mode immediately
         from server_config import get_server_config
         from schema import DB_PATH as _local_db_path
         _srv_cfg = get_server_config()
 
-        self._lan_role    = "standalone"
+        self._lan_role    = "detecting"
         self._lan_peer    = None
         self._lan_host_ip = None
         self._sync_client = None
         self._backup_mgr  = None   # created in _finish_init for standalone mode
         self._current_page_key = "dashboard"  # track active page reliably
+        self._lan_sync    = None
 
         if _srv_cfg["enabled"] and _srv_cfg["ip"]:
+            # Direct connection mode (Manual override)
             try:
                 from sync_client import SyncClient
                 import database as _db_mod
@@ -709,11 +711,23 @@ class PayrollApp(QMainWindow):
                     _srv_cfg["ip"], _srv_cfg["port"], _e,
                 )
                 self._sync_client = None
+                self._lan_role = "standalone"
 
-        # Kick off DB init and prewarm on the next event-loop tick (main thread)
-        QTimer.singleShot(0, self._finish_init)
+            # Bypass discovery and start immediately
+            QTimer.singleShot(0, self._finish_init)
+        else:
+            # Auto-Discovery Mode!
+            self._loading_overlay.set_status("🔄 Searching for network server...")
+            from lan_sync import LanSync
+            self._lan_sync = LanSync(
+                local_db_path=_local_db_path,
+                on_role_decided=self._on_lan_role_decided
+            )
+            self._lan_sync.start()
 
     def closeEvent(self, event):
+        if hasattr(self, '_lan_sync') and self._lan_sync is not None:
+            self._lan_sync.stop()
         if self._backup_mgr is not None:
             self._backup_mgr.stop()
         event.accept()
@@ -726,6 +740,30 @@ class PayrollApp(QMainWindow):
                 self._loading_overlay.setGeometry(self.central_widget.rect())
             except RuntimeError:
                 self._loading_overlay = None
+
+    def _on_lan_role_decided(self, role: str, db_path: str, peer_name: str | None, host_ip: str | None):
+        """Called from LanSync background thread. Routes execution to the main GUI thread safely."""
+        QTimer.singleShot(0, lambda: self._apply_lan_role(role, db_path, peer_name, host_ip))
+
+    def _apply_lan_role(self, role: str, db_path: str, peer_name: str | None, host_ip: str | None):
+        """Applies the decided role on the main GUI thread and proceeds with DB initialization."""
+        self._lan_role = role
+        self._lan_peer = peer_name
+        self._lan_host_ip = host_ip
+
+        if role == "client":
+            try:
+                from sync_client import SyncClient
+                import database as _db_mod
+                self._sync_client = SyncClient(host_ip=host_ip, port=5050)
+                _db_mod.set_sync_client(self._sync_client)
+            except Exception as e:
+                import logging as _logging
+                _logging.error("Failed to start Client sync client: %s", e)
+                self._sync_client = None
+                self._lan_role = "standalone"
+
+        self._finish_init()
 
     # ── Startup: DB init + prewarm ────────────────────────────────────────────
 
@@ -852,29 +890,49 @@ class PayrollApp(QMainWindow):
         """Update the sync status label in the sidebar footer."""
         if not hasattr(self, '_sync_lbl') or self._sync_lbl is None:
             return
-        if self._sync_client is not None:
+        
+        role = getattr(self, '_lan_role', 'standalone')
+        
+        if role == "detecting":
+            self._sync_lbl.setText("🔄 Searching LAN...")
+            self._sync_lbl.setStyleSheet(
+                f"color: {WARNING_CLR}; font-size: 11px; padding: 2px 8px;"
+            )
+            self._sync_lbl.setToolTip(
+                "Searching for an active central server on the local network..."
+            )
+        elif role == "host":
+            addr = self._lan_host_ip or "Local"
+            self._sync_lbl.setText(f"🟢 Host: {addr}")
+            self._sync_lbl.setStyleSheet(
+                f"color: {SUCCESS}; font-size: 11px; padding: 2px 8px;"
+            )
+            self._sync_lbl.setToolTip(
+                f"Running as the central database server.\n"
+                f"Other PCs on the network can connect using this IP address: {addr} (Port 5050)."
+            )
+        elif role == "client" and self._sync_client is not None:
             connected = self._sync_client.connected
-            icon   = "\U0001f535" if connected else "\U0001f7e1"  # blue / yellow
-            status = "Connected" if connected else "Reconnecting"
+            icon   = "🔵" if connected else "🟡"
+            status = "Connected" if connected else "Reconnecting..."
             addr   = self._lan_host_ip or "Server"
-            port   = getattr(self._sync_client, '_port', 5050)
             self._sync_lbl.setText(f"{icon} Server: {addr}")
             self._sync_lbl.setStyleSheet(
                 f"color: {'#3B82F6' if connected else '#F59E0B'}; font-size: 11px; padding: 2px 8px;"
             )
             self._sync_lbl.setToolTip(
-                f"PayrollPro Server: {addr}:{port}\n"
+                f"Connected to central database server: {addr}\n"
                 f"Status: {status}\n"
                 "Data refreshes automatically every 2 seconds."
             )
         else:
-            self._sync_lbl.setText("\u26aa Standalone Mode")
+            self._sync_lbl.setText("⚪ Standalone Mode")
             self._sync_lbl.setStyleSheet(
                 f"color: {TEXT_MUTED}; font-size: 11px; padding: 2px 8px;"
             )
             self._sync_lbl.setToolTip(
                 "No server configured. Running with local database.\n"
-                "Go to Settings \u2192 Server Connection to connect to a server."
+                "Go to Settings → Server Connection to connect to a server manually."
             )
 
     def _on_backup_sync(self, status: str, timestamp: str):
