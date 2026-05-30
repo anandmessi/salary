@@ -647,6 +647,7 @@ def _safe_delete(widget):
 # ══════════════════════════════════════════════════════════════════════════════
 class PayrollApp(QMainWindow):
     backup_sync_signal = pyqtSignal(str, str)
+    lan_role_decided_signal = pyqtSignal(str, str, object, object)
 
     def __init__(self):
         super().__init__()
@@ -656,6 +657,7 @@ class PayrollApp(QMainWindow):
         self._loading_overlay = None    # assigned after sidebar+main area are built
         self._refresh_timer = None      # debounce timer for LAN-sync refresh (see _schedule_refresh)
         self.backup_sync_signal.connect(self._update_backup_label)
+        self.lan_role_decided_signal.connect(self._apply_lan_role)
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — Professional Payroll Management")
         self.resize(1300, 800)
         self.setMinimumSize(1050, 650)
@@ -742,8 +744,8 @@ class PayrollApp(QMainWindow):
                 self._loading_overlay = None
 
     def _on_lan_role_decided(self, role: str, db_path: str, peer_name: str | None, host_ip: str | None):
-        """Called from LanSync background thread. Routes execution to the main GUI thread safely."""
-        QTimer.singleShot(0, lambda: self._apply_lan_role(role, db_path, peer_name, host_ip))
+        """Called from LanSync background thread. Emits a signal to safely route to the main GUI thread."""
+        self.lan_role_decided_signal.emit(role, db_path, peer_name, host_ip)
 
     def _apply_lan_role(self, role: str, db_path: str, peer_name: str | None, host_ip: str | None):
         """Applies the decided role on the main GUI thread and proceeds with DB initialization."""

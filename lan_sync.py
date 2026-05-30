@@ -94,39 +94,47 @@ class LanSync:
 
     def _negotiate(self) -> None:
         logger.info("Starting LAN server auto-discovery...")
-        host_ip, peer_name = self._discover_host()
+        try:
+            host_ip, peer_name = self._discover_host()
 
-        if host_ip:
-            # Another PC is already running as the Host Database Server
-            logger.info("Discovered active database host at %s (%s)", host_ip, peer_name)
-            if self._check_server_reachable(host_ip):
-                self._role      = "client"
-                self._peer_name = peer_name
-                self._host_ip   = host_ip
-                self._on_role("client", self.local_db_path, peer_name, host_ip)
+            if host_ip:
+                # Another PC is already running as the Host Database Server
+                logger.info("Discovered active database host at %s (%s)", host_ip, peer_name)
+                if self._check_server_reachable(host_ip):
+                    self._role      = "client"
+                    self._peer_name = peer_name
+                    self._host_ip   = host_ip
+                    self._on_role("client", self.local_db_path, peer_name, host_ip)
+                else:
+                    logger.warning(
+                        "Discovered host at %s but API port %d was not reachable. "
+                        "Falling back to Standalone mode.", host_ip, SYNC_PORT
+                    )
+                    self._role = "standalone"
+                    self._on_role("standalone", self.local_db_path, None, None)
             else:
-                logger.warning(
-                    "Discovered host at %s but API port %d was not reachable. "
-                    "Falling back to Standalone mode.", host_ip, SYNC_PORT
-                )
-                self._role = "standalone"
+                # No server found on the network — this PC becomes the Host!
+                logger.info("No active database host found. Becoming Host on %s:%d...", self._local_ip, SYNC_PORT)
+                import sync_server
+                ok = sync_server.start(self.local_db_path)
+                if ok:
+                    time.sleep(0.5)  # Wait briefly for Flask to bind
+                    self._role      = "host"
+                    self._peer_name = None
+                    self._host_ip   = self._local_ip
+                    self._start_heartbeat()
+                    self._on_role("host", self.local_db_path, None, self._local_ip)
+                else:
+                    logger.warning("Failed to start background Flask server. Running standalone.")
+                    self._role = "standalone"
+                    self._on_role("standalone", self.local_db_path, None, None)
+        except Exception as e:
+            logger.error("Error during LAN server negotiation: %s. Falling back to standalone.", e)
+            self._role = "standalone"
+            try:
                 self._on_role("standalone", self.local_db_path, None, None)
-        else:
-            # No server found on the network — this PC becomes the Host!
-            logger.info("No active database host found. Becoming Host on %s:%d...", self._local_ip, SYNC_PORT)
-            import sync_server
-            ok = sync_server.start(self.local_db_path)
-            if ok:
-                time.sleep(0.5)  # Wait briefly for Flask to bind
-                self._role      = "host"
-                self._peer_name = None
-                self._host_ip   = self._local_ip
-                self._start_heartbeat()
-                self._on_role("host", self.local_db_path, None, self._local_ip)
-            else:
-                logger.warning("Failed to start background Flask server. Running standalone.")
-                self._role = "standalone"
-                self._on_role("standalone", self.local_db_path, None, None)
+            except Exception:
+                pass
 
     def _check_server_reachable(self, host_ip: str) -> bool:
         """Verify that the Flask server is up and responding to API requests."""
