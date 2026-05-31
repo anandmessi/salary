@@ -39,6 +39,7 @@ class SyncClient:
         self._stop_evt = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
         self._on_change: Optional[callable] = None  # UI callback
+        self._on_disconnect: Optional[callable] = None  # called when host goes offline
         # Prevents stacking on_change calls when the host writes faster than the
         # client can refresh (e.g. bulk-save 20 workers).  Set while a refresh is
         # in-flight; cleared after REFRESH_SETTLE_SECS to allow the next one.
@@ -186,7 +187,7 @@ class SyncClient:
 
             if consecutive_failures >= 3:
                 logger.warning("Lost connection to host after 3 failed polls. Triggering failover...")
-                if hasattr(self, '_on_disconnect') and self._on_disconnect:
+                if self._on_disconnect:
                     self._on_disconnect()
                 break
 

@@ -69,6 +69,24 @@ class LanSync:
         )
         t.start()
 
+    def promote_to_host(self) -> None:
+        """Promote this instance to Host role at runtime (failover path).
+
+        Called when the current host goes offline and this client needs to
+        become the new Host immediately, without re-running _negotiate().
+        Starts the UDP discovery heartbeat responder so other PCs (including
+        the original host when it restarts) can discover this machine.
+        """
+        self._stop_evt.clear()   # ensure responder loop won't exit immediately
+        self._role      = "host"
+        self._host_ip   = self._local_ip
+        self._peer_name = None
+        self._start_heartbeat()
+        logger.info(
+            "LanSync: promoted to Host at %s (failover). "
+            "UDP heartbeat responder started.", self._local_ip
+        )
+
     def stop(self) -> None:
         self._stop_evt.set()
         if self._role == "host":

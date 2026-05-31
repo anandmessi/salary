@@ -852,7 +852,10 @@ class PayrollApp(QMainWindow):
 
         if self._sync_client is not None:
             # Server-connected mode: skip local DB init, start polling for server changes.
-            self._sync_client.start_polling(on_change=self._on_host_data_changed)
+            self._sync_client.start_polling(
+                on_change=self._on_host_data_changed,
+                on_disconnect=self._on_host_disconnected,
+            )
         else:
             # Standalone mode: init local DB and start the backup manager.
             init_db(db, seed=True)
@@ -923,6 +926,75 @@ class PayrollApp(QMainWindow):
         # so rapid-fire host writes (e.g. bulk attendance save) coalesce into ONE refresh.
         QMetaObject.invokeMethod(
             self, "_schedule_refresh", Qt.ConnectionType.QueuedConnection
+        )
+
+    def _on_host_disconnected(self):
+        """Called (from background poll thread) when the host PC has gone offline.
+
+        Promotes THIS PC to Host:
+          1. Stops the dead sync-client polling.
+          2. Detaches the sync client from the database layer so local writes
+             go directly to SQLite again.
+          3. Starts the local Flask sync server so other PCs can discover us.
+          4. Starts the heartbeat responder so UDP broadcasts are answered.
+          5. Updates the sidebar role badge on the main thread.
+        """
+        import logging as _logging
+        _logging.info("Host disconnected — promoting this PC to Host role.")
+
+        # 1. Stop the dead polling loop
+        if self._sync_client is not None:
+            try:
+                self._sync_client.stop_polling()
+            except Exception:
+                pass
+            self._sync_client = None
+
+        # 2. Detach sync client from database layer so future writes go local
+        try:
+            import database as _db_mod
+            _db_mod.set_sync_client(None)
+        except Exception as e:
+            _logging.warning("Could not detach sync client: %s", e)
+
+        # 3. Start the local Flask sync server
+        try:
+            import sync_server
+            from schema import get_active_db_path
+            local_db = get_active_db_path()
+            ok = sync_server.start(local_db)
+            if ok:
+                import time as _time
+                _time.sleep(0.5)  # allow Flask to bind
+                sync_server.set_change_callback(self._on_host_data_changed)
+                _logging.info("Failover: now serving as Host on port 5050")
+            else:
+                _logging.warning("Failover: failed to start sync server")
+        except Exception as e:
+            _logging.error("Failover sync server start error: %s", e)
+
+        # 4. Start the UDP discovery heartbeat so other PCs find us
+        try:
+            from lan_sync import LanSync
+            from schema import get_active_db_path
+            if self._lan_sync is None:
+                self._lan_sync = LanSync(
+                    local_db_path=get_active_db_path(),
+                    on_role_decided=self._on_lan_role_decided,
+                )
+            self._lan_sync.promote_to_host()
+        except Exception as e:
+            _logging.error("Failover heartbeat start error: %s", e)
+
+        # 5. Update role state and refresh the badge on the main thread
+        self._lan_role = "host"
+        try:
+            from lan_sync import _get_local_ip
+            self._lan_host_ip = _get_local_ip()
+        except Exception:
+            pass
+        QMetaObject.invokeMethod(
+            self, "_update_sync_badge", Qt.ConnectionType.QueuedConnection
         )
 
     @pyqtSlot()
