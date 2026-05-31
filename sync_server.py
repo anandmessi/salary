@@ -24,6 +24,7 @@ SYNC_PORT = 5050
 _server_thread: Optional[threading.Thread] = None
 _flask_app = None
 _shutdown_event = threading.Event()
+_backup_manager = None
 
 # Tracks the last DB write timestamp so clients can detect changes
 _last_change_ts: float = 0.0
@@ -117,6 +118,143 @@ def _make_app(host_db_path: str):
             mtime = os.path.getmtime(host_db_path)
             cc = _get_db_change_counter(host_db_path)
             return jsonify({"mtime": mtime, "change_counter": cc})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/db/version_info", methods=["GET"])
+    def db_version_info():
+        import sqlite3, os, time as _time
+        try:
+            mtime = os.path.getmtime(host_db_path)
+            size = os.path.getsize(host_db_path)
+            conn = sqlite3.connect(host_db_path)
+            w = conn.execute("SELECT count(*) FROM workers").fetchone()[0]
+            a = conn.execute("SELECT count(*) FROM attendance").fetchone()[0]
+            conn.close()
+            row_hash = w * 10000 + a
+        except Exception:
+            mtime, size, row_hash = 0, 0, 0
+        return jsonify({
+            "version": _write_version,
+            "mtime": mtime,
+            "size": size,
+            "row_hash": row_hash,
+            "server_time": _time.time(),
+        })
+
+    @app.route("/api/db/snapshot", methods=["GET"])
+    def db_snapshot():
+        import sqlite3, os
+        try:
+            conn = sqlite3.connect(host_db_path)
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.close()
+            with open(host_db_path, "rb") as f:
+                data = f.read()
+            return (
+                data, 200,
+                {
+                    "Content-Type": "application/octet-stream",
+                    "Content-Disposition": "attachment; filename=payroll.db",
+                    "X-DB-Version": str(_write_version),
+                    "X-DB-Size": str(len(data)),
+                }
+            )
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/db/upload", methods=["PUT"])
+    def db_upload():
+        """
+        Accept a full SQLite DB file from a client that has newer data.
+        Validates, backs up current DB, replaces it, reloads connections.
+        """
+        import sqlite3, shutil, tempfile, time as _time, os
+        from database import close_thread_conn
+
+        try:
+            data = request.get_data()
+            if not data:
+                return jsonify({"error": "Empty body"}), 400
+
+            # Write to temp file
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".db", prefix="payroll_upload_")
+            try:
+                with os.fdopen(tmp_fd, "wb") as f:
+                    f.write(data)
+
+                # Validate it is a real SQLite DB
+                try:
+                    conn = sqlite3.connect(tmp_path)
+                    workers_count = conn.execute("SELECT count(*) FROM workers").fetchone()[0]
+                    conn.close()
+                except Exception as e:
+                    os.unlink(tmp_path)
+                    return jsonify({"error": f"Invalid SQLite DB: {e}"}), 400
+
+                # Close local database connections first to prevent Windows locking issues
+                close_thread_conn()
+
+                # Backup current server DB before replacing
+                timestamp = _time.strftime("%Y%m%d_%H%M%S")
+                backup_path = host_db_path + f".pre_upload_{timestamp}.bak"
+                if os.path.exists(host_db_path):
+                    shutil.copy2(host_db_path, backup_path)
+
+                # WAL checkpoint on current DB before replacing
+                try:
+                    cur_conn = sqlite3.connect(host_db_path)
+                    cur_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    cur_conn.close()
+                except Exception:
+                    pass
+
+                # Replace server DB atomically
+                try:
+                    if os.path.exists(host_db_path):
+                        os.remove(host_db_path)
+                    shutil.move(tmp_path, host_db_path)
+                except Exception:
+                    shutil.copy2(tmp_path, host_db_path)
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+
+                # Increment write version significantly so all clients know to pull
+                global _write_version
+                _write_version += 1000
+
+                new_mtime = os.path.getmtime(host_db_path)
+                new_size = os.path.getsize(host_db_path)
+
+                # Invalidate server-side cache
+                _cache.clear()
+                _bump_change()
+
+                # Signal the BackupManager to run a backup immediately
+                try:
+                    global _backup_manager
+                    if _backup_manager is not None:
+                        _backup_manager.trigger_now()
+                except Exception:
+                    pass
+
+                return jsonify({
+                    "status": "ok",
+                    "version": _write_version,
+                    "mtime": new_mtime,
+                    "size": new_size,
+                    "workers_imported": workers_count,
+                }), 200
+
+            except Exception as e:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise e
+
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
@@ -444,7 +582,16 @@ def start(host_db_path: str) -> bool:
     Start the Flask sync server in a background daemon thread.
     Returns True if started successfully, False if Flask not available.
     """
-    global _server_thread, _flask_app
+    global _server_thread, _flask_app, _backup_manager
+
+    # Start backup manager on server startup
+    if _backup_manager is None:
+        try:
+            from backup_manager import BackupManager
+            _backup_manager = BackupManager(db_path=host_db_path, on_sync=lambda s, t: logger.info("Server Backup: %s at %s", s, t))
+            _backup_manager.start()
+        except Exception as e:
+            logger.error("Failed to start backup manager on server: %s", e)
 
     try:
         _flask_app = _make_app(host_db_path)
@@ -550,6 +697,14 @@ if __name__ == "__main__":
     # Silence default Flask requests log
     import logging as _logging
     _logging.getLogger("werkzeug").setLevel(_logging.WARNING)
+
+    # Start the backup manager on standalone server run
+    try:
+        from backup_manager import BackupManager
+        _backup_manager = BackupManager(db_path=db_path, on_sync=lambda s, t: print(f"  Backup: {s} at {t}"))
+        _backup_manager.start()
+    except Exception as e:
+        print(f"Failed to start backup manager: {e}")
 
     # Build Flask app
     app = _make_app(db_path)

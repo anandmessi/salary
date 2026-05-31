@@ -131,6 +131,10 @@ class BackupManager:
         """Trigger an immediate sync (e.g. from a 'Sync Now' button)."""
         threading.Thread(target=self._do_sync, daemon=True).start()
 
+    def trigger_now(self) -> None:
+        """Force an immediate backup outside the normal schedule."""
+        self.sync_now()
+
     @property
     def csv_path_str(self) -> str:
         return str(self.csv_path)

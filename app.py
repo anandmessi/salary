@@ -617,12 +617,23 @@ class PrewarmThread(QThread):
     result_ready = pyqtSignal(object)    # emits True on success
     error_ready  = pyqtSignal(Exception) # emits on unexpected failure
 
-    def __init__(self, current_month: str):
+    def __init__(self, current_month: str, sync_client=None):
         super().__init__()
         self._month = current_month
+        self._sync_client = sync_client
 
     def run(self):
         try:
+            # Step 0: Bidirectional startup sync
+            if self._sync_client is not None:
+                from db_sync import startup_sync
+                from schema import get_active_db_path
+                startup_sync(
+                    self._sync_client,
+                    get_active_db_path(),
+                    on_progress=lambda msg: self.progress.emit(msg)
+                )
+
             self.progress.emit("Loading workers\u2026")
             get_all_workers()
 
@@ -709,9 +720,6 @@ class PayrollApp(QMainWindow):
         if _srv_cfg["enabled"] and _srv_cfg["ip"]:
             # Direct connection mode (Manual override)
             try:
-                # Perform startup database synchronization
-                self._sync_databases_on_startup(_srv_cfg["ip"])
-
                 from sync_client import SyncClient
                 import database as _db_mod
                 self._sync_client = SyncClient(
@@ -851,9 +859,6 @@ class PayrollApp(QMainWindow):
         self._lan_host_ip = host_ip
 
         if role == "client":
-            # Perform startup database synchronization
-            self._sync_databases_on_startup(host_ip)
-
             try:
                 from sync_client import SyncClient
                 import database as _db_mod
@@ -899,7 +904,7 @@ class PayrollApp(QMainWindow):
         if self._loading_overlay is not None:
             self._loading_overlay.set_status("\U0001f504 Initializing database\u2026")
         current_month = datetime.date.today().strftime("%Y-%m")
-        self._prewarm_thread = PrewarmThread(current_month)
+        self._prewarm_thread = PrewarmThread(current_month, self._sync_client)
         self._prewarm_thread.progress.connect(self._on_prewarm_progress)
         self._prewarm_thread.result_ready.connect(self._on_prewarm_done)
         self._prewarm_thread.error_ready.connect(self._on_prewarm_error)
