@@ -55,16 +55,6 @@ class _Cache:
         try:
             import sync_server
             sync_server._bump_change()
-
-            # If the database write was initiated from the main GUI thread (Host desktop app action),
-            # update the Host's background poll client _last_version to prevent self-refreshes.
-            if threading.current_thread() == threading.main_thread():
-                from PyQt6.QtWidgets import QApplication
-                q_app = QApplication.instance()
-                if q_app:
-                    for widget in q_app.topLevelWidgets():
-                        if hasattr(widget, '_host_poll_client') and widget._host_poll_client is not None:
-                            widget._host_poll_client._last_version = sync_server._write_version
         except Exception:
             pass
 

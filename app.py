@@ -695,9 +695,31 @@ class PayrollApp(QMainWindow):
         self._lan_sync    = None
 
         if _srv_cfg["enabled"] and _srv_cfg["ip"]:
-            # P2P Unicast Dynamic Negotiation
-            self._loading_overlay.set_status("🔄 Pinging peer database host...")
-            self._start_p2p_negotiation(_srv_cfg["ip"], _srv_cfg["port"])
+            # Direct connection mode (Manual override)
+            try:
+                # Perform startup database synchronization
+                self._sync_databases_on_startup(_srv_cfg["ip"])
+
+                from sync_client import SyncClient
+                import database as _db_mod
+                self._sync_client = SyncClient(
+                    host_ip=_srv_cfg["ip"], port=_srv_cfg["port"]
+                )
+                _db_mod.set_sync_client(self._sync_client)
+                self._lan_role    = "client"
+                self._lan_peer    = _srv_cfg["ip"]
+                self._lan_host_ip = _srv_cfg["ip"]
+            except Exception as _e:
+                import logging as _logging
+                _logging.error(
+                    "Failed to connect to server %s:%s — %s. Falling back to standalone.",
+                    _srv_cfg["ip"], _srv_cfg["port"], _e,
+                )
+                self._sync_client = None
+                self._lan_role = "standalone"
+
+            # Bypass discovery and start immediately
+            QTimer.singleShot(0, self._finish_init)
         else:
             # Auto-Discovery Mode!
             self._loading_overlay.set_status("🔄 Searching for network server...")
@@ -709,11 +731,6 @@ class PayrollApp(QMainWindow):
             self._lan_sync.start()
 
     def closeEvent(self, event):
-        if hasattr(self, '_host_poll_client') and self._host_poll_client is not None:
-            try:
-                self._host_poll_client.stop_polling()
-            except Exception:
-                pass
         if hasattr(self, '_lan_sync') and self._lan_sync is not None:
             self._lan_sync.stop()
         if self._backup_mgr is not None:
@@ -729,6 +746,67 @@ class PayrollApp(QMainWindow):
             except RuntimeError:
                 self._loading_overlay = None
 
+    def _sync_databases_on_startup(self, host_ip: str):
+        """Query host and client SQLite DB modification times on startup, and sync the newer database."""
+        try:
+            import os
+            import urllib.request
+            import json
+            from schema import get_active_db_path
+            
+            local_db = get_active_db_path()
+            if not os.path.exists(local_db):
+                return
+                
+            # Request database mtime from host
+            url_mtime = f"http://{host_ip}:5050/api/db_mtime"
+            with urllib.request.urlopen(url_mtime, timeout=3) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode('utf-8'))
+                    host_mtime = data.get("mtime")
+                    if host_mtime is None:
+                        return
+                        
+                    local_mtime = os.path.getmtime(local_db)
+                    clock_skew_tolerance = 2.0  # seconds
+                    
+                    import logging as _logging
+                    if local_mtime > host_mtime + clock_skew_tolerance:
+                        # Client database is newer! Upload local database to Host
+                        _logging.info("Client database is newer (%s > %s). Uploading to Host...", local_mtime, host_mtime)
+                        
+                        from database import close_thread_conn
+                        close_thread_conn()
+                        
+                        with open(local_db, "rb") as f:
+                            db_data = f.read()
+                            
+                        url_upload = f"http://{host_ip}:5050/api/upload_db"
+                        req = urllib.request.Request(url_upload, data=db_data, method="POST")
+                        with urllib.request.urlopen(req, timeout=10) as upload_resp:
+                            if upload_resp.status == 200:
+                                _logging.info("Successfully synchronized Client database to Host.")
+                                
+                    elif host_mtime > local_mtime + clock_skew_tolerance:
+                        # Host database is newer! Download Host database to Client
+                        _logging.info("Host database is newer (%s > %s). Downloading from Host...", host_mtime, local_mtime)
+                        
+                        from database import close_thread_conn
+                        close_thread_conn()
+                        
+                        url_download = f"http://{host_ip}:5050/api/download_db"
+                        with urllib.request.urlopen(url_download, timeout=10) as dl_resp:
+                            if dl_resp.status == 200:
+                                with open(local_db, "wb") as f:
+                                    f.write(dl_resp.read())
+                                    
+                                # Sync file modification time to match Host to prevent redundant sync loops
+                                os.utime(local_db, (host_mtime, host_mtime))
+                                _logging.info("Successfully synchronized Host database to Client.")
+        except Exception as e:
+            import logging as _logging
+            _logging.error("Startup database synchronization failed: %s", e)
+
     def _on_lan_role_decided(self, role: str, db_path: str, peer_name: str | None, host_ip: str | None):
         """Called from LanSync background thread. Emits a signal to safely route to the main GUI thread."""
         self.lan_role_decided_signal.emit(role, db_path, peer_name, host_ip)
@@ -740,93 +818,28 @@ class PayrollApp(QMainWindow):
         self._lan_host_ip = host_ip
 
         if role == "client":
+            # Perform startup database synchronization
+            self._sync_databases_on_startup(host_ip)
+
             try:
                 from sync_client import SyncClient
                 import database as _db_mod
                 self._sync_client = SyncClient(host_ip=host_ip, port=5050)
-                
-                # Immediately download the latest DB state on connection!
-                from schema import get_active_db_path
-                self._sync_client.download_db_file(get_active_db_path())
-                
                 _db_mod.set_sync_client(self._sync_client)
             except Exception as e:
                 import logging as _logging
                 _logging.error("Failed to start Client sync client: %s", e)
                 self._sync_client = None
                 self._lan_role = "standalone"
+        elif role == "host":
+            try:
+                import sync_server
+                sync_server.set_change_callback(self._on_host_data_changed)
+            except Exception as e:
+                import logging as _logging
+                _logging.error("Failed to set sync_server change callback: %s", e)
 
         self._finish_init()
-
-    def _start_p2p_negotiation(self, peer_ip: str, port: int):
-        """Runs in a background thread to ping the peer.
-        If peer is alive, starts as client and pulls latest database.
-        If peer is dead, starts as host (server).
-        """
-        def _check_and_start():
-            from sync_client import SyncClient
-            from schema import get_active_db_path
-            
-            # 1. Test connection to the peer
-            client = SyncClient(host_ip=peer_ip, port=port)
-            if client.ping():
-                # Peer is active! Become Client
-                try:
-                    # Sync DB file from active host
-                    client.download_db_file(get_active_db_path())
-                    self.lan_role_decided_signal.emit("client", get_active_db_path(), peer_ip, peer_ip)
-                except Exception as e:
-                    import logging
-                    logging.error("P2P Client DB download error: %s", e)
-                    self.lan_role_decided_signal.emit("host", get_active_db_path(), None, None)
-            else:
-                # Peer is offline! Become Host
-                self.lan_role_decided_signal.emit("host", get_active_db_path(), None, None)
-
-        threading.Thread(target=_check_and_start, daemon=True, name="P2PNegotiate").start()
-
-    def _on_host_disconnected(self):
-        """Called on a background thread when connection to host is lost.
-        Routes to the main thread for dynamic role failover."""
-        QMetaObject.invokeMethod(
-            self, "_transition_client_to_host", Qt.ConnectionType.QueuedConnection
-        )
-
-    @pyqtSlot()
-    def _transition_client_to_host(self):
-        """Transition client to host mode gracefully on the main thread."""
-        if getattr(self, '_lan_role', None) == "host":
-            return
-            
-        import logging
-        logging.warning("Lost connection to peer host. Transitioning to Host server...")
-        self.set_message("⚠️ Host offline. Transitioned to Host mode.", WARNING_CLR)
-        
-        # Stop client polling
-        if self._sync_client:
-            self._sync_client.stop_polling()
-            self._sync_client = None
-            
-        # Switch database back to local SQLite
-        import database as _db_mod
-        _db_mod.set_sync_client(None)
-        
-        # Start background Flask server on this PC
-        import sync_server
-        self._lan_role = "host"
-        self._lan_host_ip = "127.0.0.1"
-        ok = sync_server.start(self.local_db_path)
-        
-        # Start backup manager since we are now the Host
-        from schema import get_active_db_path
-        if self._backup_mgr is not None:
-            self._backup_mgr.stop()
-        self._backup_mgr = BackupManager(db_path=get_active_db_path(), on_sync=self._on_backup_sync)
-        self._backup_mgr.start()
-        
-        # Update the UI
-        self._update_sync_badge()
-        self._refresh_current_page()
 
     # ── Startup: DB init + prewarm ────────────────────────────────────────────
 
@@ -839,25 +852,12 @@ class PayrollApp(QMainWindow):
 
         if self._sync_client is not None:
             # Server-connected mode: skip local DB init, start polling for server changes.
-            self._sync_client.start_polling(
-                on_change=self._on_host_data_changed,
-                on_disconnect=self._on_host_disconnected
-            )
+            self._sync_client.start_polling(on_change=self._on_host_data_changed)
         else:
-            # Standalone or Host mode: init local DB and start the backup manager.
+            # Standalone mode: init local DB and start the backup manager.
             init_db(db, seed=True)
             self._backup_mgr = BackupManager(db_path=db, on_sync=self._on_backup_sync)
             self._backup_mgr.start()
-
-            # If running as the Host, start a background local poll to refresh GUI on client writes
-            if getattr(self, '_lan_role', None) == "host":
-                try:
-                    from sync_client import SyncClient
-                    self._host_poll_client = SyncClient(host_ip="127.0.0.1", port=5050)
-                    self._host_poll_client.start_polling(on_change=self._on_host_data_changed)
-                except Exception as _e:
-                    import logging as _logging
-                    _logging.error("Failed to start Host local poll client: %s", _e)
 
         # Update overlay and launch prewarm — dashboard shown only AFTER cache is warm
         if self._loading_overlay is not None:
@@ -913,6 +913,10 @@ class PayrollApp(QMainWindow):
         """Called (from background thread) when the host's DB has new data.
         Flushes the local cache so the next read goes to the HOST over HTTP,
         then schedules a debounced UI refresh on the main thread."""
+        # Avoid redundant self-refreshes if the write originated from the Host's own main thread GUI.
+        if threading.current_thread() is threading.main_thread():
+            return
+
         from db_cache import cache as _db_cache
         _db_cache.clear()   # drop stale CLIENT-side HTTP-response cache
         # Route to main thread via invokeMethod, then debounce through _schedule_refresh
@@ -970,36 +974,36 @@ class PayrollApp(QMainWindow):
         role = getattr(self, '_lan_role', 'standalone')
         
         if role == "detecting":
-            self._sync_lbl.setText("🔄 P2P Syncing...")
+            self._sync_lbl.setText("🔄 Searching LAN...")
             self._sync_lbl.setStyleSheet(
                 f"color: {WARNING_CLR}; font-size: 11px; padding: 2px 8px;"
             )
             self._sync_lbl.setToolTip(
-                "Pinging your peer to negotiate Host/Client roles..."
+                "Searching for an active central server on the local network..."
             )
         elif role == "host":
             addr = self._lan_host_ip or "Local"
-            self._sync_lbl.setText("🟢 Host: Active")
+            self._sync_lbl.setText(f"🟢 Host: {addr}")
             self._sync_lbl.setStyleSheet(
                 f"color: {SUCCESS}; font-size: 11px; padding: 2px 8px;"
             )
             self._sync_lbl.setToolTip(
-                "Running as the database Host (Server).\n"
-                "Your friend can connect to you, and their app will auto-sync with your database."
+                f"Running as the central database server.\n"
+                f"Other PCs on the network can connect using this IP address: {addr} (Port 5050)."
             )
         elif role == "client" and self._sync_client is not None:
             connected = self._sync_client.connected
             icon   = "🔵" if connected else "🟡"
             status = "Connected" if connected else "Reconnecting..."
-            addr   = self._lan_host_ip or "Peer"
-            self._sync_lbl.setText(f"{icon} Client: Synced")
+            addr   = self._lan_host_ip or "Server"
+            self._sync_lbl.setText(f"{icon} Server: {addr}")
             self._sync_lbl.setStyleSheet(
                 f"color: {'#3B82F6' if connected else '#F59E0B'}; font-size: 11px; padding: 2px 8px;"
             )
             self._sync_lbl.setToolTip(
-                f"Running as Client (Connected to Peer: {addr})\n"
+                f"Connected to central database server: {addr}\n"
                 f"Status: {status}\n"
-                "Your local database is automatically kept 100% in sync for failover safety."
+                "Data refreshes automatically every 2 seconds."
             )
         else:
             self._sync_lbl.setText("⚪ Standalone Mode")
@@ -1007,8 +1011,8 @@ class PayrollApp(QMainWindow):
                 f"color: {TEXT_MUTED}; font-size: 11px; padding: 2px 8px;"
             )
             self._sync_lbl.setToolTip(
-                "Running with offline local database.\n"
-                "Go to Settings → Server Connection to configure peer connection."
+                "No server configured. Running with local database.\n"
+                "Go to Settings → Server Connection to connect to a server manually."
             )
 
     def _on_backup_sync(self, status: str, timestamp: str):
@@ -1174,6 +1178,7 @@ class PayrollApp(QMainWindow):
         pl.addWidget(sa)
 
         self.stack.addWidget(page)
+        self.stack.setCurrentWidget(page)
         self._page_cache[key] = page   # Fix #4: cache the built page
 
         {"dashboard": self._page_dashboard, "attendance": self._page_attendance,
@@ -2471,19 +2476,19 @@ class PayrollApp(QMainWindow):
         stl = QVBoxLayout(srv_tab); stl.setContentsMargins(20, 20, 20, 20); stl.setSpacing(14)
 
         stl.addWidget(QLabel(
-            "\U0001f5a5\ufe0f  Peer-to-Peer Unicast Connection",
+            "\U0001f5a5\ufe0f  Server Connection",
             styleSheet="font-size: 15px; font-weight: bold;"
         ))
         stl.addWidget(QLabel(
-            "Enter your friend's IP address (e.g. from Tailscale). Whichever computer starts first becomes the Host, "
-            "and the other connects as Client. If the Host exits, the Client automatically transitions to Host with no data loss.",
+            "Enter the IP address of the PC running <b>python sync_server.py</b>. "
+            "All PCs on the network connect to that one central server.",
             styleSheet=f"color: {TEXT_SECONDARY}; font-size: 11px;"
         ))
 
         # IP + Port row
         ip_row = QHBoxLayout()
-        ip_row.addWidget(QLabel("<b>Peer IP (P2P):</b>"))
-        e_srv_ip = QLineEdit(); e_srv_ip.setPlaceholderText("e.g. 100.x.y.z"); e_srv_ip.setFixedWidth(200)
+        ip_row.addWidget(QLabel("<b>Server IP:</b>"))
+        e_srv_ip = QLineEdit(); e_srv_ip.setPlaceholderText("e.g. 192.168.1.10"); e_srv_ip.setFixedWidth(200)
         ip_row.addWidget(e_srv_ip)
         ip_row.addSpacing(16)
         ip_row.addWidget(QLabel("<b>Port:</b>"))
@@ -2519,14 +2524,14 @@ class PayrollApp(QMainWindow):
                 connected = self._sync_client.connected
                 icon   = "\U0001f535" if connected else "\U0001f7e1"
                 status = "Connected" if connected else "Reconnecting\u2026"
-                addr   = self._lan_host_ip or "Peer"
+                addr   = self._lan_host_ip or "Server"
                 port   = getattr(self._sync_client, '_port', 5050)
                 srv_status_lbl.setText(f"{icon} {status} \u2014 {addr}:{port}")
                 srv_status_lbl.setStyleSheet(
                     f"font-size: 11px; color: {'#3B82F6' if connected else '#F59E0B'};"
                 )
             else:
-                srv_status_lbl.setText("\u26aa Auto-Discovery Mode \u2014 no peer IP configured")
+                srv_status_lbl.setText("\u26aa Standalone \u2014 no server configured")
                 srv_status_lbl.setStyleSheet(f"font-size: 11px; color: {TEXT_MUTED};")
 
         _refresh_srv_status()

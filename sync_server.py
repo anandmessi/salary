@@ -34,6 +34,15 @@ _change_lock = threading.Lock()
 # detect changes without relying on wall-clock timestamps.
 _write_version: int = 0
 
+# Callback registered by Host's main thread GUI to watch for Client changes
+_on_change_callback = None
+
+
+def set_change_callback(callback):
+    """Register a callback to be triggered on every database modification."""
+    global _on_change_callback
+    _on_change_callback = callback
+
 
 def _bump_change():
     """Called after every write so polling clients see a new timestamp and version."""
@@ -41,6 +50,12 @@ def _bump_change():
     with _change_lock:
         _last_change_ts = time.time()
         _write_version += 1
+    
+    if _on_change_callback:
+        try:
+            _on_change_callback()
+        except Exception:
+            pass
 
 
 def _make_app(host_db_path: str):
@@ -77,6 +92,45 @@ def _make_app(host_db_path: str):
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
             conn.close()
             return send_file(host_db_path, as_attachment=True, download_name="payroll.db")
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/db_mtime")
+    def db_mtime():
+        """Get the modification time of the database file."""
+        try:
+            import os
+            mtime = os.path.getmtime(host_db_path)
+            return jsonify({"mtime": mtime})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/upload_db", methods=["POST"])
+    def upload_db():
+        """Receive a new database file from a client and replace the host database."""
+        try:
+            import sqlite3
+            # Close connection on database module thread local first
+            db.close_thread_conn()
+            
+            # Read binary payload
+            payload = request.get_data()
+            if not payload:
+                return jsonify({"error": "Empty payload"}), 400
+                
+            # Overwrite the host database safely
+            with open(host_db_path, "wb") as f:
+                f.write(payload)
+                
+            # Force sqlite checkpoints
+            conn = sqlite3.connect(host_db_path)
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            conn.close()
+            
+            # Invalidate all server-side caches
+            _cache.clear()
+            _bump_change()
+            return jsonify({"ok": True})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
