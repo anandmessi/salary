@@ -59,6 +59,11 @@ def _bump_change():
             pass
 
 
+def set_backup_manager(mgr):
+    global _backup_manager
+    _backup_manager = mgr
+
+
 def _get_db_change_counter(db_path: str) -> int:
     try:
         import os
@@ -95,20 +100,6 @@ def _make_app(host_db_path: str):
     @app.route("/api/ping")
     def ping():
         return jsonify({"status": "ok", "version": 1, "ts": _last_change_ts})
-
-    @app.route("/api/download_db")
-    def download_db():
-        """Serve the SQLite database file to clients for syncing."""
-        try:
-            import sqlite3
-            from flask import send_file
-            # Force sqlite to write WAL pages to main database file
-            conn = sqlite3.connect(host_db_path)
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-            conn.close()
-            return send_file(host_db_path, as_attachment=True, download_name="payroll.db")
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
 
     @app.route("/api/db_mtime")
     def db_mtime():
@@ -255,35 +246,6 @@ def _make_app(host_db_path: str):
                     pass
                 raise e
 
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
-    @app.route("/api/upload_db", methods=["POST"])
-    def upload_db():
-        """Receive a new database file from a client and replace the host database."""
-        try:
-            import sqlite3
-            # Close connection on database module thread local first
-            db.close_thread_conn()
-            
-            # Read binary payload
-            payload = request.get_data()
-            if not payload:
-                return jsonify({"error": "Empty payload"}), 400
-                
-            # Overwrite the host database safely
-            with open(host_db_path, "wb") as f:
-                f.write(payload)
-                
-            # Force sqlite checkpoints
-            conn = sqlite3.connect(host_db_path)
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-            conn.close()
-            
-            # Invalidate all server-side caches
-            _cache.clear()
-            _bump_change()
-            return jsonify({"ok": True})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
@@ -713,4 +675,3 @@ if __name__ == "__main__":
         app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
     except KeyboardInterrupt:
         print("\nStopping central database server...")
-

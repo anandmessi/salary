@@ -80,7 +80,7 @@ class SyncClient:
     def download_db_file(self, local_db_path: str) -> bool:
         """Download the latest database file from the host and save it locally."""
         try:
-            url = f"{self.base_url.replace('/api', '')}/api/download_db"
+            url = f"{self.base_url}/db/snapshot"
             r = self._requests.get(url, stream=True, timeout=CONNECT_TIMEOUT)
             if r.status_code == 200:
                 import os, tempfile, shutil

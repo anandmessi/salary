@@ -1,4 +1,32 @@
+# Databases
+payroll.db
+payroll.db-wal
+payroll.db-shm
+payroll.db.*
+backup.db
+backup.db-wal
+backup.db-shm
+*.bak
+*.pre_pull.bak
+*.pre_sync_backup
+*.corrupted*
+
+# Sync metadata
+sync_meta.json
+server_config.json
+server_token.json
+
+# Generated PDFs
+SalarySlip_*.pdf
+
+# Sample data with real info
+employee.xlsx
+
+# Python cache
 __pycache__/
-*.db
-*.db-shm
-*.db-wal
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log

@@ -14,7 +14,6 @@ if getattr(sys, 'frozen', False):
 
 from version import APP_NAME, APP_VERSION
 from backup_manager import BackupManager
-from lan_sync import LanSync
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QStackedWidget,
@@ -651,7 +650,6 @@ class PrewarmThread(QThread):
 
             self.progress.emit(f"Loading attendance for {self._month}\u2026")
             get_workers_and_attendance(self._month)
-
             self.result_ready.emit(True)
         except Exception as e:
             self.error_ready.emit(e)
@@ -667,10 +665,8 @@ def _safe_delete(widget):
         pass
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 class PayrollApp(QMainWindow):
     backup_sync_signal = pyqtSignal(str, str)
-    lan_role_decided_signal = pyqtSignal(str, str, object, object)
 
     def __init__(self):
         super().__init__()
@@ -680,7 +676,6 @@ class PayrollApp(QMainWindow):
         self._loading_overlay = None    # assigned after sidebar+main area are built
         self._refresh_timer = None      # debounce timer for LAN-sync refresh (see _schedule_refresh)
         self.backup_sync_signal.connect(self._update_backup_label)
-        self.lan_role_decided_signal.connect(self._apply_lan_role)
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — Professional Payroll Management")
         self.resize(1300, 800)
         self.setMinimumSize(1050, 650)
@@ -706,16 +701,15 @@ class PayrollApp(QMainWindow):
 
         # Load server config and decide mode immediately
         from server_config import get_server_config
-        from schema import DB_PATH as _local_db_path
+        from schema import get_active_db_path
         _srv_cfg = get_server_config()
 
-        self._lan_role    = "detecting"
+        self._lan_role    = "standalone"
         self._lan_peer    = None
         self._lan_host_ip = None
         self._sync_client = None
         self._backup_mgr  = None   # created in _finish_init for standalone mode
         self._current_page_key = "dashboard"  # track active page reliably
-        self._lan_sync    = None
 
         if _srv_cfg["enabled"] and _srv_cfg["ip"]:
             # Direct connection mode (Manual override)
@@ -737,24 +731,68 @@ class PayrollApp(QMainWindow):
                 )
                 self._sync_client = None
                 self._lan_role = "standalone"
-
-            # Bypass discovery and start immediately
-            QTimer.singleShot(0, self._finish_init)
         else:
-            # Auto-Discovery Mode!
-            self._loading_overlay.set_status("🔄 Searching for network server...")
-            from lan_sync import LanSync
-            self._lan_sync = LanSync(
-                local_db_path=_local_db_path,
-                on_role_decided=self._on_lan_role_decided
-            )
-            self._lan_sync.start()
+            # Standalone/Host mode
+            try:
+                import sync_server
+                from sync_server import get_local_ips
+                ok = sync_server.start(get_active_db_path())
+                if ok:
+                    self._lan_role = "host"
+                    ips = get_local_ips()
+                    self._lan_host_ip = ips[0] if ips else "127.0.0.1"
+                    sync_server.set_change_callback(self._on_host_data_changed)
+                else:
+                    self._lan_role = "standalone"
+            except Exception as e:
+                import logging as _logging
+                _logging.error("Failed to start sync server: %s. Running standalone.", e)
+                self._lan_role = "standalone"
+
+        # Bypass discovery and start immediately
+        QTimer.singleShot(0, self._finish_init)
 
     def closeEvent(self, event):
-        if hasattr(self, '_lan_sync') and self._lan_sync is not None:
-            self._lan_sync.stop()
+        # 1. Stop background SyncClient polling
+        if self._sync_client is not None:
+            try:
+                self._sync_client.stop_polling()
+            except Exception:
+                pass
+            self._sync_client = None
+
+        # 2. Stop BackupManager
         if self._backup_mgr is not None:
-            self._backup_mgr.stop()
+            try:
+                self._backup_mgr.stop()
+            except Exception:
+                pass
+
+        # 3. Stop Flask server
+        try:
+            import sync_server
+            sync_server.stop()
+        except Exception:
+            pass
+
+        # 4. Stop prewarm thread
+        if hasattr(self, '_prewarm_thread') and self._prewarm_thread is not None:
+            try:
+                if self._prewarm_thread.isRunning():
+                    self._prewarm_thread.quit()
+                    self._prewarm_thread.wait(200)
+            except Exception:
+                pass
+
+        # 5. Stop active background FetchThreads
+        for thread in list(self._active_threads):
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    thread.wait(200)
+            except Exception:
+                pass
+
         event.accept()
 
     def resizeEvent(self, event):
@@ -765,121 +803,6 @@ class PayrollApp(QMainWindow):
                 self._loading_overlay.setGeometry(self.central_widget.rect())
             except RuntimeError:
                 self._loading_overlay = None
-
-    def _sync_databases_on_startup(self, host_ip: str):
-        """Query host and client SQLite DB write versions or modification times on startup, and sync the newer database."""
-        try:
-            import os
-            import urllib.request
-            import json
-            from schema import get_active_db_path
-            
-            local_db = get_active_db_path()
-            if not os.path.exists(local_db):
-                return
-                
-            # Request database mtime and change counter from host
-            url_mtime = f"http://{host_ip}:5050/api/db_mtime"
-            with urllib.request.urlopen(url_mtime, timeout=3) as resp:
-                if resp.status == 200:
-                    data = json.loads(resp.read().decode('utf-8'))
-                    host_mtime = data.get("mtime")
-                    host_cc = data.get("change_counter", 0)
-                    if host_mtime is None:
-                        return
-                        
-                    local_mtime = os.path.getmtime(local_db)
-                    local_cc = _get_db_change_counter(local_db)
-                    
-                    import logging as _logging
-                    _logging.info(
-                        "Database Sync Check: local_cc=%d, host_cc=%d | local_mtime=%f, host_mtime=%f",
-                        local_cc, host_cc, local_mtime, host_mtime
-                    )
-                    
-                    # 1. Compare SQLite change counters first (completely immune to clock-skew)
-                    if local_cc > host_cc:
-                        _logging.info("Client database is newer by change counter (%d > %d). Uploading to Host...", local_cc, host_cc)
-                        self._upload_local_db_to_host(local_db, host_ip)
-                    elif host_cc > local_cc:
-                        _logging.info("Host database is newer by change counter (%d > %d). Downloading from Host...", host_cc, local_cc)
-                        self._download_db_from_host(local_db, host_ip, host_mtime)
-                    else:
-                        # 2. Fall back to mtime only if change counters are equal (e.g. fresh databases)
-                        clock_skew_tolerance = 2.0  # seconds
-                        if local_mtime > host_mtime + clock_skew_tolerance:
-                            _logging.info("Client database is newer by mtime (%s > %s). Uploading to Host...", local_mtime, host_mtime)
-                            self._upload_local_db_to_host(local_db, host_ip)
-                        elif host_mtime > local_mtime + clock_skew_tolerance:
-                            _logging.info("Host database is newer by mtime (%s > %s). Downloading from Host...", host_mtime, local_mtime)
-                            self._download_db_from_host(local_db, host_ip, host_mtime)
-        except Exception as e:
-            import logging as _logging
-            _logging.error("Startup database synchronization failed: %s", e)
-
-    def _upload_local_db_to_host(self, local_db: str, host_ip: str):
-        import urllib.request
-        from database import close_thread_conn
-        close_thread_conn()
-        
-        with open(local_db, "rb") as f:
-            db_data = f.read()
-            
-        url_upload = f"http://{host_ip}:5050/api/upload_db"
-        req = urllib.request.Request(url_upload, data=db_data, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as upload_resp:
-            if upload_resp.status == 200:
-                import logging as _logging
-                _logging.info("Successfully uploaded Client database to Host.")
-
-    def _download_db_from_host(self, local_db: str, host_ip: str, host_mtime: float):
-        import urllib.request
-        from database import close_thread_conn
-        close_thread_conn()
-        
-        url_download = f"http://{host_ip}:5050/api/download_db"
-        with urllib.request.urlopen(url_download, timeout=10) as dl_resp:
-            if dl_resp.status == 200:
-                with open(local_db, "wb") as f:
-                    f.write(dl_resp.read())
-                # Sync file modification time to match Host to prevent redundant sync loops
-                import os
-                os.utime(local_db, (host_mtime, host_mtime))
-                import logging as _logging
-                _logging.info("Successfully downloaded Host database to Client.")
-
-    def _on_lan_role_decided(self, role: str, db_path: str, peer_name: str | None, host_ip: str | None):
-        """Called from LanSync background thread. Emits a signal to safely route to the main GUI thread."""
-        self.lan_role_decided_signal.emit(role, db_path, peer_name, host_ip)
-
-    def _apply_lan_role(self, role: str, db_path: str, peer_name: str | None, host_ip: str | None):
-        """Applies the decided role on the main GUI thread and proceeds with DB initialization."""
-        self._lan_role = role
-        self._lan_peer = peer_name
-        self._lan_host_ip = host_ip
-
-        if role == "client":
-            try:
-                from sync_client import SyncClient
-                import database as _db_mod
-                self._sync_client = SyncClient(host_ip=host_ip, port=5050)
-                _db_mod.set_sync_client(self._sync_client)
-            except Exception as e:
-                import logging as _logging
-                _logging.error("Failed to start Client sync client: %s", e)
-                self._sync_client = None
-                self._lan_role = "standalone"
-        elif role == "host":
-            try:
-                import sync_server
-                sync_server.set_change_callback(self._on_host_data_changed)
-            except Exception as e:
-                import logging as _logging
-                _logging.error("Failed to set sync_server change callback: %s", e)
-
-        self._finish_init()
-
-    # ── Startup: DB init + prewarm ────────────────────────────────────────────
 
     @pyqtSlot()
     def _finish_init(self):
@@ -895,10 +818,19 @@ class PayrollApp(QMainWindow):
                 on_disconnect=self._on_host_disconnected,
             )
         else:
-            # Standalone mode: init local DB and start the backup manager.
+            # Standalone/Host mode: init local DB and start the backup manager.
             init_db(db, seed=True)
             self._backup_mgr = BackupManager(db_path=db, on_sync=self._on_backup_sync)
             self._backup_mgr.start()
+
+            # Share the backup manager with local sync server!
+            if self._lan_role == "host":
+                try:
+                    import sync_server
+                    sync_server.set_backup_manager(self._backup_mgr)
+                except Exception as e:
+                    import logging as _logging
+                    _logging.error("Failed to share backup manager: %s", e)
 
         # Update overlay and launch prewarm — dashboard shown only AFTER cache is warm
         if self._loading_overlay is not None:
@@ -974,8 +906,7 @@ class PayrollApp(QMainWindow):
           2. Detaches the sync client from the database layer so local writes
              go directly to SQLite again.
           3. Starts the local Flask sync server so other PCs can discover us.
-          4. Starts the heartbeat responder so UDP broadcasts are answered.
-          5. Updates the sidebar role badge on the main thread.
+          4. Updates the sidebar role badge on the main thread.
         """
         import logging as _logging
         _logging.info("Host disconnected — promoting this PC to Host role.")
@@ -1013,6 +944,7 @@ class PayrollApp(QMainWindow):
                         self._backup_mgr = BackupManager(db_path=local_db, on_sync=self._on_backup_sync)
                         self._backup_mgr.start()
                         _logging.info("BackupManager started on failover Host.")
+                        sync_server.set_backup_manager(self._backup_mgr)
                     except Exception as backup_err:
                         _logging.error("Failed to start BackupManager on failover: %s", backup_err)
             else:
@@ -1020,24 +952,12 @@ class PayrollApp(QMainWindow):
         except Exception as e:
             _logging.error("Failover sync server start error: %s", e)
 
-        # 4. Start the UDP discovery heartbeat so other PCs find us
-        try:
-            from lan_sync import LanSync
-            from schema import get_active_db_path
-            if self._lan_sync is None:
-                self._lan_sync = LanSync(
-                    local_db_path=get_active_db_path(),
-                    on_role_decided=self._on_lan_role_decided,
-                )
-            self._lan_sync.promote_to_host()
-        except Exception as e:
-            _logging.error("Failover heartbeat start error: %s", e)
-
-        # 5. Update role state and refresh the badge on the main thread
+        # 4. Update role state and refresh the badge on the main thread
         self._lan_role = "host"
         try:
-            from lan_sync import _get_local_ip
-            self._lan_host_ip = _get_local_ip()
+            from sync_server import get_local_ips
+            ips = get_local_ips()
+            self._lan_host_ip = ips[0] if ips else "127.0.0.1"
         except Exception:
             pass
         QMetaObject.invokeMethod(

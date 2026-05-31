@@ -5,8 +5,16 @@ Config is saved to a local JSON file next to the database.
 """
 import json
 import os
+import sys
 
-_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_config.json")
+
+def _get_base_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+_CONFIG_FILE = os.path.join(_get_base_dir(), "server_config.json")
 
 DEFAULT_PORT = 5050
 

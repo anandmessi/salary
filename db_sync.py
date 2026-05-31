@@ -15,14 +15,20 @@ import logging
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 import time
 
 logger = logging.getLogger(__name__)
 
-_META_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "sync_meta.json"
-)
+
+def _get_base_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+_META_FILE = os.path.join(_get_base_dir(), "sync_meta.json")
 
 
 # ── Metadata helpers ───────────────────────────────────────────────────────────
@@ -72,29 +78,31 @@ def _local_stats(db_path: str) -> dict:
 # ── Who wins? ──────────────────────────────────────────────────────────────────
 
 def _who_is_newer(server_info: dict, local: dict) -> str:
-    """
-    Returns "server", "local", or "equal".
-    Decision order: mtime (2s tolerance) → row_hash.
-    """
     if not local["exists"]:
         return "server"
 
-    s_mtime = server_info.get("mtime", 0.0)
-    l_mtime = local["mtime"]
-    diff = s_mtime - l_mtime
+    meta = _load_meta()
+    server_version = server_info.get("version", 0)
+    last_known_version = meta.get("last_synced_version", -1)
 
-    if diff > 2.0:
+    # Server has had writes since we last synced — definitely newer
+    if server_version > last_known_version:
         return "server"
-    if diff < -2.0:
+
+    # Local mtime is significantly newer — offline edits happened
+    s_mtime = server_info.get("mtime", 0.0)
+    l_mtime = local.get("mtime", 0.0)
+    if l_mtime > s_mtime + 2.0:
         return "local"
 
-    # Mtimes within 2 seconds — use row_hash as tiebreaker
+    # Row count tiebreaker
     s_hash = server_info.get("row_hash", 0)
-    l_hash = local["row_hash"]
+    l_hash = local.get("row_hash", 0)
     if s_hash > l_hash:
         return "server"
     if l_hash > s_hash:
         return "local"
+
     return "equal"
 
 
