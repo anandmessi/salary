@@ -58,6 +58,20 @@ def _bump_change():
             pass
 
 
+def _get_db_change_counter(db_path: str) -> int:
+    try:
+        import os
+        if os.path.exists(db_path):
+            with open(db_path, "rb") as f:
+                f.seek(24)
+                data = f.read(4)
+                if len(data) == 4:
+                    return int.from_bytes(data, byteorder="big")
+    except Exception:
+        pass
+    return 0
+
+
 def _make_app(host_db_path: str):
     """Build and return the Flask application."""
     try:
@@ -97,11 +111,12 @@ def _make_app(host_db_path: str):
 
     @app.route("/api/db_mtime")
     def db_mtime():
-        """Get the modification time of the database file."""
+        """Get the modification time and change counter of the database file."""
         try:
             import os
             mtime = os.path.getmtime(host_db_path)
-            return jsonify({"mtime": mtime})
+            cc = _get_db_change_counter(host_db_path)
+            return jsonify({"mtime": mtime, "change_counter": cc})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 

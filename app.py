@@ -229,6 +229,18 @@ QLabel#metric_lbl {{
 """
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+def _get_db_change_counter(db_path: str) -> int:
+    try:
+        if os.path.exists(db_path):
+            with open(db_path, "rb") as f:
+                f.seek(24)
+                data = f.read(4)
+                if len(data) == 4:
+                    return int.from_bytes(data, byteorder="big")
+    except Exception:
+        pass
+    return 0
+
 # Fix #5 — cache month_options() to avoid hitting DB on every page load
 _month_options_cache: list = []
 _month_options_ts: float = 0.0
@@ -747,7 +759,7 @@ class PayrollApp(QMainWindow):
                 self._loading_overlay = None
 
     def _sync_databases_on_startup(self, host_ip: str):
-        """Query host and client SQLite DB modification times on startup, and sync the newer database."""
+        """Query host and client SQLite DB write versions or modification times on startup, and sync the newer database."""
         try:
             import os
             import urllib.request
@@ -758,54 +770,75 @@ class PayrollApp(QMainWindow):
             if not os.path.exists(local_db):
                 return
                 
-            # Request database mtime from host
+            # Request database mtime and change counter from host
             url_mtime = f"http://{host_ip}:5050/api/db_mtime"
             with urllib.request.urlopen(url_mtime, timeout=3) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode('utf-8'))
                     host_mtime = data.get("mtime")
+                    host_cc = data.get("change_counter", 0)
                     if host_mtime is None:
                         return
                         
                     local_mtime = os.path.getmtime(local_db)
-                    clock_skew_tolerance = 2.0  # seconds
+                    local_cc = _get_db_change_counter(local_db)
                     
                     import logging as _logging
-                    if local_mtime > host_mtime + clock_skew_tolerance:
-                        # Client database is newer! Upload local database to Host
-                        _logging.info("Client database is newer (%s > %s). Uploading to Host...", local_mtime, host_mtime)
-                        
-                        from database import close_thread_conn
-                        close_thread_conn()
-                        
-                        with open(local_db, "rb") as f:
-                            db_data = f.read()
-                            
-                        url_upload = f"http://{host_ip}:5050/api/upload_db"
-                        req = urllib.request.Request(url_upload, data=db_data, method="POST")
-                        with urllib.request.urlopen(req, timeout=10) as upload_resp:
-                            if upload_resp.status == 200:
-                                _logging.info("Successfully synchronized Client database to Host.")
-                                
-                    elif host_mtime > local_mtime + clock_skew_tolerance:
-                        # Host database is newer! Download Host database to Client
-                        _logging.info("Host database is newer (%s > %s). Downloading from Host...", host_mtime, local_mtime)
-                        
-                        from database import close_thread_conn
-                        close_thread_conn()
-                        
-                        url_download = f"http://{host_ip}:5050/api/download_db"
-                        with urllib.request.urlopen(url_download, timeout=10) as dl_resp:
-                            if dl_resp.status == 200:
-                                with open(local_db, "wb") as f:
-                                    f.write(dl_resp.read())
-                                    
-                                # Sync file modification time to match Host to prevent redundant sync loops
-                                os.utime(local_db, (host_mtime, host_mtime))
-                                _logging.info("Successfully synchronized Host database to Client.")
+                    _logging.info(
+                        "Database Sync Check: local_cc=%d, host_cc=%d | local_mtime=%f, host_mtime=%f",
+                        local_cc, host_cc, local_mtime, host_mtime
+                    )
+                    
+                    # 1. Compare SQLite change counters first (completely immune to clock-skew)
+                    if local_cc > host_cc:
+                        _logging.info("Client database is newer by change counter (%d > %d). Uploading to Host...", local_cc, host_cc)
+                        self._upload_local_db_to_host(local_db, host_ip)
+                    elif host_cc > local_cc:
+                        _logging.info("Host database is newer by change counter (%d > %d). Downloading from Host...", host_cc, local_cc)
+                        self._download_db_from_host(local_db, host_ip, host_mtime)
+                    else:
+                        # 2. Fall back to mtime only if change counters are equal (e.g. fresh databases)
+                        clock_skew_tolerance = 2.0  # seconds
+                        if local_mtime > host_mtime + clock_skew_tolerance:
+                            _logging.info("Client database is newer by mtime (%s > %s). Uploading to Host...", local_mtime, host_mtime)
+                            self._upload_local_db_to_host(local_db, host_ip)
+                        elif host_mtime > local_mtime + clock_skew_tolerance:
+                            _logging.info("Host database is newer by mtime (%s > %s). Downloading from Host...", host_mtime, local_mtime)
+                            self._download_db_from_host(local_db, host_ip, host_mtime)
         except Exception as e:
             import logging as _logging
             _logging.error("Startup database synchronization failed: %s", e)
+
+    def _upload_local_db_to_host(self, local_db: str, host_ip: str):
+        import urllib.request
+        from database import close_thread_conn
+        close_thread_conn()
+        
+        with open(local_db, "rb") as f:
+            db_data = f.read()
+            
+        url_upload = f"http://{host_ip}:5050/api/upload_db"
+        req = urllib.request.Request(url_upload, data=db_data, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as upload_resp:
+            if upload_resp.status == 200:
+                import logging as _logging
+                _logging.info("Successfully uploaded Client database to Host.")
+
+    def _download_db_from_host(self, local_db: str, host_ip: str, host_mtime: float):
+        import urllib.request
+        from database import close_thread_conn
+        close_thread_conn()
+        
+        url_download = f"http://{host_ip}:5050/api/download_db"
+        with urllib.request.urlopen(url_download, timeout=10) as dl_resp:
+            if dl_resp.status == 200:
+                with open(local_db, "wb") as f:
+                    f.write(dl_resp.read())
+                # Sync file modification time to match Host to prevent redundant sync loops
+                import os
+                os.utime(local_db, (host_mtime, host_mtime))
+                import logging as _logging
+                _logging.info("Successfully downloaded Host database to Client.")
 
     def _on_lan_role_decided(self, role: str, db_path: str, peer_name: str | None, host_ip: str | None):
         """Called from LanSync background thread. Emits a signal to safely route to the main GUI thread."""
@@ -968,6 +1001,15 @@ class PayrollApp(QMainWindow):
                 _time.sleep(0.5)  # allow Flask to bind
                 sync_server.set_change_callback(self._on_host_data_changed)
                 _logging.info("Failover: now serving as Host on port 5050")
+                
+                # Start BackupManager on the newly promoted host!
+                if self._backup_mgr is None:
+                    try:
+                        self._backup_mgr = BackupManager(db_path=local_db, on_sync=self._on_backup_sync)
+                        self._backup_mgr.start()
+                        _logging.info("BackupManager started on failover Host.")
+                    except Exception as backup_err:
+                        _logging.error("Failed to start BackupManager on failover: %s", backup_err)
             else:
                 _logging.warning("Failover: failed to start sync server")
         except Exception as e:
