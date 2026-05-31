@@ -127,6 +127,14 @@ def calculate_payroll(
     month       : str,
     config      : CompanyConfig,
 ) -> Tuple[List[PayrollResult], List[str]]:
+    # Guard: warn loudly if no wage rates are configured
+    if not skill_wages:
+        return [], [
+            "⚠️ No wage rates configured. "
+            "Go to Wage Rates tab and set daily rates before calculating payroll. "
+            "All workers will show ₹0 until rates are saved."
+        ]
+
     results  = []
     warnings = []
     att_idx  = {a.worker_id: a for a in attendance if a.month == month}

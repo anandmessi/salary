@@ -1774,6 +1774,21 @@ class PayrollApp(QMainWindow):
             if not _page_alive[0]:
                 return
 
+            if not records:
+                self.set_message("⚠️ No attendance data to save.", WARNING_CLR)
+                return
+
+            reply = QMessageBox.question(
+                self,
+                "Confirm Save",
+                f"Save attendance for {month} ({len(records)} workers)?\n\n"
+                "This will overwrite all existing records for this month.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
             bulk_upsert_attendance(records)
             _invalidate_month_options_cache()   # Fix #5: refresh month list after save
             self.set_message(f"✅ Saved {len(records)} records for {month}", SUCCESS)
@@ -2585,25 +2600,109 @@ class PayrollApp(QMainWindow):
         def _do_connect():
             ip = e_srv_ip.text().strip()
             if not ip:
-                self.set_message("\u26a0\ufe0f Enter a server IP address first.", WARNING_CLR)
+                self.set_message("⚠️ Enter a server IP address first.", WARNING_CLR)
                 return
             try:
                 port = int(e_srv_port.text().strip() or "5050")
             except ValueError:
-                self.set_message("\u26a0\ufe0f Port must be a number.", WARNING_CLR)
+                self.set_message("⚠️ Port must be a number.", WARNING_CLR)
                 return
+
+            # 1. Stop existing sync client if any
+            if self._sync_client is not None:
+                try:
+                    self._sync_client.stop_polling()
+                except Exception:
+                    pass
+                self._sync_client = None
+
+            # 2. Stop local Flask server if running as host
+            try:
+                import sync_server
+                sync_server.stop()
+            except Exception:
+                pass
+
+            # 3. Save config
             save_server_config(ip=ip, port=port, enabled=True)
-            self.set_message(
-                "\u2705 Server config saved. Restart the app to connect.", SUCCESS
-            )
+
+            # 4. Create new SyncClient and inject into database layer
+            try:
+                from sync_client import SyncClient
+                import database as _db_mod
+                sc = SyncClient(host_ip=ip, port=port)
+                _db_mod.set_sync_client(sc)
+                self._sync_client = sc
+                self._lan_role = "client"
+                self._lan_host_ip = ip
+
+                # 5. Start polling
+                self._sync_client.start_polling(
+                    on_change=self._on_host_data_changed,
+                    on_disconnect=self._on_host_disconnected,
+                )
+
+                # 6. Clear cache and refresh current page with server data
+                from db_cache import cache as _db_cache
+                _db_cache.clear()
+                self._update_sync_badge()
+                _refresh_srv_status()
+                self.set_message(f"✅ Connected to {ip}:{port}", SUCCESS)
+
+            except Exception as e:
+                self.set_message(f"⚠️ Connection failed: {e}", WARNING_CLR)
 
         def _do_disconnect():
+            # 1. Stop sync client
+            if self._sync_client is not None:
+                try:
+                    self._sync_client.stop_polling()
+                except Exception:
+                    pass
+                self._sync_client = None
+
+            # 2. Detach from database layer
+            try:
+                import database as _db_mod
+                _db_mod.set_sync_client(None)
+            except Exception:
+                pass
+
+            # 3. Start local server (become host again)
+            try:
+                import sync_server
+                from schema import get_active_db_path
+                from database import init_db
+                db = get_active_db_path()
+                init_db(db, seed=True)
+                ok = sync_server.start(db)
+                if ok:
+                    sync_server.set_change_callback(self._on_host_data_changed)
+                    if self._backup_mgr is None:
+                        self._backup_mgr = BackupManager(
+                            db_path=db, on_sync=self._on_backup_sync
+                        )
+                        self._backup_mgr.start()
+                    sync_server.set_backup_manager(self._backup_mgr)
+                    self._lan_role = "host"
+                    from sync_server import get_local_ips
+                    ips = get_local_ips()
+                    self._lan_host_ip = ips[0] if ips else "127.0.0.1"
+                else:
+                    self._lan_role = "standalone"
+                    self._lan_host_ip = None
+            except Exception as e:
+                self._lan_role = "standalone"
+
+            # 4. Save config and update UI
             clear_server_config()
             e_srv_ip.clear()
             e_srv_port.setText("5050")
-            self.set_message(
-                "\u2705 Disconnected. Restart the app to apply.", SUCCESS
-            )
+            from db_cache import cache as _db_cache
+            _db_cache.clear()
+            self._update_sync_badge()
+            _refresh_srv_status()
+            self.set_message("✅ Disconnected — running as standalone/host", SUCCESS)
 
         btn_connect.clicked.connect(_do_connect)
         btn_disconnect.clicked.connect(_do_disconnect)
@@ -2661,6 +2760,13 @@ class PayrollApp(QMainWindow):
         _results_cache = []
 
         def refresh():
+            if hasattr(self, '_pr_warn_lbl') and self._pr_warn_lbl is not None:
+                try:
+                    self._pr_warn_lbl.deleteLater()
+                except RuntimeError:
+                    pass
+                self._pr_warn_lbl = None
+
             sync_combo(m_cb, month_options())
             sync_combo(u_cb, _unit_filter_list())
             month = m_cb.currentText()
@@ -2683,7 +2789,20 @@ class PayrollApp(QMainWindow):
                 workers, sw, att, month, unit, q = data
                 nonlocal _results_cache
                 if unit != "All": workers = [w for w in workers if w.unit == unit]
-                results, _ = calculate_payroll(workers, sw, att, month, get_config())
+                results, warnings = calculate_payroll(workers, sw, att, month, get_config())
+                
+                # Check for wage rate warning and display a red warning banner
+                if any("No wage rates configured" in w for w in warnings):
+                    self._pr_warn_lbl = QLabel(
+                        "⚠️  No wage rates configured — all amounts are ₹0. "
+                        "Go to Wage Rates tab first."
+                    )
+                    self._pr_warn_lbl.setStyleSheet(
+                        f"background: {DANGER}; color: white; padding: 8px 12px; "
+                        f"border-radius: 6px; font-weight: bold;"
+                    )
+                    self._pr_warn_lbl.setWordWrap(True)
+                    layout.insertWidget(1, self._pr_warn_lbl)
                 if q:
                     results = [r for r in results if q in r.worker_name.lower() or q in r.worker_id.lower()]
                 _results_cache = results
