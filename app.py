@@ -668,6 +668,7 @@ def _safe_delete(widget):
 
 class PayrollApp(QMainWindow):
     backup_sync_signal = pyqtSignal(str, str)
+    lan_role_decided_signal = pyqtSignal(str, str, str)
 
     def __init__(self):
         super().__init__()
@@ -677,6 +678,7 @@ class PayrollApp(QMainWindow):
         self._loading_overlay = None    # assigned after sidebar+main area are built
         self._refresh_timer = None      # debounce timer for LAN-sync refresh (see _schedule_refresh)
         self.backup_sync_signal.connect(self._update_backup_label)
+        self.lan_role_decided_signal.connect(self._on_lan_role_decided)
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — Professional Payroll Management")
         self.resize(1300, 800)
         self.setMinimumSize(1050, 650)
@@ -711,6 +713,7 @@ class PayrollApp(QMainWindow):
         self._sync_client = None
         self._backup_mgr  = None   # created in _finish_init for standalone mode
         self._current_page_key = "dashboard"  # track active page reliably
+        self._lan_sync    = None
 
         if _srv_cfg["enabled"] and _srv_cfg["ip"]:
             # Direct connection mode (Manual override)
@@ -732,26 +735,20 @@ class PayrollApp(QMainWindow):
                 )
                 self._sync_client = None
                 self._lan_role = "standalone"
+            QTimer.singleShot(0, self._finish_init)
         else:
-            # Standalone/Host mode
+            # Automatic LAN Discovery Mode
+            self._lan_role = "detecting"
+            
             try:
-                import sync_server
-                from sync_server import get_local_ips
-                ok = sync_server.start(get_active_db_path())
-                if ok:
-                    self._lan_role = "host"
-                    ips = get_local_ips()
-                    self._lan_host_ip = ips[0] if ips else "127.0.0.1"
-                    sync_server.set_change_callback(self._on_host_data_changed)
-                else:
-                    self._lan_role = "standalone"
+                from lan_sync import LanSync
+                self._lan_sync = LanSync(get_active_db_path(), self._on_lan_role_decided_bg)
+                self._lan_sync.start()
             except Exception as e:
                 import logging as _logging
-                _logging.error("Failed to start sync server: %s. Running standalone.", e)
+                _logging.error("Failed to start LAN auto-discovery: %s. Running standalone.", e)
                 self._lan_role = "standalone"
-
-        # Bypass discovery and start immediately
-        QTimer.singleShot(0, self._finish_init)
+                QTimer.singleShot(0, self._finish_init)
 
     def closeEvent(self, event):
         # 1. Stop background SyncClient polling
@@ -766,6 +763,13 @@ class PayrollApp(QMainWindow):
         if self._backup_mgr is not None:
             try:
                 self._backup_mgr.stop()
+            except Exception:
+                pass
+
+        # Stop background LanSync thread/responder
+        if hasattr(self, '_lan_sync') and self._lan_sync is not None:
+            try:
+                self._lan_sync.stop()
             except Exception:
                 pass
 
@@ -804,6 +808,40 @@ class PayrollApp(QMainWindow):
                 self._loading_overlay.setGeometry(self.central_widget.rect())
             except RuntimeError:
                 self._loading_overlay = None
+
+    def _on_lan_role_decided_bg(self, role, db_path, peer_name, host_ip):
+        """Callback from background LanSync thread."""
+        self.lan_role_decided_signal.emit(role, peer_name or "", host_ip or "")
+
+    @pyqtSlot(str, str, str)
+    def _on_lan_role_decided(self, role, peer_name, host_ip):
+        """Called on the main thread after LAN discovery completes."""
+        self._lan_role = role
+        self._lan_peer = peer_name if peer_name else None
+        self._lan_host_ip = host_ip if host_ip else None
+
+        if role == "client":
+            try:
+                from sync_client import SyncClient
+                import database as _db_mod
+                self._sync_client = SyncClient(
+                    host_ip=host_ip, port=5050
+                )
+                _db_mod.set_sync_client(self._sync_client)
+            except Exception as e:
+                import logging as _logging
+                _logging.error("Failed to create SyncClient for auto-discovered host %s: %s", host_ip, e)
+                self._lan_role = "standalone"
+                self._sync_client = None
+        elif role == "host":
+            try:
+                import sync_server
+                sync_server.set_change_callback(self._on_host_data_changed)
+            except Exception as e:
+                import logging as _logging
+                _logging.error("Failed to set change callback on auto-discovered host server: %s", e)
+
+        self._finish_init()
 
     @pyqtSlot()
     def _finish_init(self):
@@ -948,6 +986,13 @@ class PayrollApp(QMainWindow):
                         sync_server.set_backup_manager(self._backup_mgr)
                     except Exception as backup_err:
                         _logging.error("Failed to start BackupManager on failover: %s", backup_err)
+
+                # Promote LanSync to Host so UDP heartbeat responder starts running
+                if hasattr(self, '_lan_sync') and self._lan_sync is not None:
+                    try:
+                        self._lan_sync.promote_to_host()
+                    except Exception as lan_err:
+                        _logging.error("Failed to promote LanSync to Host: %s", lan_err)
             else:
                 _logging.warning("Failover: failed to start sync server")
         except Exception as e:
@@ -2690,6 +2735,13 @@ class PayrollApp(QMainWindow):
             except Exception:
                 pass
 
+            # Stop LanSync discovery/heartbeat since we are manually connecting to a server
+            if hasattr(self, '_lan_sync') and self._lan_sync is not None:
+                try:
+                    self._lan_sync.stop()
+                except Exception:
+                    pass
+
             # 3. Save config
             save_server_config(ip=ip, port=port, enabled=True)
 
@@ -2755,6 +2807,13 @@ class PayrollApp(QMainWindow):
                     from sync_server import get_local_ips
                     ips = get_local_ips()
                     self._lan_host_ip = ips[0] if ips else "127.0.0.1"
+
+                    # Restart LanSync as Host
+                    if hasattr(self, '_lan_sync') and self._lan_sync is not None:
+                        try:
+                            self._lan_sync.promote_to_host()
+                        except Exception:
+                            pass
                 else:
                     self._lan_role = "standalone"
                     self._lan_host_ip = None
