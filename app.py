@@ -1269,6 +1269,34 @@ class PayrollApp(QMainWindow):
                 except Exception:
                     pass
 
+    def run_db_op(self, op_fn):
+        """Runs a database operation. If in client mode and a network/connection
+        error occurs, automatically triggers failover to Host/Standalone mode
+        and retries the operation locally.
+        """
+        try:
+            return op_fn()
+        except Exception as e:
+            is_net_err = False
+            err_str = str(e).lower()
+            if isinstance(e, (ConnectionError, TimeoutError)) or "connection" in err_str or "timeout" in err_str or "http" in err_str or "max retries" in err_str or "httpconnectionpool" in err_str:
+                is_net_err = True
+            
+            if is_net_err and getattr(self, '_sync_client', None) is not None:
+                import logging as _logging
+                _logging.warning("Database operation failed due to network error: %s. Triggering immediate failover.", e)
+                try:
+                    self._on_host_disconnected()
+                except Exception as failover_err:
+                    _logging.error("Failed to run _on_host_disconnected: %s", failover_err)
+                self.set_message("🔌 Host offline! Promoted this PC to Host role.", DANGER)
+                try:
+                    return op_fn()
+                except Exception as retry_err:
+                    raise retry_err
+            else:
+                raise e
+
     def _navigate(self, key, _background_refresh: bool = False):
         # Fix #1: invalidate in-flight renders — skip when refreshing in the background
         # so a LAN-sync-triggered rebuild does not cancel the page's own data fetch.
@@ -1980,25 +2008,29 @@ class PayrollApp(QMainWindow):
                 wid = item_id.text().strip()
                 name = item_name.text().strip()
                 if not name or not wid: return
-                w_obj = get_worker_by_id(wid)
-                bname_item = table.item(row, 6)
-                bname = bname_item.text().strip() if bname_item else ""
-                if bname.startswith("(No"): bname = ""
                 
-                def _get_txt(col):
-                    it = table.item(row, col)
-                    return it.text().strip() if it else ""
+                def _op():
+                    w_obj = get_worker_by_id(wid)
+                    bname_item = table.item(row, 6)
+                    bname = bname_item.text().strip() if bname_item else ""
+                    if bname.startswith("(No"): bname = ""
+                    
+                    def _get_txt(col):
+                        it = table.item(row, col)
+                        return it.text().strip() if it else ""
+                    
+                    upsert_worker(Worker(
+                        worker_id=wid, name=name, unit=_get_txt(3),
+                        skill_category=_get_txt(4),
+                        designation=_get_txt(5),
+                        bank_name=bname, bank_account=_get_txt(7),
+                        ifsc_code=_get_txt(8),
+                        uan_number=_get_txt(9),
+                        esic_number=_get_txt(10),
+                        joining_date=w_obj.joining_date if w_obj else "",
+                        active=w_obj.active if w_obj else True))
                 
-                upsert_worker(Worker(
-                    worker_id=wid, name=name, unit=_get_txt(3),
-                    skill_category=_get_txt(4),
-                    designation=_get_txt(5),
-                    bank_name=bname, bank_account=_get_txt(7),
-                    ifsc_code=_get_txt(8),
-                    uan_number=_get_txt(9),
-                    esic_number=_get_txt(10),
-                    joining_date=w_obj.joining_date if w_obj else "",
-                    active=w_obj.active if w_obj else True))
+                self.run_db_op(_op)
                 self.clear_other_pages_cache()
                 self.set_message(f"✅ {wid} auto-saved!", SUCCESS)
             except Exception as e:
@@ -2036,26 +2068,29 @@ class PayrollApp(QMainWindow):
             wid_item = table.item(sel[0].row(), 1)   # col 1 = worker_id
             if not wid_item:
                 return
-            w = get_worker_by_id(wid_item.text())
-            if not w:
-                return
-            e_id.setText(w.worker_id)
-            e_name.setText(w.name)
-            e_desig.setText(w.designation or "")
-            e_bank_acc.setText(w.bank_account or "")
-            e_ifsc.setText(w.ifsc_code or "")
-            e_uan.setText(w.uan_number or "")
-            e_esic.setText(w.esic_number or "")
-            e_join.setText(w.joining_date or "")
-            idx = e_skill.findText(w.skill_category or "")
-            if idx >= 0:
-                e_skill.setCurrentIndex(idx)
-            idx2 = e_unit.findText(w.unit or "")
-            if idx2 >= 0:
-                e_unit.setCurrentIndex(idx2)
-            idx3 = e_bank_name.findText(w.bank_name or "")
-            if idx3 >= 0:
-                e_bank_name.setCurrentIndex(idx3)
+            try:
+                w = self.run_db_op(lambda: get_worker_by_id(wid_item.text()))
+                if not w:
+                    return
+                e_id.setText(w.worker_id)
+                e_name.setText(w.name)
+                e_desig.setText(w.designation or "")
+                e_bank_acc.setText(w.bank_account or "")
+                e_ifsc.setText(w.ifsc_code or "")
+                e_uan.setText(w.uan_number or "")
+                e_esic.setText(w.esic_number or "")
+                e_join.setText(w.joining_date or "")
+                idx = e_skill.findText(w.skill_category or "")
+                if idx >= 0:
+                    e_skill.setCurrentIndex(idx)
+                idx2 = e_unit.findText(w.unit or "")
+                if idx2 >= 0:
+                    e_unit.setCurrentIndex(idx2)
+                idx3 = e_bank_name.findText(w.bank_name or "")
+                if idx3 >= 0:
+                    e_bank_name.setCurrentIndex(idx3)
+            except Exception as e:
+                self.set_message(f"⚠️ Failed to load worker details: {e}", DANGER)
 
         table.itemSelectionChanged.connect(_prefill_form)
 
@@ -2183,15 +2218,22 @@ class PayrollApp(QMainWindow):
             if not wid or not name: return
             bname = e_bank_name.currentText()
             if bname.startswith("(No"): bname = ""
-            upsert_worker(Worker(
-                worker_id=wid, name=name, designation=e_desig.text().strip(),
-                bank_account=e_bank_acc.text().strip(), bank_name=bname,
-                ifsc_code=e_ifsc.text().strip(), uan_number=e_uan.text().strip(),
-                esic_number=e_esic.text().strip(), joining_date=e_join.text().strip(),
-                active=True, unit=e_unit.currentText(), skill_category=e_skill.currentText()))
-            self.clear_other_pages_cache()
-            self.set_message(f"✅ Worker {wid} saved!", SUCCESS)
-            clr(); refresh()
+            
+            def _op():
+                upsert_worker(Worker(
+                    worker_id=wid, name=name, designation=e_desig.text().strip(),
+                    bank_account=e_bank_acc.text().strip(), bank_name=bname,
+                    ifsc_code=e_ifsc.text().strip(), uan_number=e_uan.text().strip(),
+                    esic_number=e_esic.text().strip(), joining_date=e_join.text().strip(),
+                    active=True, unit=e_unit.currentText(), skill_category=e_skill.currentText()))
+            
+            try:
+                self.run_db_op(_op)
+                self.clear_other_pages_cache()
+                self.set_message(f"✅ Worker {wid} saved!", SUCCESS)
+                clr(); refresh()
+            except Exception as e:
+                self.set_message(f"⚠️ Failed to save worker: {e}", DANGER)
             
         btn_sv.clicked.connect(sv)
         fl.addWidget(btn_sv)
