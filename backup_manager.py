@@ -217,10 +217,24 @@ class BackupManager:
                 rows = conn.execute(
                     "SELECT * FROM workers ORDER BY name"
                 ).fetchall()
+            except sqlite3.OperationalError as e:
+                if "no such table" in str(e).lower():
+                    # Database not initialised yet — skip this sync cycle silently.
+                    logger.debug("_sync_csv: workers table not ready yet, skipping.")
+                    return
+                raise
             except sqlite3.DatabaseError:
                 # Corrupted index — fall back to row-by-row ROWID scan
                 logger.warning("_sync_csv: SELECT * failed, falling back to ROWID scan")
-                max_rowid = conn.execute("SELECT MAX(rowid) FROM workers").fetchone()[0] or 0
+                try:
+                    max_rowid = conn.execute(
+                        "SELECT MAX(rowid) FROM workers"
+                    ).fetchone()[0] or 0
+                except sqlite3.OperationalError as e2:
+                    if "no such table" in str(e2).lower():
+                        logger.debug("_sync_csv: workers table not ready yet, skipping.")
+                        return
+                    raise
                 rows = []
                 for rowid in range(1, max_rowid + 1):
                     try:

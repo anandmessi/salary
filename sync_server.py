@@ -535,14 +535,9 @@ def start(host_db_path: str) -> bool:
     """
     global _server_thread, _flask_app, _backup_manager
 
-    # Start backup manager on server startup
-    if _backup_manager is None:
-        try:
-            from backup_manager import BackupManager
-            _backup_manager = BackupManager(db_path=host_db_path, on_sync=lambda s, t: logger.info("Server Backup: %s at %s", s, t))
-            _backup_manager.start()
-        except Exception as e:
-            logger.error("Failed to start backup manager on server: %s", e)
+    # BackupManager is started by app.py's _finish_init() AFTER init_db().
+    # Do NOT start it here — the workers table may not exist yet.
+    pass
 
     try:
         _flask_app = _make_app(host_db_path)
