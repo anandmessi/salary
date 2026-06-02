@@ -1,9 +1,6 @@
 # Databases
-payroll.db
-payroll.db-wal
-payroll.db-shm
-payroll.db.*
-backup.db
+
+
 backup.db-wal
 backup.db-shm
 *.bak
