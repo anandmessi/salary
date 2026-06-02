@@ -25,6 +25,23 @@ from db_cache import cache
 
 logger = logging.getLogger(__name__)
 
+
+def _clean_num_str(val: str) -> str:
+    """Fix values stored as scientific notation e.g. '1.23456e+15'.
+    Safe no-op for normal strings like 'SBIN0001234'."""
+    if not val:
+        return val or ''
+    v = val.strip()
+    if 'e' in v or 'E' in v:
+        try:
+            f = float(v)
+            if f == int(f):
+                return str(int(f))
+        except (ValueError, OverflowError):
+            pass
+    return v
+
+
 # ── LAN CLIENT dispatch ────────────────────────────────────────────────────────
 # When set, all public DB calls are forwarded to the SyncClient (HTTP proxy).
 _sync_client = None   # type: Optional["sync_client.SyncClient"]
@@ -442,7 +459,14 @@ def get_all_workers(db_path=None, active_only=True):
     )
     with get_conn(db_path) as conn:
         rows = conn.execute(sql).fetchall()
-    result = [Worker.from_dict(dict(r)) for r in rows]
+    result = []
+    for r in rows:
+        w = Worker.from_dict(dict(r))
+        w.bank_account = _clean_num_str(w.bank_account)
+        w.ifsc_code    = _clean_num_str(w.ifsc_code)
+        w.uan_number   = _clean_num_str(w.uan_number)
+        w.esic_number  = _clean_num_str(w.esic_number)
+        result.append(w)
     cache.set(key, result)
     return result
 
@@ -546,7 +570,14 @@ def get_worker_by_id(worker_id, db_path=None):
         row = conn.execute(
             "SELECT * FROM workers WHERE worker_id=?", (worker_id,)
         ).fetchone()
-    return Worker.from_dict(dict(row)) if row else None
+    if not row:
+        return None
+    w = Worker.from_dict(dict(row))
+    w.bank_account = _clean_num_str(w.bank_account)
+    w.ifsc_code    = _clean_num_str(w.ifsc_code)
+    w.uan_number   = _clean_num_str(w.uan_number)
+    w.esic_number  = _clean_num_str(w.esic_number)
+    return w
 
 
 def import_workers_from_csv(filepath, db_path=None):

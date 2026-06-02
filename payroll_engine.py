@@ -8,7 +8,9 @@ Wages determined by SKILL CATEGORY:
 Deductions:
   EPF = 12% of Gross  if Gross < ₹15,000
         ₹1,800 flat   if Gross ≥ ₹15,000
-  ESI = 0.75% of Gross if gross ≤ ₹21,000 (Unskilled exempt)
+  ESI = 0.75% of Gross, applied only when the worker's
+        esi_applicable checkbox is ticked. No ceiling check.
+        No category exemption. Eligibility is per-worker only.
 """
 
 from __future__ import annotations

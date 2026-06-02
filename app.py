@@ -5,7 +5,7 @@ Professional native desktop payroll software.
 Run with:  python app.py
 """
 
-import os, sys, csv, datetime, threading, tempfile
+import os, sys, csv, datetime, threading, tempfile, shutil
 
 if getattr(sys, 'frozen', False):
     os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = os.path.join(
@@ -39,6 +39,7 @@ from database import (
     get_workers_and_attendance,
     close_thread_conn,
     DB_PATH,
+    save_payroll_run, get_payroll_runs, get_payroll_run,
 )
 from payroll_engine import calculate_payroll, payroll_summary
 from pdf_generator import generate_bulk_pdfs, generate_slip_pdf
@@ -1129,7 +1130,7 @@ class PayrollApp(QMainWindow):
         f1 = QLabel("🟢 Zero-Cost Payroll System")
         f1.setStyleSheet(f"font-size: 10px; font-weight: bold; color: {SUCCESS};")
         fl.addWidget(f1)
-        f2 = QLabel("Python • SQLite • 2026")
+        f2 = QLabel(f"Python • SQLite • {datetime.date.today().year}")
         f2.setStyleSheet(f"font-size: 10px; color: {TEXT_MUTED};")
         fl.addWidget(f2)
         sl.addWidget(foot)
@@ -1382,10 +1383,13 @@ class PayrollApp(QMainWindow):
                 snap_btn.setStyleSheet(f"background-color: {SUCCESS}; height: 32px; font-weight: bold;")
                 def save_snapshot():
                     import json, datetime
-                    from database import save_payroll_run
                     rj = json.dumps([r.to_dict() for r in results])
                     save_payroll_run(month, datetime.datetime.now().isoformat(), s["total_gross"], s["total_net"], s["total_workers"], rj)
                     self.set_message("✅ Payroll run snapshot saved!", SUCCESS)
+                try:
+                    snap_btn.clicked.disconnect()
+                except TypeError:
+                    pass
                 snap_btn.clicked.connect(save_snapshot)
 
                 hist_btn = QPushButton("📚 View Audit Logs")
@@ -1929,6 +1933,41 @@ class PayrollApp(QMainWindow):
             table.blockSignals(False)
         table.itemSelectionChanged.connect(_sync_checkboxes)
 
+        def _prefill_form():
+            try:
+                if not e_id:
+                    return
+            except NameError:
+                return
+            sel = table.selectionModel().selectedRows()
+            if not sel:
+                return
+            wid_item = table.item(sel[0].row(), 1)   # col 1 = worker_id
+            if not wid_item:
+                return
+            w = get_worker_by_id(wid_item.text())
+            if not w:
+                return
+            e_id.setText(w.worker_id)
+            e_name.setText(w.name)
+            e_desig.setText(w.designation or "")
+            e_bank_acc.setText(w.bank_account or "")
+            e_ifsc.setText(w.ifsc_code or "")
+            e_uan.setText(w.uan_number or "")
+            e_esic.setText(w.esic_number or "")
+            e_join.setText(w.joining_date or "")
+            idx = e_skill.findText(w.skill_category or "")
+            if idx >= 0:
+                e_skill.setCurrentIndex(idx)
+            idx2 = e_unit.findText(w.unit or "")
+            if idx2 >= 0:
+                e_unit.setCurrentIndex(idx2)
+            idx3 = e_bank_name.findText(w.bank_name or "")
+            if idx3 >= 0:
+                e_bank_name.setCurrentIndex(idx3)
+
+        table.itemSelectionChanged.connect(_prefill_form)
+
         def _item_changed(item):
             if item.column() == 0:
                 table.blockSignals(True)
@@ -2394,6 +2433,9 @@ class PayrollApp(QMainWindow):
                     self._pdf_thread = FetchThread(do)
                     self._pdf_thread.result_ready.connect(
                         lambda paths: self.set_message(f"✅ {len(paths)} slip(s) saved → {od}", SUCCESS))
+                    self._pdf_thread.finished.connect(
+                        lambda t=self._pdf_thread: self._active_threads.discard(t))
+                    self._active_threads.add(self._pdf_thread)
                     self._pdf_thread.start()
 
                 # ── All as ZIP ─────────────────────────────────────────────
@@ -2405,7 +2447,6 @@ class PayrollApp(QMainWindow):
                     snap = list(filtered)
                     self.set_message(f"⏳ Generating {len(snap)} slip(s)...", ACCENT)
                     def do():
-                        import shutil
                         td = tempfile.mkdtemp()
                         gen = generate_bulk_pdfs(snap, get_config(), td, zip_output=True, zip_only=True)
                         if gen.get("zip_path"): shutil.move(gen["zip_path"], path)
@@ -2413,6 +2454,9 @@ class PayrollApp(QMainWindow):
                     self._pdf_zip_thread = FetchThread(do)
                     self._pdf_zip_thread.result_ready.connect(
                         lambda _: self.set_message(f"✅ ZIP saved — {len(snap)} slips!", SUCCESS))
+                    self._pdf_zip_thread.finished.connect(
+                        lambda t=self._pdf_zip_thread: self._active_threads.discard(t))
+                    self._active_threads.add(self._pdf_zip_thread)
                     self._pdf_zip_thread.start()
 
                 gen_sel_btn.clicked.connect(gen_selected)
@@ -2451,6 +2495,19 @@ class PayrollApp(QMainWindow):
         v3 = QVBoxLayout(); v3.addWidget(QLabel("Phone")); v3.addWidget(e_ph); r2.addLayout(v3)
         v4 = QVBoxLayout(); v4.addWidget(QLabel("Email")); v4.addWidget(e_em); r2.addLayout(v4)
         gl.addLayout(r2)
+
+        r_wd = QHBoxLayout()
+        v_wd = QVBoxLayout()
+        v_wd.addWidget(QLabel("Working Days / Month",
+                       styleSheet=f"color: {TEXT_SECONDARY}; font-size: 10px;"))
+        e_wd = QLineEdit(str(cfg.working_days))
+        e_wd.setFixedWidth(80)
+        e_wd.setPlaceholderText("26")
+        v_wd.addWidget(e_wd)
+        r_wd.addLayout(v_wd)
+        r_wd.addStretch()
+        gl.addLayout(r_wd)
+
         cfl.addLayout(gl)
         
         cfl.addWidget(QLabel("⚖️ Statutory Rates", styleSheet="font-size: 15px; font-weight: bold; margin-top: 10px;"))
@@ -2466,8 +2523,18 @@ class PayrollApp(QMainWindow):
             try:
                 epf = float(e_epf.text())
                 esi = float(e_esi.text())
-            except: return
-            save_config(CompanyConfig(e_cn.text(), e_a1.text(), e_a2.text(), e_ph.text(), e_em.text(), 26, epf, esi, cfg.esi_ceiling, ""))
+                wd_text = e_wd.text().strip()
+                wd = int(wd_text) if wd_text.isdigit() else cfg.working_days
+            except:
+                return
+            save_config(CompanyConfig(
+                e_cn.text(), e_a1.text(), e_a2.text(),
+                e_ph.text(), e_em.text(),
+                wd,                  # from the new e_wd field
+                epf, esi,
+                cfg.esi_ceiling,     # preserved silently — NO UI widget
+                cfg.target_email,    # preserved — do NOT wipe to ""
+            ))
             self.set_message("✅ Settings saved!", SUCCESS)
         bs.clicked.connect(sv); cfl.addWidget(bs)
 
@@ -2758,14 +2825,15 @@ class PayrollApp(QMainWindow):
         layout.addWidget(btn_row)
 
         _results_cache = []
+        _warn_lbl_ref = [None]
 
         def refresh():
-            if hasattr(self, '_pr_warn_lbl') and self._pr_warn_lbl is not None:
+            if _warn_lbl_ref[0] is not None:
                 try:
-                    self._pr_warn_lbl.deleteLater()
+                    _warn_lbl_ref[0].deleteLater()
                 except RuntimeError:
                     pass
-                self._pr_warn_lbl = None
+                _warn_lbl_ref[0] = None
 
             sync_combo(m_cb, month_options())
             sync_combo(u_cb, _unit_filter_list())
@@ -2793,16 +2861,17 @@ class PayrollApp(QMainWindow):
                 
                 # Check for wage rate warning and display a red warning banner
                 if any("No wage rates configured" in w for w in warnings):
-                    self._pr_warn_lbl = QLabel(
+                    warn_lbl = QLabel(
                         "⚠️  No wage rates configured — all amounts are ₹0. "
                         "Go to Wage Rates tab first."
                     )
-                    self._pr_warn_lbl.setStyleSheet(
+                    warn_lbl.setStyleSheet(
                         f"background: {DANGER}; color: white; padding: 8px 12px; "
                         f"border-radius: 6px; font-weight: bold;"
                     )
-                    self._pr_warn_lbl.setWordWrap(True)
-                    layout.insertWidget(1, self._pr_warn_lbl)
+                    warn_lbl.setWordWrap(True)
+                    layout.insertWidget(1, warn_lbl)
+                    _warn_lbl_ref[0] = warn_lbl
                 if q:
                     results = [r for r in results if q in r.worker_name.lower() or q in r.worker_id.lower()]
                 _results_cache = results
@@ -2825,7 +2894,7 @@ class PayrollApp(QMainWindow):
             if path:
                 try:
                     with open(path, "w", newline="", encoding="utf-8-sig") as f:
-                        writer = csv.writer(f)
+                        writer = csv.writer(f, quoting=csv.QUOTE_ALL)
                         writer.writerow(["Emp name", "Total Sal", "IFSC Code", "Account Number"])
                         for r in _results_cache:
                             writer.writerow([r.worker_name, round(r.net_pay, 2), r.ifsc_code, r.bank_account])
@@ -2847,7 +2916,6 @@ class PayrollApp(QMainWindow):
 
     def _show_audit_logs(self):
         from PyQt6.QtWidgets import QDialog, QTableWidget, QTableWidgetItem, QHeaderView, QVBoxLayout, QPushButton, QHBoxLayout, QWidget, QMessageBox, QFileDialog
-        from database import get_payroll_runs, get_payroll_run
         import json
         from pdf_generator import generate_bulk_pdfs
         from schema import PayrollResult
@@ -2857,9 +2925,20 @@ class PayrollApp(QMainWindow):
         dlg.resize(850, 450)
         lay = QVBoxLayout(dlg)
         
-        runs = get_payroll_runs()
+        try:
+            runs = get_payroll_runs()
+        except Exception as e:
+            lay.addWidget(QLabel(
+                f"⚠️ Could not load payroll history: {e}\n"
+                "Save a Snapshot from the Dashboard first."
+            ))
+            dlg.exec()
+            return
         if not runs:
-            lay.addWidget(QLabel("No payroll runs saved yet."))
+            lay.addWidget(QLabel(
+                "No payroll runs saved yet.\n"
+                "Go to Dashboard → 'Snapshot / Save Payroll Run'."
+            ))
             dlg.exec()
             return
             

@@ -3,6 +3,19 @@ from database import upsert_worker
 from schema import Worker
 
 
+def _safe_cell_str(val) -> str:
+    """Convert openpyxl cell value to clean string.
+    Whole-number floats (account numbers, UAN, ESIC) are returned
+    as plain integers to avoid scientific notation."""
+    if val is None:
+        return ''
+    if isinstance(val, float):
+        if val == int(val):
+            return str(int(val))
+        return str(val)
+    return str(val).strip()
+
+
 def import_employees(filepath='employee.xlsx') -> dict:
     """
     Import workers from Excel file.
@@ -54,8 +67,8 @@ def import_employees(filepath='employee.xlsx') -> dict:
             w = Worker(
                 worker_id=worker_id,
                 name=str(name).strip(),
-                ifsc_code=str(ifsc).strip() if ifsc else '',
-                bank_account=str(acct).strip() if acct else '',
+                ifsc_code=_safe_cell_str(ifsc),
+                bank_account=_safe_cell_str(acct),
                 skill_category='Unskilled',
                 active=True,
             )

@@ -101,17 +101,6 @@ def _make_app(host_db_path: str):
     def ping():
         return jsonify({"status": "ok", "version": 1, "ts": _last_change_ts})
 
-    @app.route("/api/db_mtime")
-    def db_mtime():
-        """Get the modification time and change counter of the database file."""
-        try:
-            import os
-            mtime = os.path.getmtime(host_db_path)
-            cc = _get_db_change_counter(host_db_path)
-            return jsonify({"mtime": mtime, "change_counter": cc})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
     @app.route("/api/db/version_info", methods=["GET"])
     def db_version_info():
         import sqlite3, os, time as _time
