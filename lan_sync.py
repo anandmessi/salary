@@ -198,8 +198,20 @@ class LanSync:
         sock.settimeout(DISCOVER_TIMEOUT)
         try:
             sock.bind(("", 0))
+            # Broadcast to standard broadcast address (255.255.255.255)
             sock.sendto(DISCOVER_MSG, (BROADCAST_ADDR, DISCOVER_PORT))
-            logger.debug("Sent discovery broadcast packet from %s", self._local_ip)
+            logger.debug("Sent discovery broadcast packet to %s from %s", BROADCAST_ADDR, self._local_ip)
+            
+            # Also broadcast to subnet-specific broadcast address (handles Windows multi-interface routing bugs)
+            if self._local_ip and self._local_ip != "127.0.0.1":
+                parts = self._local_ip.split(".")
+                if len(parts) == 4:
+                    subnet_broadcast = ".".join(parts[:3]) + ".255"
+                    try:
+                        sock.sendto(DISCOVER_MSG, (subnet_broadcast, DISCOVER_PORT))
+                        logger.debug("Sent discovery broadcast packet to subnet-specific %s", subnet_broadcast)
+                    except Exception as b_err:
+                        logger.debug("Failed to send subnet-specific broadcast to %s: %s", subnet_broadcast, b_err)
             
             deadline = time.time() + DISCOVER_TIMEOUT
             while time.time() < deadline:
