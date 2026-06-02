@@ -668,7 +668,6 @@ def _safe_delete(widget):
 
 class PayrollApp(QMainWindow):
     backup_sync_signal = pyqtSignal(str, str)
-    lan_role_decided_signal = pyqtSignal(str, str, str)
 
     def __init__(self):
         super().__init__()
@@ -678,7 +677,6 @@ class PayrollApp(QMainWindow):
         self._loading_overlay = None    # assigned after sidebar+main area are built
         self._refresh_timer = None      # debounce timer for LAN-sync refresh (see _schedule_refresh)
         self.backup_sync_signal.connect(self._update_backup_label)
-        self.lan_role_decided_signal.connect(self._on_lan_role_decided)
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — Professional Payroll Management")
         self.resize(1300, 800)
         self.setMinimumSize(1050, 650)
@@ -735,20 +733,21 @@ class PayrollApp(QMainWindow):
                 )
                 self._sync_client = None
                 self._lan_role = "standalone"
-            QTimer.singleShot(0, self._finish_init)
         else:
-            # Automatic LAN Discovery Mode
-            self._lan_role = "detecting"
-            
-            try:
-                from lan_sync import LanSync
-                self._lan_sync = LanSync(get_active_db_path(), self._on_lan_role_decided_bg)
-                self._lan_sync.start()
-            except Exception as e:
-                import logging as _logging
-                _logging.error("Failed to start LAN auto-discovery: %s. Running standalone.", e)
-                self._lan_role = "standalone"
-                QTimer.singleShot(0, self._finish_init)
+            # Use LanSync UDP discovery to automatically elect Host vs Client.
+            # _finish_init() is called from on_role_decided on the main thread
+            # via QMetaObject.invokeMethod — NOT by QTimer.singleShot here.
+            from lan_sync import LanSync
+            from schema import get_active_db_path as _get_db
+            self._lan_sync = LanSync(
+                local_db_path=_get_db(),
+                on_role_decided=self._on_lan_role_decided,
+            )
+            self._lan_sync.start()
+            return   # ← _finish_init will be called by _on_lan_role_decided
+
+        # Only reached in manual server_config mode (client with saved IP)
+        QTimer.singleShot(0, self._finish_init)
 
     def closeEvent(self, event):
         # 1. Stop background SyncClient polling
@@ -809,39 +808,49 @@ class PayrollApp(QMainWindow):
             except RuntimeError:
                 self._loading_overlay = None
 
-    def _on_lan_role_decided_bg(self, role, db_path, peer_name, host_ip):
-        """Callback from background LanSync thread."""
-        self.lan_role_decided_signal.emit(role, peer_name or "", host_ip or "")
-
-    @pyqtSlot(str, str, str)
-    def _on_lan_role_decided(self, role, peer_name, host_ip):
-        """Called on the main thread after LAN discovery completes."""
-        self._lan_role = role
-        self._lan_peer = peer_name if peer_name else None
-        self._lan_host_ip = host_ip if host_ip else None
+    def _on_lan_role_decided(self, role: str, db_path: str,
+                              peer_name, host_ip):
+        """
+        Called by LanSync background thread when Host/Client/Standalone
+        role is determined. Marshals back to the main thread then calls
+        _finish_init().
+        """
+        import database as _db_mod
+        from schema import set_active_db_path
 
         if role == "client":
             try:
                 from sync_client import SyncClient
-                import database as _db_mod
                 self._sync_client = SyncClient(
-                    host_ip=host_ip, port=5050
+                    host_ip=host_ip,
+                    port=__import__('sync_server').SYNC_PORT,
                 )
                 _db_mod.set_sync_client(self._sync_client)
+                self._lan_role    = "client"
+                self._lan_peer    = peer_name
+                self._lan_host_ip = host_ip
             except Exception as e:
-                import logging as _logging
-                _logging.error("Failed to create SyncClient for auto-discovered host %s: %s", host_ip, e)
+                import logging as _lg
+                _lg.error("Failed to create SyncClient for %s: %s", host_ip, e)
                 self._lan_role = "standalone"
                 self._sync_client = None
-        elif role == "host":
-            try:
-                import sync_server
-                sync_server.set_change_callback(self._on_host_data_changed)
-            except Exception as e:
-                import logging as _logging
-                _logging.error("Failed to set change callback on auto-discovered host server: %s", e)
 
-        self._finish_init()
+        elif role == "host":
+            from sync_server import get_local_ips, set_change_callback
+            self._lan_role    = "host"
+            self._lan_host_ip = host_ip
+            self._lan_peer    = None
+            set_change_callback(self._on_host_data_changed)
+
+        else:  # standalone
+            self._lan_role    = "standalone"
+            self._lan_host_ip = None
+            self._lan_peer    = None
+
+        # Marshal to main thread to call _finish_init safely
+        QMetaObject.invokeMethod(
+            self, "_finish_init", Qt.ConnectionType.QueuedConnection
+        )
 
     @pyqtSlot()
     def _finish_init(self):
