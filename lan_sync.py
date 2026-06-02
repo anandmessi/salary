@@ -19,7 +19,7 @@ DISCOVER_PORT    = 5051
 DISCOVER_MSG     = b"PAYROLLPRO_DISCOVER"
 HOST_PREFIX      = b"PAYROLLPRO_HOST|"
 BROADCAST_ADDR   = "255.255.255.255"
-DISCOVER_TIMEOUT = 1.5    # seconds to wait for a host response
+DISCOVER_TIMEOUT = 4.0
 
 
 def _get_local_ip() -> str:
@@ -136,7 +136,27 @@ class LanSync:
                 import sync_server
                 ok = sync_server.start(self.local_db_path)
                 if ok:
-                    time.sleep(0.5)  # Wait briefly for Flask to bind
+                    time.sleep(2.0)  # Wait for Flask to fully bind before heartbeat
+                    
+                    # ── NEW: Final race-condition guard ──────────────────────────
+                    # Another PC may have also just become host in the same window.
+                    # Do one final discovery check before committing to Host role.
+                    host_ip2, peer_name2 = self._discover_host()
+                    if host_ip2 and self._check_server_reachable(host_ip2):
+                        # The other machine won the race — we become Client instead.
+                        logger.warning(
+                            "Race condition: another host appeared at %s (%s). "
+                            "Stopping local server and switching to Client role.",
+                            host_ip2, peer_name2
+                        )
+                        sync_server.stop()
+                        self._role      = "client"
+                        self._peer_name = peer_name2
+                        self._host_ip   = host_ip2
+                        self._on_role("client", self.local_db_path, peer_name2, host_ip2)
+                        return
+                    # ── END race-condition guard ──────────────────────────────────
+                    
                     self._role      = "host"
                     self._peer_name = None
                     self._host_ip   = self._local_ip
