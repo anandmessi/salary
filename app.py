@@ -2159,17 +2159,106 @@ class PayrollApp(QMainWindow):
         fl.addWidget(btn_sv)
         al.addWidget(form); al.addStretch()
         
-        self._build_workers_csv(cl)
+        self._build_workers_bulk_import(cl)
 
-    def _build_workers_csv(self, layout):
-        layout.addWidget(QLabel("Upload a CSV to import new workers in bulk.", styleSheet=f"color: {TEXT_SECONDARY};"))
-        info = QFrame(); info.setObjectName("card"); il = QVBoxLayout(info)
-        il.addWidget(QLabel("<b>Supported columns:</b>"))
-        il.addWidget(QLabel("worker_id, name, designation, bank_account, bank_name, ifsc_code,\nuan_number, esic_number, joining_date, active, unit, skill_category", styleSheet=f"color: {TEXT_MUTED}; font-size: 10px;"))
-        layout.addWidget(info)
+    def _build_workers_bulk_import(self, layout):
+        layout.addWidget(QLabel("📦 Bulk Worker Import", styleSheet="font-size: 15px; font-weight: bold; margin-bottom: 4px;"))
+        layout.addWidget(QLabel("Choose either Excel or CSV format to import workers in bulk.", styleSheet=f"color: {TEXT_SECONDARY}; font-size: 11px; margin-bottom: 10px;"))
+
+        # ── EXCEL IMPORT CARD ────────────────────────────────────────────────
+        xlsx_card = QFrame(); xlsx_card.setObjectName("card")
+        xl = QVBoxLayout(xlsx_card); xl.setContentsMargins(14, 12, 14, 12); xl.setSpacing(8)
         
-        def dl():
-            path, _ = QFileDialog.getSaveFileName(self, "Save Template", "workers_template.csv", "CSV (*.csv)")
+        xl.addWidget(QLabel("<b>🟢 Option A: Excel (.xlsx)</b>", styleSheet=f"color: {SUCCESS};"))
+        xl.addWidget(QLabel("Import standard employee list with basic bank details.", styleSheet=f"color: {TEXT_SECONDARY}; font-size: 10px;"))
+        
+        headers_info = QFrame(); headers_info.setStyleSheet(f"background-color: {SURFACE_3}; border-radius: 4px; border: 1px solid {CARD_BORDER};")
+        hl = QVBoxLayout(headers_info); hl.setContentsMargins(8, 6, 8, 6)
+        hl.addWidget(QLabel("<b>Required Columns (Starting Row 3):</b>\nCol A: Employee ID / S.No\nCol B: Employee Name\nCol C: IFSC Code\nCol D: Bank Account No", styleSheet=f"color: {TEXT_SECONDARY}; font-size: 9px;"))
+        xl.addWidget(headers_info)
+        
+        btn_row_xl = QHBoxLayout()
+        def dl_xlsx():
+            path, _ = QFileDialog.getSaveFileName(self, "Save Excel Template", "workers_template.xlsx", "Excel (*.xlsx)")
+            if path:
+                try:
+                    import openpyxl
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = "Employees"
+                    # Title block
+                    ws.cell(row=1, column=1, value="PayrollPro Employee Import Template")
+                    ws.cell(row=1, column=2, value="Data must start from Row 3")
+                    # Column Headers
+                    ws.cell(row=2, column=1, value="Employee ID / S.No")
+                    ws.cell(row=2, column=2, value="Employee Name")
+                    ws.cell(row=2, column=3, value="IFSC Code")
+                    ws.cell(row=2, column=4, value="Bank Account No")
+                    # Sample row
+                    ws.cell(row=3, column=1, value=1)
+                    ws.cell(row=3, column=2, value="John Doe")
+                    ws.cell(row=3, column=3, value="SBIN0001234")
+                    ws.cell(row=3, column=4, value="1234567890")
+                    
+                    wb.save(path)
+                    self.set_message("✅ Excel template downloaded successfully!", SUCCESS)
+                except Exception as e:
+                    QMessageBox.critical(self, "Template Error", f"Failed to generate template: {e}")
+                    
+        b_dl_xl = QPushButton("📥 Excel Template")
+        b_dl_xl.setStyleSheet(f"background-color: {SURFACE_3}; font-size: 11px;")
+        b_dl_xl.clicked.connect(dl_xlsx)
+        
+        def imp_xlsx():
+            fp, _ = QFileDialog.getOpenFileName(self, "Open Excel File", "", "Excel Files (*.xlsx *.xls)")
+            if fp:
+                try:
+                    from import_excel import import_employees
+                    res = import_employees(fp)
+                    if res["errors"]:
+                        err_path = os.path.join(os.path.dirname(fp), "excel_import_errors.txt")
+                        with open(err_path, "w") as f:
+                            f.write("\n".join(res["errors"]))
+                        QMessageBox.warning(
+                            self, "Import Warnings/Errors", 
+                            f"Imported {res['imported']} workers.\nEncountered {len(res['errors'])} errors/skips.\n\nDetails saved to: {err_path}"
+                        )
+                    else:
+                        self.set_message(f"✅ Imported {res['imported']} workers successfully!", SUCCESS)
+                    
+                    # Refresh the table and database cache
+                    from db_cache import cache as _db_cache
+                    _db_cache.clear()
+                    self._navigate("workers")
+                except Exception as e:
+                    QMessageBox.critical(self, "Import Failed", f"An error occurred during Excel import:\n{e}")
+
+        b_imp_xl = QPushButton("📁 Import Excel")
+        b_imp_xl.setStyleSheet(f"background-color: {SUCCESS}; font-size: 11px; font-weight: bold;")
+        b_imp_xl.clicked.connect(imp_xlsx)
+        
+        btn_row_xl.addWidget(b_dl_xl)
+        btn_row_xl.addWidget(b_imp_xl)
+        xl.addLayout(btn_row_xl)
+        
+        layout.addWidget(xlsx_card)
+        layout.addSpacing(10)
+
+        # ── CSV IMPORT CARD ──────────────────────────────────────────────────
+        csv_card = QFrame(); csv_card.setObjectName("card")
+        cl = QVBoxLayout(csv_card); cl.setContentsMargins(14, 12, 14, 12); cl.setSpacing(8)
+        
+        cl.addWidget(QLabel("<b>🔵 Option B: CSV (.csv)</b>", styleSheet=f"color: {ACCENT};"))
+        cl.addWidget(QLabel("Import all 12 worker attributes including joining date, designation, etc.", styleSheet=f"color: {TEXT_SECONDARY}; font-size: 10px;"))
+        
+        headers_info_csv = QFrame(); headers_info_csv.setStyleSheet(f"background-color: {SURFACE_3}; border-radius: 4px; border: 1px solid {CARD_BORDER};")
+        hcl = QVBoxLayout(headers_info_csv); hcl.setContentsMargins(8, 6, 8, 6)
+        hcl.addWidget(QLabel("<b>Supported Columns (Row 1):</b>\nworker_id, name, designation, bank_account, bank_name, ifsc_code, uan_number, esic_number, joining_date, active, unit, skill_category", styleSheet=f"color: {TEXT_MUTED}; font-size: 9px;"))
+        cl.addWidget(headers_info_csv)
+        
+        btn_row_csv = QHBoxLayout()
+        def dl_csv():
+            path, _ = QFileDialog.getSaveFileName(self, "Save CSV Template", "workers_template.csv", "CSV (*.csv)")
             if path:
                 with open(path, "w", newline="") as f:
                     w = csv.writer(f)
@@ -2177,13 +2266,13 @@ class PayrollApp(QMainWindow):
                                 "uan_number","esic_number","joining_date","active","unit","skill_category"])
                     w.writerow(["EMP001","John Doe","Helper","123456789","SBI","SBIN0001234",
                                 "100000000000","2000000000","01/01/2026","1","Unit A","Unskilled"])
-        b1 = QPushButton("📥 Download Template")
-        b1.setStyleSheet(f"background-color: {SURFACE_3};")
-        b1.clicked.connect(dl)
-        b1.setFixedWidth(160)
-        layout.addWidget(b1)
+            self.set_message("✅ CSV template downloaded successfully!", SUCCESS)
+            
+        b_dl_csv = QPushButton("📥 CSV Template")
+        b_dl_csv.setStyleSheet(f"background-color: {SURFACE_3}; font-size: 11px;")
+        b_dl_csv.clicked.connect(dl_csv)
         
-        def imp():
+        def imp_csv():
             fp, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV (*.csv)")
             if fp:
                 try:
@@ -2195,15 +2284,23 @@ class PayrollApp(QMainWindow):
                         QMessageBox.warning(self, "Import Errors", f"Imported {res['imported']} workers.\nEncountered {len(res['errors'])} errors.\n\nDetails saved to: {err_path}")
                     else:
                         self.set_message(f"✅ Imported {res['imported']} workers.", SUCCESS)
+                    
+                    # Refresh the table and database cache
+                    from db_cache import cache as _db_cache
+                    _db_cache.clear()
                     self._navigate("workers")
                 except Exception as e:
-                    QMessageBox.critical(self, "Import Failed", f"An error occurred during import:\n{e}")
+                    QMessageBox.critical(self, "Import Failed", f"An error occurred during CSV import:\n{e}")
 
-                
-        b2 = QPushButton("📁 Import CSV")
-        b2.clicked.connect(imp)
-        b2.setFixedWidth(160)
-        layout.addWidget(b2)
+        b_imp_csv = QPushButton("📁 Import CSV")
+        b_imp_csv.setStyleSheet(f"background-color: {ACCENT}; font-size: 11px; font-weight: bold;")
+        b_imp_csv.clicked.connect(imp_csv)
+        
+        btn_row_csv.addWidget(b_dl_csv)
+        btn_row_csv.addWidget(b_imp_csv)
+        cl.addLayout(btn_row_csv)
+        
+        layout.addWidget(csv_card)
         layout.addStretch()
 
     # ══════════════════════════════════════════════════════════════════════
