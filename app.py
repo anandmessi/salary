@@ -1235,6 +1235,40 @@ class PayrollApp(QMainWindow):
         if auto_clear and color != DANGER:
             QTimer.singleShot(4000, lambda: self.set_message("Ready", TEXT_MUTED, False))
 
+    def clear_other_pages_cache(self):
+        """Discards all cached page widgets except the currently visible one.
+        Ensures that when any data changes on one tab, all other tabs are
+        forced to perform a fresh database query and UI rebuild when navigated to.
+        Also invalidates the database's cache and, in client mode, synchronously
+        downloads the latest database from the host to ensure immediate data consistency.
+        """
+        try:
+            from db_cache import cache as _db_cache
+            _db_cache.clear()
+        except Exception:
+            pass
+
+        if getattr(self, '_sync_client', None) is not None:
+            try:
+                from schema import get_active_db_path
+                self._sync_client.download_db_file(get_active_db_path())
+            except Exception as e:
+                import logging as _logging
+                _logging.warning("Failed to force pull database in clear_other_pages_cache: %s", e)
+
+        current = getattr(self, '_current_page_key', None)
+        if not current:
+            return
+        keys = list(self._page_cache.keys())
+        for k in keys:
+            if k != current:
+                widget = self._page_cache.pop(k)
+                try:
+                    self.stack.removeWidget(widget)
+                    widget.deleteLater()
+                except Exception:
+                    pass
+
     def _navigate(self, key, _background_refresh: bool = False):
         # Fix #1: invalidate in-flight renders — skip when refreshing in the background
         # so a LAN-sync-triggered rebuild does not cancel the page's own data fetch.
@@ -1849,6 +1883,7 @@ class PayrollApp(QMainWindow):
 
             bulk_upsert_attendance(records)
             _invalidate_month_options_cache()   # Fix #5: refresh month list after save
+            self.clear_other_pages_cache()
             self.set_message(f"✅ Saved {len(records)} records for {month}", SUCCESS)
 
         m_cb.currentTextChanged.connect(refresh)
@@ -1901,6 +1936,7 @@ class PayrollApp(QMainWindow):
                         QMessageBox.warning(self, "Import Errors", f"Imported {res['imported']} records.\nEncountered {len(res['errors'])} errors.\n\nDetails saved to: {err_path}")
                     else:
                         self.set_message(f"✅ Imported {res['imported']} records.", SUCCESS)
+                    self.clear_other_pages_cache()
                     self._navigate("attendance")
                 except Exception as e:
                     QMessageBox.critical(self, "Import Failed", f"An error occurred during import:\n{e}")
@@ -1963,6 +1999,7 @@ class PayrollApp(QMainWindow):
                     esic_number=_get_txt(10),
                     joining_date=w_obj.joining_date if w_obj else "",
                     active=w_obj.active if w_obj else True))
+                self.clear_other_pages_cache()
                 self.set_message(f"✅ {wid} auto-saved!", SUCCESS)
             except Exception as e:
                 self.set_message(f"⚠️ Auto-save failed: {e}", DANGER)
@@ -2152,6 +2189,7 @@ class PayrollApp(QMainWindow):
                 ifsc_code=e_ifsc.text().strip(), uan_number=e_uan.text().strip(),
                 esic_number=e_esic.text().strip(), joining_date=e_join.text().strip(),
                 active=True, unit=e_unit.currentText(), skill_category=e_skill.currentText()))
+            self.clear_other_pages_cache()
             self.set_message(f"✅ Worker {wid} saved!", SUCCESS)
             clr(); refresh()
             
@@ -2229,6 +2267,7 @@ class PayrollApp(QMainWindow):
                     # Refresh the table and database cache
                     from db_cache import cache as _db_cache
                     _db_cache.clear()
+                    self.clear_other_pages_cache()
                     self._navigate("workers")
                 except Exception as e:
                     QMessageBox.critical(self, "Import Failed", f"An error occurred during Excel import:\n{e}")
@@ -2288,6 +2327,7 @@ class PayrollApp(QMainWindow):
                     # Refresh the table and database cache
                     from db_cache import cache as _db_cache
                     _db_cache.clear()
+                    self.clear_other_pages_cache()
                     self._navigate("workers")
                 except Exception as e:
                     QMessageBox.critical(self, "Import Failed", f"An error occurred during CSV import:\n{e}")
@@ -2371,6 +2411,7 @@ class PayrollApp(QMainWindow):
                 dw = float(ed.text() or 0)
                 ot = float(eo.text() or 0)
                 upsert_skill_wage(SkillWage(cat, dw, ot))
+                self.clear_other_pages_cache()
                 self.set_message(f"✅ {cat} wage auto-saved!", SUCCESS)
             except Exception as exc:
                 self.set_message(f"⚠️ Failed to save {cat}: {exc}", DANGER)
@@ -2405,6 +2446,7 @@ class PayrollApp(QMainWindow):
                     failed += 1
                     self.set_message(f"⚠️ Error saving {cat}: {exc}", DANGER)
             if not failed:
+                self.clear_other_pages_cache()
                 self.set_message(f"✅ All {saved} wage rates saved!", SUCCESS)
 
         bs = QPushButton("💾 Save All Wage Rates")
@@ -2676,17 +2718,19 @@ class PayrollApp(QMainWindow):
                 esi = float(e_esi.text())
                 wd_text = e_wd.text().strip()
                 wd = int(wd_text) if wd_text.isdigit() else cfg.working_days
-            except:
-                return
-            save_config(CompanyConfig(
-                e_cn.text(), e_a1.text(), e_a2.text(),
-                e_ph.text(), e_em.text(),
-                wd,                  # from the new e_wd field
-                epf, esi,
-                cfg.esi_ceiling,     # preserved silently — NO UI widget
-                cfg.target_email,    # preserved — do NOT wipe to ""
-            ))
-            self.set_message("✅ Settings saved!", SUCCESS)
+                
+                save_config(CompanyConfig(
+                    e_cn.text(), e_a1.text(), e_a2.text(),
+                    e_ph.text(), e_em.text(),
+                    wd,                  # from the new e_wd field
+                    epf, esi,
+                    cfg.esi_ceiling,     # preserved silently — NO UI widget
+                    cfg.target_email,    # preserved — do NOT wipe to ""
+                ))
+                self.clear_other_pages_cache()
+                self.set_message("✅ Settings saved!", SUCCESS)
+            except Exception as e:
+                self.set_message(f"⚠️ Failed to save settings: {e}", DANGER)
         bs.clicked.connect(sv); cfl.addWidget(bs)
 
         # Bank Management Section
@@ -2723,10 +2767,10 @@ class PayrollApp(QMainWindow):
                 
                 def ren(bn=b):
                     nn, ok = QInputDialog.getText(self, "Rename Bank", f"Rename '{bn}' to:")
-                    if ok and nn.strip(): update_bank(bn, nn.strip()); refresh_banks()
+                    if ok and nn.strip(): update_bank(bn, nn.strip()); self.clear_other_pages_cache(); refresh_banks()
                 def rem(bn=b):
                     if QMessageBox.question(self, "Delete Bank", f"Delete '{bn}'?") == QMessageBox.StandardButton.Yes:
-                        delete_bank(bn); refresh_banks()
+                        delete_bank(bn); self.clear_other_pages_cache(); refresh_banks()
                 br = QPushButton("✏️ Rename"); br.clicked.connect(ren); b_row_lay.addWidget(br)
                 bd = QPushButton("🗑️"); bd.setStyleSheet(f"background-color: {DANGER};"); bd.clicked.connect(rem); b_row_lay.addWidget(bd)
                 bank_list_lay.addWidget(b_row)
@@ -2735,7 +2779,7 @@ class PayrollApp(QMainWindow):
         def add_bank_action():
             n = e_b_new.text().strip()
             if n:
-                try: add_bank(n); e_b_new.clear(); refresh_banks()
+                try: add_bank(n); self.clear_other_pages_cache(); e_b_new.clear(); refresh_banks()
                 except Exception as e: QMessageBox.warning(self, "Error", str(e))
                 
         btn_b_add.clicked.connect(add_bank_action)
