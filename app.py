@@ -1590,8 +1590,10 @@ class PayrollApp(QMainWindow):
     # ══════════════════════════════════════════════════════════════════════
     def _page_attendance(self, layout):
         _page_header(layout, "📋  Attendance & Earnings Entry", "Enter daily attendance and manage per-worker allowances / deductions")
+        # Clear AlignTop so the tab widget (with stretch=1) fills the available height
+        layout.setAlignment(Qt.AlignmentFlag(0))
         tabs = QTabWidget()
-        cw = QWidget(); cwl = QVBoxLayout(cw); cwl.setContentsMargins(28, 0, 28, 20); cwl.addWidget(tabs); layout.addWidget(cw, 1)
+        cw = QWidget(); cwl = QVBoxLayout(cw); cwl.setContentsMargins(28, 0, 28, 20); cwl.addWidget(tabs, 1); layout.addWidget(cw, 1)
         
         tab_man = QWidget(); tm_l = QVBoxLayout(tab_man)
         tab_csv = QWidget(); tc_l = QVBoxLayout(tab_csv)
