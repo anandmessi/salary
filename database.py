@@ -59,6 +59,20 @@ def get_sync_client():
     return _sync_client
 
 
+def _notify_host_change():
+    """Bump the sync-server write-version so connected clients detect the change.
+
+    Called at the end of every local write in HOST / standalone mode.
+    Safe to call when the sync server is not running — the import will fail
+    silently and the call is a no-op.
+    """
+    try:
+        import sync_server as _ss
+        _ss._bump_change()
+    except Exception:
+        pass
+
+
 # ── Runtime DB path resolver ───────────────────────────────────────────────────
 def _db(db_path):
     """Return db_path unchanged, or the current active runtime path if None."""
@@ -288,6 +302,7 @@ def upsert_skill_wage(sw: SkillWage, db_path=None):
             (sw.skill_category, sw.daily_wage, sw.ot_rate),
         )
     cache.invalidate(f"skill_wages:{db_path}")
+    _notify_host_change()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -319,6 +334,7 @@ def add_bank(name: str, db_path=None):
     with get_conn(db_path) as conn:
         conn.execute("INSERT INTO banks(name) VALUES(?)", (name.strip(),))
     cache.invalidate(f"banks:{db_path}")
+    _notify_host_change()
 
 
 def update_bank(old_name: str, new_name: str, db_path=None):
@@ -338,6 +354,7 @@ def update_bank(old_name: str, new_name: str, db_path=None):
         f"workers:{db_path}:active",
         f"workers:{db_path}:all",
     )
+    _notify_host_change()
 
 
 def delete_bank(name: str, db_path=None):
@@ -349,6 +366,7 @@ def delete_bank(name: str, db_path=None):
     with get_conn(db_path) as conn:
         conn.execute("DELETE FROM banks WHERE name=?", (name,))
     cache.invalidate(f"banks:{db_path}")
+    _notify_host_change()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -379,6 +397,7 @@ def add_unit(name: str, db_path=None):
     with get_conn(db_path) as conn:
         conn.execute("INSERT INTO units(name) VALUES(?)", (name.strip(),))
     cache.invalidate(f"units:{db_path}")
+    _notify_host_change()
 
 
 def rename_unit(old_name: str, new_name: str, db_path=None):
@@ -397,6 +416,7 @@ def rename_unit(old_name: str, new_name: str, db_path=None):
         f"workers:{db_path}:all",
         f"unit_worker_count:{db_path}",
     )
+    _notify_host_change()
 
 
 def delete_unit(name: str, db_path=None) -> int:
@@ -417,6 +437,7 @@ def delete_unit(name: str, db_path=None) -> int:
         f"workers:{db_path}:all",
         f"unit_worker_count:{db_path}",
     )
+    _notify_host_change()
     return count
 
 
@@ -515,6 +536,7 @@ def upsert_worker(w: Worker, db_path=None):
         f"workers:{db_path}:all",
         f"unit_worker_count:{db_path}",
     )
+    _notify_host_change()
 
 
 def deactivate_worker(worker_id, db_path=None):
@@ -529,6 +551,7 @@ def deactivate_worker(worker_id, db_path=None):
         f"workers:{db_path}:active", f"workers:{db_path}:all",
         f"unit_worker_count:{db_path}",
     )
+    _notify_host_change()
 
 
 def reactivate_worker(worker_id, db_path=None):
@@ -543,6 +566,7 @@ def reactivate_worker(worker_id, db_path=None):
         f"workers:{db_path}:active", f"workers:{db_path}:all",
         f"unit_worker_count:{db_path}",
     )
+    _notify_host_change()
 
 
 def delete_worker(worker_id, db_path=None):
@@ -559,6 +583,7 @@ def delete_worker(worker_id, db_path=None):
         f"unit_worker_count:{db_path}",
     )
     cache.invalidate_prefix(f"attendance:{db_path}:")
+    _notify_host_change()
 
 
 def get_worker_by_id(worker_id, db_path=None):
@@ -642,6 +667,7 @@ def import_workers_from_csv(filepath, db_path=None):
             f"workers:{db_path}:all",
             f"unit_worker_count:{db_path}",
         )
+        _notify_host_change()
     return {"imported": len(records), "errors": errors}
 
 
@@ -692,6 +718,7 @@ def upsert_attendance(a: AttendanceRecord, db_path=None):
             vals,
         )
     cache.invalidate(f"attendance:{db_path}:{a.month}", f"months_with_data:{db_path}")
+    _notify_host_change()
 
 
 def bulk_upsert_attendance(records: List[AttendanceRecord], db_path=None):
@@ -717,6 +744,7 @@ def bulk_upsert_attendance(records: List[AttendanceRecord], db_path=None):
     for m in months:
         cache.invalidate(f"attendance:{db_path}:{m}")
     cache.invalidate(f"months_with_data:{db_path}")
+    _notify_host_change()
 
 
 def delete_attendance_for_worker(worker_id: str, month: str = None, db_path=None):
@@ -736,6 +764,7 @@ def delete_attendance_for_worker(worker_id: str, month: str = None, db_path=None
             conn.execute("DELETE FROM attendance WHERE worker_id=?", (worker_id,))
             cache.invalidate_prefix(f"attendance:{db_path}:")
     cache.invalidate(f"months_with_data:{db_path}")
+    _notify_host_change()
 
 
 def import_attendance_from_csv(filepath, month, db_path=None):
@@ -843,6 +872,7 @@ def save_config(cfg: CompanyConfig, db_path=None):
             (cfg.to_json(),),
         )
     cache.invalidate(f"config:{db_path}")
+    _notify_host_change()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

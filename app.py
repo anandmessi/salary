@@ -275,6 +275,15 @@ def _invalidate_month_options_cache():
     global _month_options_ts
     _month_options_ts = 0.0
 
+def _init_month_combo(cb):
+    """Populate *cb* with month_options() and pre-select the current month."""
+    opts = month_options()
+    cb.addItems(opts)
+    current = datetime.date.today().strftime("%Y-%m")
+    idx = cb.findText(current)
+    if idx >= 0:
+        cb.setCurrentIndex(idx)
+
 def fmt_inr(amount):
     s = f"{abs(amount):,.2f}"; p = s.split(".")
     n = p[0].replace(",", "")
@@ -1370,7 +1379,7 @@ class PayrollApp(QMainWindow):
         ctrl = QFrame(); ctrl.setObjectName("surface2")
         cl = QHBoxLayout(ctrl); cl.setContentsMargins(16, 10, 16, 10)
         cl.addWidget(QLabel("<b>Month:</b>"))
-        m_cb = QComboBox(); m_cb.addItems(month_options()); m_cb.setFixedWidth(140); cl.addWidget(m_cb)
+        m_cb = QComboBox(); _init_month_combo(m_cb); m_cb.setFixedWidth(140); cl.addWidget(m_cb)
         cl.addSpacing(20)
         cl.addWidget(QLabel("<b>Unit:</b>"))
         u_cb = QComboBox(); u_cb.addItems(_unit_filter_list()); u_cb.setFixedWidth(140); cl.addWidget(u_cb)
@@ -1601,7 +1610,7 @@ class PayrollApp(QMainWindow):
         # ── Control bar ──────────────────────────────────────────────────
         ctrl = QWidget(); cl = QHBoxLayout(ctrl); cl.setContentsMargins(12, 12, 12, 8)
         cl.addWidget(QLabel("<b>Month:</b>"))
-        m_cb = QComboBox(); m_cb.addItems(month_options()); m_cb.setFixedWidth(140); cl.addWidget(m_cb)
+        m_cb = QComboBox(); _init_month_combo(m_cb); m_cb.setFixedWidth(140); cl.addWidget(m_cb)
         cl.addSpacing(20)
         cl.addWidget(QLabel("<b>Unit:</b>"))
         u_cb = QComboBox(); u_cb.addItems(_unit_filter_list()); u_cb.setFixedWidth(140); cl.addWidget(u_cb)
@@ -1950,7 +1959,7 @@ class PayrollApp(QMainWindow):
         
         ctrl = QWidget(); cl = QHBoxLayout(ctrl)
         cl.addWidget(QLabel("<b>Import for Month:</b>"))
-        m_cb = QComboBox(); m_cb.addItems(month_options()); cl.addWidget(m_cb)
+        m_cb = QComboBox(); _init_month_combo(m_cb); cl.addWidget(m_cb)
         
         def imp():
             fp, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV (*.csv)")
@@ -2504,7 +2513,7 @@ class PayrollApp(QMainWindow):
         ctrl = QFrame(); ctrl.setObjectName("surface2")
         cl = QHBoxLayout(ctrl); cl.setContentsMargins(16, 10, 16, 10)
         cl.addWidget(QLabel("<b>Month:</b>"))
-        m_cb = QComboBox(); m_cb.addItems(month_options()); m_cb.setFixedWidth(140); cl.addWidget(m_cb)
+        m_cb = QComboBox(); _init_month_combo(m_cb); m_cb.setFixedWidth(140); cl.addWidget(m_cb)
         cl.addSpacing(20)
         cl.addWidget(QLabel("<b>Unit:</b>"))
         u_cb = QComboBox(); u_cb.addItems(_unit_filter_list()); u_cb.setFixedWidth(140); cl.addWidget(u_cb)
@@ -3041,7 +3050,7 @@ class PayrollApp(QMainWindow):
         ctrl = QFrame(); ctrl.setObjectName("surface2")
         cl = QHBoxLayout(ctrl); cl.setContentsMargins(16, 10, 16, 10)
         cl.addWidget(QLabel("<b>Month:</b>"))
-        m_cb = QComboBox(); m_cb.addItems(month_options()); m_cb.setFixedWidth(140); cl.addWidget(m_cb)
+        m_cb = QComboBox(); _init_month_combo(m_cb); m_cb.setFixedWidth(140); cl.addWidget(m_cb)
         cl.addSpacing(20)
         cl.addWidget(QLabel("<b>Unit:</b>"))
         u_cb = QComboBox(); u_cb.addItems(_unit_filter_list()); u_cb.setFixedWidth(140); cl.addWidget(u_cb)
