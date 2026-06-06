@@ -65,10 +65,14 @@ def _notify_host_change():
     Called at the end of every local write in HOST / standalone mode.
     Safe to call when the sync server is not running — the import will fail
     silently and the call is a no-op.
+
+    Uses notify_callback=False so the HOST does not refresh its own UI for
+    data it just wrote locally.  The HOST UI refresh callback is reserved for
+    CLIENT-originated writes that arrive via the Flask API handlers.
     """
     try:
         import sync_server as _ss
-        _ss._bump_change()
+        _ss._bump_change(notify_callback=False)
     except Exception:
         pass
 

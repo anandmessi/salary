@@ -45,14 +45,23 @@ def set_change_callback(callback):
     _on_change_callback = callback
 
 
-def _bump_change():
-    """Called after every write so polling clients see a new timestamp and version."""
+def _bump_change(notify_callback: bool = True):
+    """Increment the version counters so polling clients detect a DB change.
+
+    Args:
+        notify_callback: If True (default), also fire the HOST UI refresh
+            callback registered via set_change_callback().  Pass False when
+            the bump comes from a local HOST write (via _notify_host_change in
+            database.py) so the HOST does not refresh its own UI for data it
+            just wrote — the Flask handlers still call _bump_change() with the
+            default True to refresh the HOST's UI when a CLIENT writes.
+    """
     global _last_change_ts, _write_version
     with _change_lock:
         _last_change_ts = time.time()
         _write_version += 1
-    
-    if _on_change_callback:
+
+    if notify_callback and _on_change_callback:
         try:
             _on_change_callback()
         except Exception:

@@ -940,33 +940,25 @@ class PayrollApp(QMainWindow):
         self.set_message(f"\u26a0\ufe0f Startup data error: {e}", WARNING_CLR)
 
     def _on_host_data_changed(self):
-        """Called when the host's DB has new data.
+        """Called when the host DB has new data that this PC did not write.
 
         Two callers:
-          • SyncClient._poll_loop  — always a background thread; role == "client"
-          • sync_server._bump_change  — may be main thread OR a background thread;
-            role == "host"  (HOST's own write triggered the bump)
+          • SyncClient._poll_loop  — background thread; CLIENT polling the HOST
+          • sync_server._bump_change(notify_callback=True)  — Flask worker thread;
+            a CLIENT wrote data through the HOST's Flask API
 
-        On HOST: the data is already in the local SQLite file — no cache flush or
-        UI rebuild is needed.  _bump_change is only relevant so that *connected
-        clients* see the version counter increment; the HOST itself should not
-        react to its own writes.
-
-        On CLIENT: flush the HTTP-response cache so the next read fetches fresh
-        data from the host, then schedule a debounced UI rebuild.
+        In both cases the thread is NOT the main thread, so the guard below
+        correctly lets the callback through.  HOST-local writes call
+        _notify_host_change() which uses notify_callback=False, so they never
+        reach this function — no spurious self-refresh on the HOST.
         """
-        # HOST role: _bump_change fires for every local write. Ignore — data is
-        # already fresh in local SQLite.  (The old guard only caught main-thread
-        # writes; background-thread writes on the host would slip through.)
-        if getattr(self, '_lan_role', 'standalone') == "host":
-            return
-
-        # Also guard against spurious calls on the main thread in other modes.
+        # Safety guard: should never be called on the main thread, but protect
+        # against any accidental direct call to avoid a recursive refresh.
         if threading.current_thread() is threading.main_thread():
             return
 
         from db_cache import cache as _db_cache
-        _db_cache.clear()   # drop stale CLIENT-side HTTP-response cache
+        _db_cache.clear()   # drop stale cache so next read fetches fresh data
         # Route to main thread via invokeMethod, then debounce through _schedule_refresh
         # so rapid-fire host writes (e.g. bulk attendance save) coalesce into ONE refresh.
         QMetaObject.invokeMethod(
