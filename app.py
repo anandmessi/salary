@@ -3167,7 +3167,11 @@ class PayrollApp(QMainWindow):
                         writer = csv.writer(f, quoting=csv.QUOTE_ALL)
                         writer.writerow(["Emp name", "Total Sal", "IFSC Code", "Account Number"])
                         for r in _results_cache:
-                            writer.writerow([r.worker_name, round(r.net_pay, 2), r.ifsc_code, r.bank_account])
+                            # Wrap account/IFSC in ="..." so Excel keeps them as
+                            # text and does not convert long digits to scientific notation.
+                            acc  = f'="{r.bank_account}"' if r.bank_account else ""
+                            ifsc = f'="{r.ifsc_code}"'    if r.ifsc_code    else ""
+                            writer.writerow([r.worker_name, round(r.net_pay, 2), ifsc, acc])
                     self.set_message(f"✅ CSV → {path}", SUCCESS)
                 except Exception as e:
                     self.set_message(f"⚠️ Export error: {e}", DANGER)
