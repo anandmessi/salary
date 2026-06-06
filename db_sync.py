@@ -235,11 +235,24 @@ def startup_sync(sync_client, local_db_path: str, on_progress=None) -> str:
     if on_progress:
         on_progress("🔍 Comparing databases across devices…")
 
-    # Step 1: Get server stats
+    # Step 1: Fast reachability check — avoids a long TCP connect timeout when
+    # the host is offline.  /api/ping is a trivially cheap endpoint.
+    try:
+        sync_client._requests.get(
+            f"{sync_client.base_url}/ping",
+            timeout=1.5,
+        ).raise_for_status()
+    except Exception:
+        logger.warning("Server unreachable (ping failed) — skipping startup sync")
+        if on_progress:
+            on_progress("⚠️ Server unreachable — using local database")
+        return "failed"
+
+    # Step 2: Get server DB version info
     try:
         r = sync_client._requests.get(
             f"{sync_client.base_url}/db/version_info",
-            timeout=5.0
+            timeout=3.0
         )
         r.raise_for_status()
         server_info = r.json()
@@ -249,7 +262,7 @@ def startup_sync(sync_client, local_db_path: str, on_progress=None) -> str:
             on_progress("⚠️ Server unreachable — using local database")
         return "failed"
 
-    # Step 2: Get local stats
+    # Step 3: Get local stats
     local = _local_stats(local_db_path)
 
     winner = _who_is_newer(server_info, local)

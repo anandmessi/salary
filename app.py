@@ -940,10 +940,28 @@ class PayrollApp(QMainWindow):
         self.set_message(f"\u26a0\ufe0f Startup data error: {e}", WARNING_CLR)
 
     def _on_host_data_changed(self):
-        """Called (from background thread) when the host's DB has new data.
-        Flushes the local cache so the next read goes to the HOST over HTTP,
-        then schedules a debounced UI refresh on the main thread."""
-        # Avoid redundant self-refreshes if the write originated from the Host's own main thread GUI.
+        """Called when the host's DB has new data.
+
+        Two callers:
+          • SyncClient._poll_loop  — always a background thread; role == "client"
+          • sync_server._bump_change  — may be main thread OR a background thread;
+            role == "host"  (HOST's own write triggered the bump)
+
+        On HOST: the data is already in the local SQLite file — no cache flush or
+        UI rebuild is needed.  _bump_change is only relevant so that *connected
+        clients* see the version counter increment; the HOST itself should not
+        react to its own writes.
+
+        On CLIENT: flush the HTTP-response cache so the next read fetches fresh
+        data from the host, then schedule a debounced UI rebuild.
+        """
+        # HOST role: _bump_change fires for every local write. Ignore — data is
+        # already fresh in local SQLite.  (The old guard only caught main-thread
+        # writes; background-thread writes on the host would slip through.)
+        if getattr(self, '_lan_role', 'standalone') == "host":
+            return
+
+        # Also guard against spurious calls on the main thread in other modes.
         if threading.current_thread() is threading.main_thread():
             return
 
